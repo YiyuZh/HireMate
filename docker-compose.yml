@@ -1,0 +1,29 @@
+services:
+  hiremate:
+    build: .
+    container_name: hiremate
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      MODEL_NAME: ${MODEL_NAME:-gpt-4o-mini}
+
+  caddy:
+    image: caddy:2
+    container_name: hiremate-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - hiremate
+
+volumes:
+  caddy_data:
+  caddy_config:

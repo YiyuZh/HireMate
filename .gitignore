@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.streamlit/
+data/jd_store.json
+data/candidate_pool_store.json
+data/review_history.json
+data/hiremate.db
+data/hiremate.db-shm
+data/hiremate.db-wal

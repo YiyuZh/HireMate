@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.streamlit/
+.env
+data/hiremate.db
+data/hiremate.db-shm
+data/hiremate.db-wal
+src/__pycache__/
+ai_recruiting_screener/
+hiremate-ai-screening/
