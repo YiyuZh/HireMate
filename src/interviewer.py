@@ -160,7 +160,7 @@ def build_interview_questions(scores: dict[str, int], risks: list[str]) -> list[
 
 if __name__ == "__main__":
     # 本地测试示例：
-    # cd ai_recruiting_screener
+    # cd HireMate
     # python src/interviewer.py
     demo_jd = {
         "required_skills": ["SQL", "Python", "PRD", "数据分析", "大模型"],

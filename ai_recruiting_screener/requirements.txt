@@ -1,7 +1,0 @@
-streamlit
-python-dotenv
-pypdf
-python-docx
-pdf2image
-pytesseract
-pillow

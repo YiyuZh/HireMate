@@ -2,23 +2,38 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
+from hashlib import sha256
 import json
 import os
 import re
+from time import perf_counter
 from uuid import uuid4
 
 import streamlit as st
 
+from src.auth import authenticate_user, get_current_user, login_user, logout_user, mark_login_success
+from src.db import init_db
 from src.interviewer import build_interview_plan
+from src.legacy_json_compat import migrate_legacy_json_if_needed
 from src.utils import load_env
 from src.candidate_store import (
+    acquire_candidate_lock,
+    can_user_operate_candidate,
+    cleanup_expired_candidate_locks,
     delete_batch as delete_candidate_batch,
     delete_batches_by_jd,
+    get_candidate_lock_state,
+    list_batch_candidate_lock_states,
+    list_recent_lock_events,
     list_batches_by_jd as list_candidate_batches_by_jd,
     list_jd_titles as list_candidate_jd_titles,
     load_batch as load_candidate_batch,
     load_latest_batch_by_jd,
+    persist_candidate_snapshot,
+    release_candidate_lock,
+    refresh_candidate_lock,
     save_candidate_batch,
     upsert_candidate_manual_review,
 )
@@ -30,9 +45,10 @@ from src.resume_loader import check_ocr_capabilities, load_resume_file
 from src.resume_parser import parse_resume
 from src.review_store import append_review, list_reviews, upsert_manual_review
 from src.risk_analyzer import analyze_risk
-from src.ai_reviewer import run_ai_reviewer
+from src.ai_reviewer import get_ai_reviewer_prompt_version, run_ai_reviewer
 from src.scorer import score_candidate, to_score_values
 from src.screener import build_screening_decision
+from src.user_store import count_users, get_user_by_id
 from src.v2_workspace import (
     build_candidate_row,
     filter_by_risk,
@@ -42,6 +58,9 @@ from src.v2_workspace import (
 )
 
 load_env()
+init_db()
+if os.getenv("HIREMATE_AUTO_MIGRATE_JSON", "0").strip() == "1":
+    migrate_legacy_json_if_needed()
 
 SAMPLE_JD = """岗位名称：AI 产品经理实习生
 
@@ -160,7 +179,9 @@ def _extract_quality_label(quality: str) -> str:
     return "正常" if (quality or "").lower() == "ok" else "较弱"
 
 
-def _extract_notice(quality: str) -> str:
+def _extract_notice(quality: str, message: str = "") -> str:
+    if _is_ocr_missing_message(message):
+        return "⚠️ 当前环境 OCR 能力缺失，建议改用 txt/docx，或在云上补齐 tesseract / poppler 后再试。"
     return "⚠️ 建议人工检查后再评估" if (quality or "").lower() == "weak" else ""
 
 
@@ -234,7 +255,18 @@ def _friendly_upload_error(err: Exception) -> str:
 
 def _is_ocr_missing_message(message: str) -> bool:
     msg = (message or "").lower()
-    keywords = ["未启用图片 ocr", "ocr 不可用", "未安装", "未启用 ocr", "pdf ocr 需要", "图片 ocr 需要"]
+    keywords = [
+        "未启用图片 ocr",
+        "ocr 不可用",
+        "未安装",
+        "未启用 ocr",
+        "pdf ocr 需要",
+        "图片 ocr 需要",
+        "tesseract",
+        "poppler",
+        "pdfinfo",
+        "pdftoppm",
+    ]
     return any(k in msg for k in keywords)
 
 
@@ -417,11 +449,12 @@ def _apply_ai_risk_suggestion(detail: dict, selected_row: dict, ai_suggestion: d
         return False
     risk_result = detail.get("risk_result") or {}
     risk_result["risk_level"] = new_level
-    detail["risk_result"] = risk_result
     selected_row["风险等级"] = new_level
     reason = str(risk_adjustment.get("reason") or "").strip()
     if reason:
+        risk_result["risk_summary"] = reason
         selected_row["风险摘要"] = reason
+    detail["risk_result"] = risk_result
     return True
 
 
@@ -446,14 +479,87 @@ def _apply_ai_score_suggestions(detail: dict, selected_row: dict, ai_suggestion:
             continue
         bounded = max(-max_delta, min(max_delta, delta))
         new_score = max(1, min(5, base_score + bounded))
+        evidence = current.get("evidence")
+        if not isinstance(evidence, list):
+            evidence = [str(evidence)] if evidence else []
+        note = f"AI建议修正：{item.get('reason') or '无'}"
+        if note not in evidence:
+            evidence.append(note)
+        if new_score == base_score and note in evidence and bounded == 0:
+            continue
         current["score"] = new_score
-        current.setdefault("evidence", []).append(f"AI建议修正：{item.get('reason') or '无'}")
+        current["evidence"] = evidence
         score_details[dim] = current
-        if dim in {"教育背景匹配度", "相关经历匹配度", "技能匹配度"}:
+        if dim in {"教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度"}:
             selected_row[dim] = new_score
         applied += 1
     detail["score_details"] = score_details
+    if applied > 0:
+        _recalculate_overall_score(detail)
+        detail["score_values"] = to_score_values(detail["score_details"])
     return applied
+
+
+def _recalculate_overall_score(detail: dict) -> None:
+    score_details = detail.get("score_details")
+    if not isinstance(score_details, dict):
+        return
+
+    base_dims = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度"]
+    weights = (((detail.get("parsed_jd") or {}).get("scoring_config") or {}).get("weights") or {})
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+    low_count = 0
+    exp_score = 1
+    skill_score = 1
+
+    for dim in base_dims:
+        dim_detail = score_details.get(dim) or {}
+        try:
+            dim_score = int(dim_detail.get("score", 1) or 1)
+        except (TypeError, ValueError):
+            dim_score = 1
+        try:
+            dim_weight = float(weights.get(dim, 1.0) or 1.0)
+        except (TypeError, ValueError):
+            dim_weight = 1.0
+
+        weighted_sum += dim_score * dim_weight
+        weight_total += dim_weight
+        if dim_score <= 2:
+            low_count += 1
+        if dim == "相关经历匹配度":
+            exp_score = dim_score
+        if dim == "技能匹配度":
+            skill_score = dim_score
+
+    if weight_total <= 0:
+        return
+
+    overall_score = round(weighted_sum / weight_total)
+    if exp_score <= 2 or skill_score <= 2:
+        overall_score = min(overall_score, 3)
+    if low_count >= 2:
+        overall_score = min(overall_score, 2)
+    if not (exp_score >= 4 and skill_score >= 4):
+        overall_score = min(overall_score, 4)
+
+    overall_detail = score_details.get("综合推荐度") or {}
+    evidence = overall_detail.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = [str(evidence)] if evidence else []
+    note = "AI建议应用后按当前维度评分重算综合推荐度。"
+    if note not in evidence:
+        evidence.append(note)
+
+    overall_detail["score"] = max(1, min(5, int(overall_score)))
+    overall_detail["reason"] = overall_detail.get("reason") or "综合推荐度已根据当前维度评分重算。"
+    overall_detail["evidence"] = evidence
+    score_details["综合推荐度"] = overall_detail
+    detail["score_details"] = score_details
+
+
 def _review_summary(decision: str, risk_level: str, risk_summary: str = "") -> str:
     decision_text = _decision_summary(decision)
     risk_text = _risk_level_label(risk_level)
@@ -463,6 +569,2074 @@ def _review_summary(decision: str, risk_level: str, risk_summary: str = "") -> s
     return f"{decision_text} 风险等级：{risk_text}。"
 
 
+def _apply_ai_timeline_updates(detail: dict, ai_suggestion: dict) -> int:
+    updates = ai_suggestion.get("timeline_updates") if isinstance(ai_suggestion, dict) else []
+    if not isinstance(updates, list):
+        return 0
+
+    existing = detail.get("ai_timeline_updates_snapshot")
+    if not isinstance(existing, list):
+        existing = []
+    existing_pairs = {
+        (str(item.get("label") or ""), str(item.get("value") or ""))
+        for item in existing
+        if isinstance(item, dict)
+    }
+
+    added = 0
+    for item in updates:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not label or not value:
+            continue
+        pair = (label, value)
+        if pair in existing_pairs:
+            continue
+        existing.append(
+            {
+                "label": label,
+                "value": value,
+                "note": str(item.get("note") or "").strip(),
+            }
+        )
+        existing_pairs.add(pair)
+        added += 1
+
+    if added > 0:
+        detail["ai_timeline_updates_snapshot"] = existing
+    return added
+
+
+def _merge_ai_actions(existing_actions: list[str], new_actions: list[str]) -> list[str]:
+    merged: list[str] = []
+    for action in [*(existing_actions or []), *(new_actions or [])]:
+        clean = str(action or "").strip()
+        if clean and clean not in merged:
+            merged.append(clean)
+    return merged
+
+
+def _ai_review_status_label(status: str) -> str:
+    mapping = {
+        "ready": "已生成",
+        "failed": "失败",
+        "not_generated": "未生成",
+        "outdated": "已过期",
+    }
+    return mapping.get((status or "").strip(), "未生成")
+
+
+def _normalize_ai_review_state(detail: dict) -> None:
+    ai_suggestion = detail.get("ai_review_suggestion")
+    if not isinstance(ai_suggestion, dict):
+        ai_suggestion = {}
+        detail["ai_review_suggestion"] = ai_suggestion
+    ai_meta = ai_suggestion.get("meta") if isinstance(ai_suggestion.get("meta"), dict) else {}
+
+    status = str(detail.get("ai_review_status") or "").strip()
+    if status not in {"ready", "failed", "not_generated", "outdated"}:
+        has_suggestion = any(
+            ai_suggestion.get(key)
+            for key in [
+                "review_summary",
+                "evidence_updates",
+                "timeline_updates",
+                "risk_adjustment",
+                "score_adjustments",
+                "recommended_action",
+            ]
+        )
+        detail["ai_review_status"] = "ready" if has_suggestion else "not_generated"
+
+    for key in [
+        "ai_input_hash",
+        "ai_prompt_version",
+        "ai_generated_at",
+        "ai_generated_by_name",
+        "ai_generated_by_email",
+        "ai_review_error",
+        "ai_source",
+        "ai_model",
+        "ai_mode",
+        "ai_generation_reason",
+        "ai_refresh_reason",
+    ]:
+        detail[key] = str(detail.get(key) or "")
+    if not detail["ai_source"]:
+        detail["ai_source"] = str(ai_meta.get("source") or "")
+    if not detail["ai_model"]:
+        detail["ai_model"] = str(ai_meta.get("model") or "")
+    if not detail["ai_mode"]:
+        detail["ai_mode"] = str(ai_suggestion.get("mode") or "")
+    if not detail["ai_prompt_version"]:
+        detail["ai_prompt_version"] = str(ai_meta.get("prompt_version") or "")
+    detail["ai_generated_latency_ms"] = int(
+        detail.get("ai_generated_latency_ms") or ai_meta.get("generated_latency_ms") or 0
+    )
+
+    _refresh_ai_review_freshness(detail)
+
+
+def _stable_ai_payload_dumps(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _compute_ai_input_hash(
+    *,
+    parsed_resume: dict,
+    scoring_config: dict,
+    score_details: dict,
+    risk_result: dict,
+    screening_result: dict,
+    evidence_snippets: list,
+) -> str:
+    payload = {
+        "parsed_resume": parsed_resume if isinstance(parsed_resume, dict) else {},
+        "scoring_config": scoring_config if isinstance(scoring_config, dict) else {},
+        "score_details": score_details if isinstance(score_details, dict) else {},
+        "risk_result": risk_result if isinstance(risk_result, dict) else {},
+        "screening_result": screening_result if isinstance(screening_result, dict) else {},
+        "evidence_snippets": evidence_snippets if isinstance(evidence_snippets, list) else [],
+    }
+    return sha256(_stable_ai_payload_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def _current_ai_input_hash(detail: dict) -> str:
+    parsed_jd = detail.get("parsed_jd") if isinstance(detail.get("parsed_jd"), dict) else {}
+    scoring_config = parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {}
+    return _compute_ai_input_hash(
+        parsed_resume=detail.get("parsed_resume") if isinstance(detail.get("parsed_resume"), dict) else {},
+        scoring_config=scoring_config,
+        score_details=detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {},
+        risk_result=detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {},
+        screening_result=detail.get("screening_result") if isinstance(detail.get("screening_result"), dict) else {},
+        evidence_snippets=detail.get("evidence_snippets") if isinstance(detail.get("evidence_snippets"), list) else [],
+    )
+
+
+def _refresh_ai_review_freshness(detail: dict) -> str:
+    ai_suggestion = detail.get("ai_review_suggestion")
+    if not isinstance(ai_suggestion, dict):
+        ai_suggestion = {}
+        detail["ai_review_suggestion"] = ai_suggestion
+
+    status = str(detail.get("ai_review_status") or "").strip() or "not_generated"
+    current_hash = _current_ai_input_hash(detail)
+    stored_hash = str(detail.get("ai_input_hash") or "").strip()
+    has_suggestion = bool(ai_suggestion)
+
+    if status == "failed":
+        return status
+    if not has_suggestion:
+        detail["ai_review_status"] = "not_generated"
+        return "not_generated"
+    if stored_hash and current_hash == stored_hash:
+        detail["ai_review_status"] = "ready"
+        return "ready"
+    if stored_hash and current_hash != stored_hash:
+        detail["ai_review_status"] = "outdated"
+        return "outdated"
+
+    detail["ai_review_status"] = "ready"
+    return "ready"
+
+
+def _resolve_ai_generation_reason(detail: dict, force_refresh: bool) -> str:
+    status = str(detail.get("ai_review_status") or "")
+    if status == "failed":
+        return "retry_after_failure"
+    if status == "outdated":
+        return "refresh_after_outdated"
+    if force_refresh:
+        return "manual_refresh"
+    return "first_generate"
+
+
+def _ai_generation_lock_key(candidate_id: str, batch_id: str, review_id: str) -> str:
+    parts = [str(part or "").strip() for part in [candidate_id, batch_id, review_id] if str(part or "").strip()]
+    return "::".join(parts) or "workspace_ai_review"
+
+
+WORKSPACE_LOCK_TTL_MINUTES = 30
+
+
+def _empty_workspace_lock_state() -> dict[str, str | bool]:
+    return {
+        "batch_id": "",
+        "candidate_id": "",
+        "lock_status": "unlocked",
+        "lock_owner_user_id": "",
+        "lock_owner_name": "",
+        "lock_owner_email": "",
+        "lock_acquired_at": "",
+        "lock_expires_at": "",
+        "lock_last_heartbeat_at": "",
+        "lock_reason": "",
+        "is_expired": False,
+        "is_locked_effective": False,
+    }
+
+
+def _lock_owner_display(lock_state: dict) -> str:
+    return str(lock_state.get("lock_owner_name") or lock_state.get("lock_owner_email") or "未领取")
+
+
+def _sync_candidate_lock_state(selected_row: dict, detail: dict, lock_state: dict, operator_user_id: str = "") -> dict:
+    normalized = _empty_workspace_lock_state()
+    if isinstance(lock_state, dict):
+        normalized.update(lock_state)
+
+    detail["lock_status"] = str(normalized.get("lock_status") or "unlocked")
+    detail["lock_owner_user_id"] = str(normalized.get("lock_owner_user_id") or "")
+    detail["lock_owner_name"] = str(normalized.get("lock_owner_name") or "")
+    detail["lock_owner_email"] = str(normalized.get("lock_owner_email") or "")
+    detail["lock_acquired_at"] = str(normalized.get("lock_acquired_at") or "")
+    detail["lock_expires_at"] = str(normalized.get("lock_expires_at") or "")
+    detail["lock_last_heartbeat_at"] = str(normalized.get("lock_last_heartbeat_at") or "")
+    detail["lock_reason"] = str(normalized.get("lock_reason") or "")
+    detail["is_expired"] = bool(normalized.get("is_expired"))
+    detail["is_locked_effective"] = bool(normalized.get("is_locked_effective"))
+
+    if bool(normalized.get("is_locked_effective")):
+        if operator_user_id and str(normalized.get("lock_owner_user_id") or "") == str(operator_user_id or ""):
+            lock_badge = "我处理中"
+        else:
+            lock_badge = "他人锁定"
+    else:
+        lock_badge = "未领取"
+
+    selected_row["锁定状态"] = lock_badge
+    selected_row["锁定人"] = _lock_owner_display(normalized)
+    selected_row["锁过期时间"] = str(normalized.get("lock_expires_at") or "-")
+    return normalized
+
+
+def _refresh_workspace_candidate_lock_state(batch_id: str, candidate_id: str, selected_row: dict, detail: dict) -> dict:
+    operator = _current_operator()
+    lock_state = get_candidate_lock_state(batch_id, candidate_id) if batch_id and candidate_id else None
+    return _sync_candidate_lock_state(
+        selected_row,
+        detail,
+        lock_state if isinstance(lock_state, dict) else _empty_workspace_lock_state(),
+        operator.get("user_id", ""),
+    )
+
+
+def _is_candidate_self_locked(lock_state: dict, operator: dict) -> bool:
+    if not isinstance(lock_state, dict):
+        return False
+    return bool(lock_state.get("is_locked_effective")) and str(lock_state.get("lock_owner_user_id") or "") == str(
+        operator.get("user_id") or ""
+    )
+
+
+def _can_edit_claimed_candidate(batch_id: str, lock_state: dict, operator: dict) -> tuple[bool, str]:
+    if not batch_id:
+        return True, ""
+    if _is_candidate_self_locked(lock_state, operator):
+        return True, ""
+    if bool(lock_state.get("is_locked_effective")):
+        if bool(operator.get("is_admin")):
+            return False, "当前候选人已被其他 HR 锁定。请先使用“管理员强制解锁”。"
+        return False, "当前候选人已被其他 HR 锁定，暂不可编辑。"
+    return False, "请先领取并开始处理，再执行人工写入或 AI 应用。"
+
+
+def _workspace_context_cache_key(
+    *,
+    selected_jd: str,
+    batch_id: str,
+    pool_label: str,
+    quick_filter: str,
+    search_kw: str,
+    risk_filter: str,
+    sort_key: str,
+) -> str:
+    return "|".join(
+        [
+            str(selected_jd or ""),
+            str(batch_id or ""),
+            str(pool_label or ""),
+            str(quick_filter or ""),
+            str((search_kw or "").strip().lower()),
+            str(risk_filter or ""),
+            str(sort_key or ""),
+        ]
+    )
+
+
+def _sync_workspace_candidate_lock_in_session(candidate_id: str, lock_state: dict | None = None) -> None:
+    candidate_key = str(candidate_id or "").strip()
+    if not candidate_key:
+        return
+
+    rows = st.session_state.get("v2_rows", [])
+    details = st.session_state.get("v2_details", {})
+    if not isinstance(rows, list) or not isinstance(details, dict):
+        return
+
+    row = next((item for item in rows if str(item.get("candidate_id") or "").strip() == candidate_key), None)
+    detail = details.get(candidate_key)
+    if not isinstance(row, dict) or not isinstance(detail, dict):
+        return
+
+    operator = _current_operator()
+    normalized_lock_state = lock_state
+    if not isinstance(normalized_lock_state, dict):
+        active_batch_id = str(st.session_state.get("workspace_preferred_batch_id") or "").strip()
+        normalized_lock_state = get_candidate_lock_state(active_batch_id, candidate_key) if active_batch_id else None
+    _sync_candidate_lock_state(
+        row,
+        detail,
+        normalized_lock_state if isinstance(normalized_lock_state, dict) else _empty_workspace_lock_state(),
+        str(operator.get("user_id") or ""),
+    )
+    st.session_state.v2_rows = rows
+    st.session_state.v2_details = details
+
+
+def _focus_workspace_candidate(candidate_id: str, row: dict, *, reset_filters: bool = True) -> None:
+    candidate_key = str(candidate_id or "").strip()
+    if not candidate_key or not isinstance(row, dict):
+        return
+
+    target_pool = _current_candidate_pool(row) or str(row.get("候选池") or "").strip() or "待复核候选人"
+    st.session_state.workspace_pool_top_radio = target_pool
+    st.session_state.workspace_default_entry_pool = target_pool
+    if reset_filters:
+        st.session_state.workspace_quick_filter = "全部"
+        st.session_state.workspace_search = ""
+        st.session_state.workspace_risk_filter = "全部"
+
+    selected_jd = str(st.session_state.get("workspace_selected_jd_title") or "").strip()
+    batch_id = str(st.session_state.get("workspace_preferred_batch_id") or "").strip()
+    quick_filter = str(st.session_state.get("workspace_quick_filter") or "全部").strip() or "全部"
+    search_kw = str(st.session_state.get("workspace_search") or "")
+    risk_filter = str(st.session_state.get("workspace_risk_filter") or "全部").strip() or "全部"
+    sort_key = str(st.session_state.get("workspace_sort_key") or "")
+    context_key = _workspace_context_cache_key(
+        selected_jd=selected_jd,
+        batch_id=batch_id,
+        pool_label=target_pool,
+        quick_filter=quick_filter,
+        search_kw=search_kw,
+        risk_filter=risk_filter,
+        sort_key=sort_key,
+    )
+    selected_cache = st.session_state.get("workspace_selected_candidate_by_context", {})
+    if not isinstance(selected_cache, dict):
+        selected_cache = {}
+    selected_cache[context_key] = candidate_key
+    st.session_state.workspace_selected_candidate_by_context = selected_cache
+    st.session_state.workspace_pool_move_feedback = ""
+    st.session_state.workspace_pool_empty_feedback = ""
+
+
+def _persist_workspace_candidate_state(
+    rows: list[dict],
+    details: dict[str, dict],
+    selected_row: dict,
+    detail: dict,
+    candidate_id: str,
+    batch_id: str,
+    review_id: str,
+    *,
+    operator: dict[str, str] | None = None,
+) -> bool:
+    actor = operator or _current_operator()
+    details[candidate_id] = detail
+    st.session_state.v2_rows = rows
+    st.session_state.v2_details = details
+
+    persisted = False
+    if batch_id:
+        persisted = persist_candidate_snapshot(
+            batch_id=batch_id,
+            candidate_id=candidate_id,
+            row_payload=selected_row,
+            detail_payload=detail,
+            operator_user_id=actor["user_id"],
+            operator_name=actor["name"],
+            operator_email=actor["email"],
+            is_admin=bool(actor.get("is_admin")),
+            enforce_lock=True,
+        )
+        if not persisted:
+            return False
+        refreshed_lock_state = get_candidate_lock_state(batch_id, candidate_id)
+        _sync_candidate_lock_state(selected_row, detail, refreshed_lock_state or _empty_workspace_lock_state(), actor["user_id"])
+
+    if review_id:
+        upsert_manual_review(
+            review_id=review_id,
+            reviewed_by_user_id=actor["user_id"],
+            reviewed_by_name=actor["name"],
+            reviewed_by_email=actor["email"],
+            metadata_updates=_build_ai_review_metadata(detail),
+        )
+    return bool(batch_id or review_id)
+
+
+def _ensure_ai_application_baseline(detail: dict, selected_row: dict) -> bool:
+    if detail.get("ai_baseline_saved"):
+        return False
+
+    detail["baseline_score_details"] = deepcopy(
+        detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {}
+    )
+    detail["baseline_score_values"] = deepcopy(
+        detail.get("score_values") if isinstance(detail.get("score_values"), dict) else {}
+    )
+    detail["baseline_risk_result"] = deepcopy(
+        detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {}
+    )
+    detail["baseline_screening_result"] = deepcopy(
+        detail.get("screening_result") if isinstance(detail.get("screening_result"), dict) else {}
+    )
+    detail["baseline_review_summary"] = str(
+        detail.get("review_summary") or selected_row.get("审核摘要") or ""
+    )
+    detail["baseline_evidence_snippets"] = deepcopy(
+        detail.get("evidence_snippets") if isinstance(detail.get("evidence_snippets"), list) else []
+    )
+    detail["baseline_timeline_updates_snapshot"] = deepcopy(
+        detail.get("ai_timeline_updates_snapshot")
+        if isinstance(detail.get("ai_timeline_updates_snapshot"), list)
+        else []
+    )
+    detail["baseline_candidate_pool"] = str(selected_row.get("候选池") or "")
+    detail["ai_baseline_saved"] = True
+    return True
+
+
+def _update_selected_row_from_detail(detail: dict, selected_row: dict) -> None:
+    score_details = detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {}
+    for dim in ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度"]:
+        dim_detail = score_details.get(dim) if isinstance(score_details.get(dim), dict) else {}
+        if "score" in dim_detail:
+            selected_row[dim] = dim_detail.get("score")
+
+    risk_result = detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {}
+    screening_result = detail.get("screening_result") if isinstance(detail.get("screening_result"), dict) else {}
+    selected_row["风险等级"] = str(risk_result.get("risk_level") or selected_row.get("风险等级") or "unknown")
+    selected_row["风险摘要"] = str(risk_result.get("risk_summary") or selected_row.get("风险摘要") or "")
+    selected_row["初筛结论"] = str(
+        screening_result.get("screening_result") or selected_row.get("初筛结论") or ""
+    )
+    selected_row["审核摘要"] = str(detail.get("review_summary") or selected_row.get("审核摘要") or "")
+    selected_row["候选池"] = str(selected_row.get("候选池") or _candidate_pool_label(selected_row.get("初筛结论", "")))
+
+
+def _clear_ai_application_state(detail: dict, *, clear_baseline: bool = True) -> None:
+    detail["ai_applied"] = False
+    detail["ai_applied_actions"] = []
+    detail["ai_applied_by_name"] = ""
+    detail["ai_applied_by_email"] = ""
+    detail["ai_applied_at"] = ""
+    detail["ai_reverted"] = False
+    detail["ai_reverted_actions"] = []
+    detail["ai_reverted_at"] = ""
+    detail["ai_reverted_by_name"] = ""
+    detail["ai_reverted_by_email"] = ""
+    detail["ai_review_summary_snapshot"] = ""
+    detail["ai_score_adjustments_snapshot"] = []
+    detail["ai_risk_adjustment_snapshot"] = {}
+    if clear_baseline:
+        for key in [
+            "ai_baseline_saved",
+            "baseline_score_details",
+            "baseline_score_values",
+            "baseline_risk_result",
+            "baseline_screening_result",
+            "baseline_review_summary",
+            "baseline_evidence_snippets",
+            "baseline_timeline_updates_snapshot",
+            "baseline_candidate_pool",
+        ]:
+            detail.pop(key, None)
+
+
+def _restore_ai_baseline(
+    detail: dict,
+    selected_row: dict,
+    *,
+    restore_evidence: bool,
+    restore_timeline: bool,
+) -> bool:
+    if not detail.get("ai_baseline_saved"):
+        return False
+
+    baseline_scores = detail.get("baseline_score_details")
+    baseline_score_values = detail.get("baseline_score_values")
+    baseline_risk = detail.get("baseline_risk_result")
+    baseline_screening = detail.get("baseline_screening_result")
+
+    detail["score_details"] = deepcopy(baseline_scores) if isinstance(baseline_scores, dict) else {}
+    detail["score_values"] = (
+        deepcopy(baseline_score_values)
+        if isinstance(baseline_score_values, dict)
+        else to_score_values(detail.get("score_details") or {})
+    )
+    detail["risk_result"] = deepcopy(baseline_risk) if isinstance(baseline_risk, dict) else {}
+    detail["screening_result"] = deepcopy(baseline_screening) if isinstance(baseline_screening, dict) else {}
+    detail["review_summary"] = str(detail.get("baseline_review_summary") or "")
+
+    if restore_evidence:
+        detail["evidence_snippets"] = deepcopy(
+            detail.get("baseline_evidence_snippets")
+            if isinstance(detail.get("baseline_evidence_snippets"), list)
+            else []
+        )
+    if restore_timeline:
+        detail["ai_timeline_updates_snapshot"] = deepcopy(
+            detail.get("baseline_timeline_updates_snapshot")
+            if isinstance(detail.get("baseline_timeline_updates_snapshot"), list)
+            else []
+        )
+
+    selected_row["初筛结论"] = str((detail.get("screening_result") or {}).get("screening_result") or "")
+    selected_row["风险等级"] = str((detail.get("risk_result") or {}).get("risk_level") or "unknown")
+    selected_row["风险摘要"] = str((detail.get("risk_result") or {}).get("risk_summary") or "")
+    selected_row["审核摘要"] = str(detail.get("review_summary") or "")
+    selected_row["候选池"] = str(
+        detail.get("baseline_candidate_pool") or _candidate_pool_label(selected_row.get("初筛结论", ""))
+    )
+    _update_selected_row_from_detail(detail, selected_row)
+    return True
+
+
+def _build_ai_change_preview(
+    detail: dict,
+    selected_row: dict,
+    ai_cfg: dict,
+    ai_suggestion: dict,
+) -> dict:
+    score_details = detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {}
+    score_adjustments = ai_suggestion.get("score_adjustments") if isinstance(ai_suggestion, dict) else []
+    if not isinstance(score_adjustments, list):
+        score_adjustments = []
+
+    score_rows: list[dict] = []
+    for item in score_adjustments:
+        if not isinstance(item, dict):
+            continue
+        dim = str(item.get("dimension") or "").strip()
+        current_detail = score_details.get(dim) if isinstance(score_details.get(dim), dict) else {}
+        try:
+            current_score = int((current_detail or {}).get("score", 0) or 0)
+            max_delta = int(item.get("max_delta", 1) or 1)
+            delta = int(item.get("suggested_delta", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        bounded = max(-max_delta, min(max_delta, delta))
+        next_score = max(1, min(5, current_score + bounded)) if current_score else "-"
+        score_rows.append(
+            {
+                "dimension": dim,
+                "current_score": current_score if current_score else "-",
+                "suggested_delta": bounded,
+                "next_score": next_score,
+                "reason": str(item.get("reason") or ""),
+            }
+        )
+
+    risk_result = detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {}
+    risk_adjustment = ai_suggestion.get("risk_adjustment") if isinstance(ai_suggestion, dict) else {}
+    if not isinstance(risk_adjustment, dict):
+        risk_adjustment = {}
+    current_risk = str(risk_result.get("risk_level") or selected_row.get("风险等级") or "unknown").lower()
+    suggested_risk = str(risk_adjustment.get("suggested_risk_level") or current_risk).lower()
+
+    evidence_existing = {
+        (str(item.get("source") or ""), str(item.get("text") or ""))
+        for item in (detail.get("evidence_snippets") or [])
+        if isinstance(item, dict)
+    }
+    evidence_add_count = sum(
+        1
+        for item in (ai_suggestion.get("evidence_updates") or [])
+        if isinstance(item, dict)
+        and str(item.get("text") or "").strip()
+        and (str(item.get("source") or ""), str(item.get("text") or "")) not in evidence_existing
+    )
+
+    timeline_existing = {
+        (str(item.get("label") or ""), str(item.get("value") or ""))
+        for item in (detail.get("ai_timeline_updates_snapshot") or [])
+        if isinstance(item, dict)
+    }
+    timeline_add_count = sum(
+        1
+        for item in (ai_suggestion.get("timeline_updates") or [])
+        if isinstance(item, dict)
+        and str(item.get("label") or "").strip()
+        and str(item.get("value") or "").strip()
+        and (str(item.get("label") or ""), str(item.get("value") or "")) not in timeline_existing
+    )
+
+    current_decision = str(
+        (detail.get("screening_result") or {}).get("screening_result") or selected_row.get("初筛结论") or ""
+    )
+    allow_direct_change = bool(
+        ((ai_cfg.get("score_adjustment_limit") or {}).get("allow_direct_recommendation_change", False))
+    )
+    estimated_decision = current_decision
+    if allow_direct_change:
+        preview_detail = deepcopy(detail)
+        preview_row = deepcopy(selected_row)
+        if suggested_risk:
+            _apply_ai_risk_suggestion(preview_detail, preview_row, ai_suggestion)
+        if score_rows:
+            _apply_ai_score_suggestions(preview_detail, preview_row, ai_suggestion)
+        _refresh_candidate_after_ai_application(preview_detail, preview_row, ai_cfg)
+        estimated_decision = str(
+            (preview_detail.get("screening_result") or {}).get("screening_result") or current_decision
+        )
+
+    return {
+        "score_rows": score_rows,
+        "current_risk": current_risk,
+        "suggested_risk": suggested_risk,
+        "risk_changed": suggested_risk != current_risk,
+        "current_decision": current_decision,
+        "estimated_decision": estimated_decision,
+        "allow_direct_change": allow_direct_change,
+        "evidence_add_count": evidence_add_count,
+        "timeline_add_count": timeline_add_count,
+    }
+
+
+def _refresh_candidate_after_ai_application(detail: dict, selected_row: dict, ai_cfg: dict) -> None:
+    score_details = detail.get("score_details")
+    if not isinstance(score_details, dict):
+        detail["score_details"] = {}
+    _recalculate_overall_score(detail)
+    detail["score_values"] = to_score_values(detail.get("score_details") or {})
+
+    risk_result = detail.get("risk_result")
+    if not isinstance(risk_result, dict):
+        risk_result = {}
+    risk_level = str(risk_result.get("risk_level") or selected_row.get("风险等级") or "unknown").lower()
+    risk_result["risk_level"] = risk_level
+    risk_summary = str(selected_row.get("风险摘要") or risk_result.get("risk_summary") or "").strip()
+    if risk_summary:
+        risk_result["risk_summary"] = risk_summary
+    detail["risk_result"] = risk_result
+
+    current_screening = detail.get("screening_result")
+    if not isinstance(current_screening, dict):
+        current_screening = {}
+
+    allow_direct_change = bool(
+        ((ai_cfg.get("score_adjustment_limit") or {}).get("allow_direct_recommendation_change", False))
+    )
+    if allow_direct_change:
+        current_screening = build_screening_decision(
+            scores_input=detail.get("score_details") or {},
+            risk_level=risk_level,
+            risks=risk_result.get("risk_points", []),
+        )
+        selected_row["初筛结论"] = current_screening.get("screening_result", "")
+        selected_row["候选池"] = _candidate_pool_label(selected_row.get("初筛结论", ""))
+    else:
+        current_screening.setdefault("screening_result", str(selected_row.get("初筛结论") or ""))
+        current_screening.setdefault("screening_reasons", current_screening.get("screening_reasons") or [])
+
+    detail["screening_result"] = current_screening
+
+    auto_decision = str((detail.get("screening_result") or {}).get("screening_result") or "")
+    if auto_decision:
+        selected_row["初筛结论"] = auto_decision
+    selected_row["风险等级"] = risk_level
+    if risk_summary:
+        selected_row["风险摘要"] = risk_summary
+    selected_row["审核摘要"] = _review_summary(auto_decision, risk_level, risk_summary)
+    detail["review_summary"] = selected_row["审核摘要"]
+
+
+def _build_ai_review_metadata(detail: dict) -> dict:
+    actions = detail.get("ai_applied_actions")
+    score_details = detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {}
+    score_snapshot = {
+        dim_name: (dim_detail.get("score") if isinstance(dim_detail, dict) else dim_detail)
+        for dim_name, dim_detail in score_details.items()
+    }
+    screening_result = detail.get("screening_result") if isinstance(detail.get("screening_result"), dict) else {}
+    risk_result = detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {}
+    return {
+        "scores": score_snapshot,
+        "auto_screening_result": str(screening_result.get("screening_result") or ""),
+        "auto_risk_level": str(risk_result.get("risk_level") or "unknown"),
+        "screening_reasons": screening_result.get("screening_reasons") if isinstance(screening_result.get("screening_reasons"), list) else [],
+        "risk_points": risk_result.get("risk_points") if isinstance(risk_result.get("risk_points"), list) else [],
+        "evidence_snippets": detail.get("evidence_snippets") if isinstance(detail.get("evidence_snippets"), list) else [],
+        "ai_applied": bool(detail.get("ai_applied")),
+        "ai_applied_actions": actions if isinstance(actions, list) else [],
+        "ai_applied_by_name": str(detail.get("ai_applied_by_name") or ""),
+        "ai_applied_by_email": str(detail.get("ai_applied_by_email") or ""),
+        "ai_applied_at": str(detail.get("ai_applied_at") or ""),
+        "ai_source": str(detail.get("ai_source") or ""),
+        "ai_mode": str(detail.get("ai_mode") or ""),
+        "ai_model": str(detail.get("ai_model") or ""),
+        "ai_input_hash": str(detail.get("ai_input_hash") or ""),
+        "ai_prompt_version": str(detail.get("ai_prompt_version") or ""),
+        "ai_generated_latency_ms": int(detail.get("ai_generated_latency_ms") or 0),
+        "ai_generation_reason": str(detail.get("ai_generation_reason") or ""),
+        "ai_refresh_reason": str(detail.get("ai_refresh_reason") or ""),
+        "ai_review_status": str(detail.get("ai_review_status") or ""),
+        "ai_generated_at": str(detail.get("ai_generated_at") or ""),
+        "ai_generated_by_name": str(detail.get("ai_generated_by_name") or ""),
+        "ai_generated_by_email": str(detail.get("ai_generated_by_email") or ""),
+        "ai_review_error": str(detail.get("ai_review_error") or ""),
+        "ai_review_summary_snapshot": str(detail.get("ai_review_summary_snapshot") or ""),
+        "ai_score_adjustments_snapshot": (
+            detail.get("ai_score_adjustments_snapshot")
+            if isinstance(detail.get("ai_score_adjustments_snapshot"), list)
+            else []
+        ),
+        "ai_risk_adjustment_snapshot": (
+            detail.get("ai_risk_adjustment_snapshot")
+            if isinstance(detail.get("ai_risk_adjustment_snapshot"), dict)
+            else {}
+        ),
+        "ai_reverted": bool(detail.get("ai_reverted")),
+        "ai_reverted_actions": (
+            detail.get("ai_reverted_actions")
+            if isinstance(detail.get("ai_reverted_actions"), list)
+            else []
+        ),
+        "ai_reverted_at": str(detail.get("ai_reverted_at") or ""),
+        "ai_reverted_by_name": str(detail.get("ai_reverted_by_name") or ""),
+        "ai_reverted_by_email": str(detail.get("ai_reverted_by_email") or ""),
+    }
+
+
+def _generate_ai_review_for_candidate(
+    rows: list[dict],
+    details: dict[str, dict],
+    selected_row: dict,
+    detail: dict,
+    candidate_id: str,
+    batch_id: str,
+    review_id: str,
+    *,
+    force_refresh: bool = False,
+) -> tuple[bool, str, str]:
+    _normalize_ai_review_state(detail)
+    ai_status = _refresh_ai_review_freshness(detail)
+    current_input_hash = _current_ai_input_hash(detail)
+    parsed_jd = detail.get("parsed_jd") if isinstance(detail.get("parsed_jd"), dict) else {}
+    scoring_cfg = parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {}
+    ai_cfg = scoring_cfg.get("ai_reviewer") if isinstance(scoring_cfg.get("ai_reviewer"), dict) else {}
+    ai_mode = str(ai_cfg.get("ai_reviewer_mode") or "off")
+    ai_enabled = bool(ai_cfg.get("enable_ai_reviewer", False)) and ai_mode != "off"
+    if not ai_enabled:
+        detail["ai_review_status"] = "not_generated"
+        detail["ai_review_error"] = ""
+        return False, "当前岗位未启用 AI reviewer，无法生成 AI 审核建议。", "warning"
+
+    ai_suggestion = detail.get("ai_review_suggestion") if isinstance(detail.get("ai_review_suggestion"), dict) else {}
+    if (
+        not force_refresh
+        and ai_status == "ready"
+        and bool(ai_suggestion)
+        and current_input_hash
+        and current_input_hash == str(detail.get("ai_input_hash") or "").strip()
+    ):
+        return False, "当前 AI 建议仍然有效，可直接查看或手动刷新。", "info"
+
+    template_name = scoring_cfg.get("role_template") or scoring_cfg.get("profile_name")
+    role_profile = get_profile_by_name(template_name) if template_name else detect_role_profile(parsed_jd)
+    operator = _current_operator()
+    if batch_id:
+        can_operate, lock_state = can_user_operate_candidate(
+            batch_id=batch_id,
+            candidate_id=candidate_id,
+            operator_user_id=str(operator["user_id"] or ""),
+            is_admin=bool(operator.get("is_admin")),
+        )
+        if not can_operate:
+            _sync_candidate_lock_state(selected_row, detail, lock_state, str(operator["user_id"] or ""))
+            return False, "当前候选人已被其他 HR 锁定，暂不可生成或刷新 AI 建议。", "warning"
+    generation_reason = _resolve_ai_generation_reason(detail, force_refresh)
+    lock_key = _ai_generation_lock_key(candidate_id, batch_id, review_id)
+    generation_locks = st.session_state.setdefault("workspace_ai_generation_locks", {})
+    if generation_locks.get(lock_key):
+        return False, "AI 审核建议正在生成中，请稍候。", "info"
+
+    generation_locks[lock_key] = True
+    st.session_state.workspace_ai_generation_locks = generation_locks
+    started_at = perf_counter()
+    try:
+        ai_suggestion = run_ai_reviewer(
+            parsed_jd=parsed_jd,
+            parsed_resume=detail.get("parsed_resume") if isinstance(detail.get("parsed_resume"), dict) else {},
+            role_profile=role_profile,
+            scoring_config=scoring_cfg,
+            score_details=detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {},
+            risk_result=detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {},
+            screening_result=detail.get("screening_result") if isinstance(detail.get("screening_result"), dict) else {},
+            evidence_snippets=detail.get("evidence_snippets") if isinstance(detail.get("evidence_snippets"), list) else [],
+        )
+        elapsed_ms = max(0, int((perf_counter() - started_at) * 1000))
+        ai_suggestion = ai_suggestion if isinstance(ai_suggestion, dict) else {}
+        ai_meta = ai_suggestion.get("meta") if isinstance(ai_suggestion.get("meta"), dict) else {}
+        detail["ai_review_suggestion"] = ai_suggestion
+        detail["ai_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        detail["ai_generated_by_name"] = operator["name"]
+        detail["ai_generated_by_email"] = operator["email"]
+        detail["ai_review_error"] = ""
+        detail["ai_source"] = str(ai_meta.get("source") or "")
+        detail["ai_model"] = str(ai_meta.get("model") or ai_cfg.get("model") or "")
+        detail["ai_mode"] = str(ai_suggestion.get("mode") or ai_mode or "")
+        detail["ai_input_hash"] = current_input_hash
+        detail["ai_prompt_version"] = str(ai_meta.get("prompt_version") or get_ai_reviewer_prompt_version())
+        detail["ai_generated_latency_ms"] = int(ai_meta.get("generated_latency_ms") or elapsed_ms)
+        detail["ai_generation_reason"] = generation_reason
+        detail["ai_refresh_reason"] = "" if generation_reason == "first_generate" else generation_reason
+        detail["ai_review_status"] = "ready"
+        ai_status = _refresh_ai_review_freshness(detail)
+        persisted = _persist_workspace_candidate_state(
+            rows=rows,
+            details=details,
+            selected_row=selected_row,
+            detail=detail,
+            candidate_id=candidate_id,
+            batch_id=batch_id,
+            review_id=review_id,
+            operator=operator,
+        )
+        if not persisted:
+            return False, "AI 审核建议已生成，但当前候选人锁状态已变化，未能落盘。", "warning"
+        action_text = "刷新" if force_refresh else "生成"
+        source = detail.get("ai_source") or "-"
+        model = detail.get("ai_model") or "-"
+        latency = int(detail.get("ai_generated_latency_ms") or elapsed_ms)
+        if source == "stub":
+            return (
+                True,
+                f"已{action_text} AI 审核建议。当前为 fallback 结果，仅用于辅助参考。来源：{source}，模型：{model}，耗时：{latency} ms。",
+                "warning",
+            )
+        status_note = "最新有效" if ai_status == "ready" else _ai_review_status_label(ai_status)
+        return (
+            True,
+            f"已{action_text} AI 审核建议。来源：{source}，模型：{model}，耗时：{latency} ms，状态：{status_note}。",
+            "success",
+        )
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = max(0, int((perf_counter() - started_at) * 1000))
+        detail["ai_review_status"] = "failed"
+        detail["ai_review_error"] = str(exc)
+        detail["ai_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        detail["ai_generated_by_name"] = operator["name"]
+        detail["ai_generated_by_email"] = operator["email"]
+        detail["ai_input_hash"] = current_input_hash
+        detail["ai_prompt_version"] = get_ai_reviewer_prompt_version()
+        detail["ai_generated_latency_ms"] = elapsed_ms
+        detail["ai_generation_reason"] = generation_reason
+        detail["ai_refresh_reason"] = "" if generation_reason == "first_generate" else generation_reason
+        detail["ai_mode"] = ai_mode
+        detail["ai_model"] = str(detail.get("ai_model") or ai_cfg.get("model") or "")
+        persisted = _persist_workspace_candidate_state(
+            rows=rows,
+            details=details,
+            selected_row=selected_row,
+            detail=detail,
+            candidate_id=candidate_id,
+            batch_id=batch_id,
+            review_id=review_id,
+            operator=operator,
+        )
+        if not persisted and batch_id:
+            return False, f"AI 审核建议生成失败：{exc}", "warning"
+        return False, f"AI 审核建议生成失败：{exc}", "warning"
+    finally:
+        generation_locks = st.session_state.setdefault("workspace_ai_generation_locks", {})
+        generation_locks.pop(lock_key, None)
+        st.session_state.workspace_ai_generation_locks = generation_locks
+
+
+def _apply_ai_suggestions_to_candidate(
+    rows: list[dict],
+    details: dict[str, dict],
+    selected_row: dict,
+    detail: dict,
+    candidate_id: str,
+    batch_id: str,
+    review_id: str,
+    ai_cfg: dict,
+    ai_suggestion: dict,
+    *,
+    apply_evidence: bool = False,
+    apply_timeline: bool = False,
+    apply_risk: bool = False,
+    apply_scores: bool = False,
+) -> tuple[bool, str]:
+    _ensure_ai_application_baseline(detail, selected_row)
+    applied_actions: list[str] = []
+
+    if apply_evidence:
+        added = _apply_ai_evidence_suggestions(detail, ai_suggestion.get("evidence_updates") or [])
+        if added > 0:
+            applied_actions.append("evidence")
+
+    if apply_timeline:
+        added = _apply_ai_timeline_updates(detail, ai_suggestion)
+        if added > 0:
+            applied_actions.append("timeline")
+
+    if apply_risk and _apply_ai_risk_suggestion(detail, selected_row, ai_suggestion):
+        applied_actions.append("risk")
+
+    if apply_scores and _apply_ai_score_suggestions(detail, selected_row, ai_suggestion) > 0:
+        applied_actions.append("scores")
+
+    if not applied_actions:
+        return False, "当前没有新的 AI 建议可应用。"
+
+    _refresh_candidate_after_ai_application(detail, selected_row, ai_cfg)
+
+    operator = _current_operator()
+    detail["ai_applied"] = True
+    detail["ai_applied_actions"] = _merge_ai_actions(
+        detail.get("ai_applied_actions") if isinstance(detail.get("ai_applied_actions"), list) else [],
+        applied_actions,
+    )
+    detail["ai_applied_by_name"] = operator["name"]
+    detail["ai_applied_by_email"] = operator["email"]
+    detail["ai_applied_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detail["ai_source"] = str((ai_suggestion.get("meta") or {}).get("source") or "")
+    detail["ai_mode"] = str(ai_suggestion.get("mode") or ai_cfg.get("ai_reviewer_mode") or "")
+    detail["ai_model"] = str((ai_suggestion.get("meta") or {}).get("model") or ai_cfg.get("model") or "")
+    detail["ai_reverted"] = False
+    detail["ai_reverted_actions"] = []
+    detail["ai_reverted_at"] = ""
+    detail["ai_reverted_by_name"] = ""
+    detail["ai_reverted_by_email"] = ""
+    detail["ai_review_summary_snapshot"] = str(ai_suggestion.get("review_summary") or "")
+    detail["ai_score_adjustments_snapshot"] = (
+        ai_suggestion.get("score_adjustments") if isinstance(ai_suggestion.get("score_adjustments"), list) else []
+    )
+    detail["ai_risk_adjustment_snapshot"] = (
+        ai_suggestion.get("risk_adjustment") if isinstance(ai_suggestion.get("risk_adjustment"), dict) else {}
+    )
+    _refresh_ai_review_freshness(detail)
+
+    persisted = _persist_workspace_candidate_state(
+        rows=rows,
+        details=details,
+        selected_row=selected_row,
+        detail=detail,
+        candidate_id=candidate_id,
+        batch_id=batch_id,
+        review_id=review_id,
+        operator=operator,
+    )
+    if not persisted:
+        return False, "当前候选人锁状态已变化，未能应用 AI 建议。"
+
+    action_labels_clean = {
+        "evidence": "证据建议",
+        "timeline": "时间线建议",
+        "risk": "风险建议",
+        "scores": "改分建议",
+    }
+    applied_text_clean = "、".join(action_labels_clean.get(action, action) for action in applied_actions)
+    persisted_text_clean = "并已写入当前批次留痕" if persisted else "已更新当前页面状态"
+    return True, f"已应用 AI 建议：{applied_text_clean}，{persisted_text_clean}。"
+
+
+
+
+def _revert_ai_application_from_baseline(
+    rows: list[dict],
+    details: dict[str, dict],
+    selected_row: dict,
+    detail: dict,
+    candidate_id: str,
+    batch_id: str,
+    review_id: str,
+    *,
+    full_restore: bool,
+) -> tuple[bool, str]:
+    if not detail.get("ai_baseline_saved"):
+        return False, "当前没有可恢复的原始规则 baseline。"
+
+    applied_actions = detail.get("ai_applied_actions") if isinstance(detail.get("ai_applied_actions"), list) else []
+    if not applied_actions and not detail.get("ai_applied"):
+        return False, "当前没有已应用的 AI 建议可撤回。"
+
+    restored = _restore_ai_baseline(
+        detail,
+        selected_row,
+        restore_evidence=full_restore,
+        restore_timeline=full_restore,
+    )
+    if not restored:
+        return False, "恢复 baseline 失败。"
+
+    operator = _current_operator()
+    reverted_actions = deepcopy(applied_actions)
+    if full_restore:
+        _clear_ai_application_state(detail, clear_baseline=True)
+    else:
+        remaining_actions = [action for action in applied_actions if action not in {"scores", "risk"}]
+        detail["ai_applied"] = bool(remaining_actions)
+        detail["ai_applied_actions"] = remaining_actions
+        if not remaining_actions:
+            detail["ai_applied_by_name"] = ""
+            detail["ai_applied_by_email"] = ""
+            detail["ai_applied_at"] = ""
+    detail["ai_reverted"] = True
+    detail["ai_reverted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detail["ai_reverted_by_name"] = operator["name"]
+    detail["ai_reverted_by_email"] = operator["email"]
+    detail["ai_reverted_actions"] = reverted_actions
+    _refresh_ai_review_freshness(detail)
+
+    persisted = _persist_workspace_candidate_state(
+        rows=rows,
+        details=details,
+        selected_row=selected_row,
+        detail=detail,
+        candidate_id=candidate_id,
+        batch_id=batch_id,
+        review_id=review_id,
+        operator=operator,
+    )
+    if not persisted:
+        return False, "当前候选人锁状态已变化，未能撤回 AI 建议。"
+    reverted_text = "、".join(reverted_actions) or "AI 建议"
+    suffix = "并恢复原始规则结果" if full_restore else "并撤回 AI 改分影响"
+    persisted_text = "，且已写入当前批次留痕" if persisted else ""
+    return True, f"已撤回 {reverted_text}{suffix}{persisted_text}。"
+
+
+def _clear_ai_application_state_for_candidate(
+    rows: list[dict],
+    details: dict[str, dict],
+    selected_row: dict,
+    detail: dict,
+    candidate_id: str,
+    batch_id: str,
+    review_id: str,
+) -> tuple[bool, str]:
+    has_state = bool(detail.get("ai_applied") or detail.get("ai_baseline_saved") or detail.get("ai_reverted"))
+    if not has_state:
+        return False, "当前没有可清除的 AI 应用状态。"
+
+    operator = _current_operator()
+    _clear_ai_application_state(detail, clear_baseline=True)
+    _refresh_ai_review_freshness(detail)
+    persisted = _persist_workspace_candidate_state(
+        rows=rows,
+        details=details,
+        selected_row=selected_row,
+        detail=detail,
+        candidate_id=candidate_id,
+        batch_id=batch_id,
+        review_id=review_id,
+        operator=operator,
+    )
+    if not persisted:
+        return False, "当前候选人锁状态已变化，未能清除 AI 应用状态。"
+    persisted_text = "并已写入当前批次留痕" if persisted else "已更新当前页面状态"
+    return True, f"已清除 AI 应用状态，{persisted_text}。"
+
+
+def _workspace_selection_scope() -> str:
+    selected_jd = str(st.session_state.get("workspace_selected_jd_title") or "").strip() or "session"
+    batch_id = str(st.session_state.get("workspace_preferred_batch_id") or "").strip() or "session"
+    return f"{selected_jd}|{batch_id}"
+
+
+def _workspace_selection_key(selection_scope: str, candidate_id: str) -> str:
+    return f"workspace_batch_select::{selection_scope}::{candidate_id}"
+
+
+def _get_workspace_selected_candidate_ids(rows: list[dict], selection_scope: str) -> list[str]:
+    selected_ids: list[str] = []
+    for row in rows:
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        if candidate_id and st.session_state.get(_workspace_selection_key(selection_scope, candidate_id), False):
+            selected_ids.append(candidate_id)
+    return selected_ids
+
+
+def _set_workspace_selected_candidate_ids(
+    selection_scope: str,
+    candidate_ids: list[str],
+    *,
+    selected: bool,
+) -> int:
+    target_ids = {str(candidate_id or "").strip() for candidate_id in candidate_ids if str(candidate_id or "").strip()}
+    if not target_ids:
+        return 0
+
+    changed = 0
+    for candidate_id in target_ids:
+        key = _workspace_selection_key(selection_scope, candidate_id)
+        if bool(st.session_state.get(key, False)) != selected:
+            changed += 1
+        st.session_state[key] = selected
+    return changed
+
+
+def _workspace_candidate_flags(row: dict, detail: dict | None) -> dict:
+    safe_detail = detail if isinstance(detail, dict) else {}
+    current_operator = _current_operator()
+    if isinstance(detail, dict):
+        _normalize_ai_review_state(detail)
+        ai_status = _refresh_ai_review_freshness(detail)
+    else:
+        ai_status = "not_generated"
+
+    extract_info = safe_detail.get("extract_info") if isinstance(safe_detail.get("extract_info"), dict) else {}
+    quality = str(extract_info.get("quality") or row.get("提取质量") or "")
+    message = str(extract_info.get("message") or row.get("提取说明") or "")
+    parse_status = str(row.get("解析状态") or extract_info.get("parse_status") or "")
+    if not parse_status and (quality or message):
+        parse_status = _resolve_parse_status(quality, message)
+
+    risk_result = safe_detail.get("risk_result") if isinstance(safe_detail.get("risk_result"), dict) else {}
+    risk_level = str(row.get("风险等级") or risk_result.get("risk_level") or "unknown").lower()
+    manual_decision = str(safe_detail.get("manual_decision") or row.get("人工最终结论") or "").strip()
+    manual_priority = str(safe_detail.get("manual_priority") or row.get("处理优先级") or "普通").strip() or "普通"
+    ai_generated = ai_status in {"ready", "outdated"}
+    ocr_missing = parse_status == "OCR能力缺失" or _is_ocr_missing_message(message)
+    ocr_weak = parse_status == "弱质量识别" or ((quality or "").lower() == "weak" and not ocr_missing)
+    lock_owner_user_id = str(safe_detail.get("lock_owner_user_id") or "").strip()
+    is_locked_effective = bool(safe_detail.get("is_locked_effective"))
+    self_locked = is_locked_effective and lock_owner_user_id == str(current_operator.get("user_id") or "")
+    locked_by_other = is_locked_effective and not self_locked
+    unlocked = not is_locked_effective
+
+    return {
+        "manual_processed": bool(manual_decision),
+        "manual_priority": manual_priority,
+        "ai_status": ai_status,
+        "ai_generated": ai_generated,
+        "ai_applied": bool(safe_detail.get("ai_applied") or safe_detail.get("ai_applied_actions")),
+        "risk_level": risk_level,
+        "ocr_weak": ocr_weak,
+        "ocr_missing": ocr_missing,
+        "parse_status": parse_status,
+        "current_pool": _current_candidate_pool(row) or str(row.get("候选池") or ""),
+        "self_locked": self_locked,
+        "locked_by_other": locked_by_other,
+        "unlocked": unlocked,
+    }
+
+
+def _build_workspace_batch_stats(rows: list[dict], details: dict[str, dict]) -> dict[str, int]:
+    stats = {
+        "total_candidates": len(rows),
+        "manual_processed": 0,
+        "manual_unprocessed": 0,
+        "ai_generated": 0,
+        "ai_applied": 0,
+        "high_risk": 0,
+        "ocr_weak": 0,
+        "ocr_missing": 0,
+        "pending_review_remaining": 0,
+    }
+
+    for row in rows:
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        flags = _workspace_candidate_flags(row, details.get(candidate_id))
+        if flags["manual_processed"]:
+            stats["manual_processed"] += 1
+        if flags["ai_generated"]:
+            stats["ai_generated"] += 1
+        if flags["ai_applied"]:
+            stats["ai_applied"] += 1
+        if flags["risk_level"] == "high":
+            stats["high_risk"] += 1
+        if flags["ocr_weak"]:
+            stats["ocr_weak"] += 1
+        if flags["ocr_missing"]:
+            stats["ocr_missing"] += 1
+        if flags["current_pool"] == "待复核候选人":
+            stats["pending_review_remaining"] += 1
+
+    stats["manual_unprocessed"] = max(0, stats["total_candidates"] - stats["manual_processed"])
+    return stats
+
+
+def _render_workspace_batch_overview(rows: list[dict], details: dict[str, dict]) -> None:
+    stats = _build_workspace_batch_stats(rows, details)
+    total_candidates = int(stats.get("total_candidates", 0) or 0)
+
+    st.markdown("### 批次运营看板")
+    metric_row_1 = st.columns(4)
+    metric_row_1[0].metric("总候选人数", total_candidates)
+    metric_row_1[1].metric("人工已处理人数", stats.get("manual_processed", 0))
+    metric_row_1[2].metric("人工未处理人数", stats.get("manual_unprocessed", 0))
+    metric_row_1[3].metric("AI 建议已生成人数", stats.get("ai_generated", 0))
+
+    metric_row_2 = st.columns(4)
+    metric_row_2[0].metric("AI 建议已应用人数", stats.get("ai_applied", 0))
+    metric_row_2[1].metric("高风险人数", stats.get("high_risk", 0))
+    metric_row_2[2].metric("OCR 弱质量人数", stats.get("ocr_weak", 0))
+    metric_row_2[3].metric("OCR 能力缺失人数", stats.get("ocr_missing", 0))
+
+    st.caption(
+        f"当前批次已人工处理 {stats.get('manual_processed', 0)} / {total_candidates}"
+        f" ｜ 待复核剩余 {stats.get('pending_review_remaining', 0)}"
+        f" ｜ AI 建议已覆盖 {stats.get('ai_generated', 0)} 人"
+    )
+    st.progress((stats.get("manual_processed", 0) / total_candidates) if total_candidates else 0.0)
+
+
+def _workspace_lock_status_label(lock_row: dict) -> str:
+    if bool(lock_row.get("is_locked_effective")):
+        return "有效锁"
+    if bool(lock_row.get("is_expired")):
+        return "已过期"
+    if bool(lock_row.get("has_lock_metadata")):
+        return "失效待清理"
+    return "未领取"
+
+
+def _workspace_lock_owner_option_label(lock_row: dict) -> str:
+    return str(lock_row.get("lock_owner_name") or lock_row.get("lock_owner_email") or "").strip()
+
+
+def _parse_workspace_timestamp(raw_value: str) -> datetime | None:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+
+    normalized = raw.replace("T", " ")[:19]
+    try:
+        return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _format_workspace_lock_age(lock_acquired_at: str) -> str:
+    acquired_at = _parse_workspace_timestamp(lock_acquired_at)
+    if acquired_at is None:
+        return "-"
+
+    delta_seconds = max(0, int((datetime.now() - acquired_at).total_seconds()))
+    if delta_seconds < 60:
+        return "1 分钟内"
+
+    total_minutes = delta_seconds // 60
+    total_hours = total_minutes // 60
+    days = total_hours // 24
+    hours = total_hours % 24
+    minutes = total_minutes % 60
+
+    if days > 0:
+        return f"{days} 天 {hours} 小时" if hours > 0 else f"{days} 天"
+    if total_hours > 0:
+        return f"{total_hours} 小时 {minutes} 分钟" if minutes > 0 else f"{total_hours} 小时"
+    return f"{total_minutes} 分钟"
+
+
+def _workspace_lock_age_minutes(lock_row: dict) -> int | None:
+    acquired_at = _parse_workspace_timestamp(str(lock_row.get("lock_acquired_at") or ""))
+    if acquired_at is None:
+        return None
+    return max(0, int((datetime.now() - acquired_at).total_seconds() // 60))
+
+
+def _workspace_lock_remaining_minutes(lock_row: dict) -> int | None:
+    expires_at = _parse_workspace_timestamp(str(lock_row.get("lock_expires_at") or ""))
+    if expires_at is None:
+        return None
+    return int((expires_at - datetime.now()).total_seconds() // 60)
+
+
+def _workspace_lock_last_heartbeat_minutes(lock_row: dict) -> int | None:
+    last_heartbeat_at = _parse_workspace_timestamp(str(lock_row.get("lock_last_heartbeat_at") or ""))
+    if last_heartbeat_at is None:
+        return None
+    return max(0, int((datetime.now() - last_heartbeat_at).total_seconds() // 60))
+
+
+def _workspace_is_long_held_lock(lock_row: dict) -> bool:
+    if not bool(lock_row.get("is_locked_effective")):
+        return False
+    age_minutes = _workspace_lock_age_minutes(lock_row)
+    return age_minutes is not None and age_minutes >= 60
+
+
+def _workspace_is_soon_expiring_lock(lock_row: dict) -> bool:
+    if not bool(lock_row.get("is_locked_effective")):
+        return False
+    remaining_minutes = _workspace_lock_remaining_minutes(lock_row)
+    return remaining_minutes is not None and remaining_minutes <= 5
+
+
+def _workspace_is_heartbeat_anomaly(lock_row: dict) -> bool:
+    if not bool(lock_row.get("is_locked_effective")):
+        return False
+
+    last_heartbeat_at = _parse_workspace_timestamp(str(lock_row.get("lock_last_heartbeat_at") or ""))
+    if last_heartbeat_at is None:
+        return True
+
+    expires_at = _parse_workspace_timestamp(str(lock_row.get("lock_expires_at") or ""))
+    if expires_at is not None and last_heartbeat_at > expires_at:
+        return True
+
+    heartbeat_minutes = _workspace_lock_last_heartbeat_minutes(lock_row)
+    return heartbeat_minutes is not None and heartbeat_minutes > 10
+
+
+def _workspace_lock_heartbeat_status_label(lock_row: dict) -> str:
+    if not bool(lock_row.get("is_locked_effective")):
+        return "-"
+    return "异常" if _workspace_is_heartbeat_anomaly(lock_row) else "正常"
+
+
+WORKSPACE_LOCK_HEALTH_ORDER: list[tuple[str, str]] = [
+    ("normal", "正常"),
+    ("soon_expiring", "即将过期"),
+    ("heartbeat_anomaly", "心跳异常"),
+    ("expired", "已过期"),
+    ("stale", "失效待清理"),
+]
+
+
+def _workspace_lock_health_bucket(lock_row: dict) -> str:
+    if bool(lock_row.get("is_expired")):
+        return "expired"
+    if bool(lock_row.get("has_lock_metadata")) and not bool(lock_row.get("is_locked_effective")) and not bool(
+        lock_row.get("is_expired")
+    ):
+        return "stale"
+    if _workspace_is_heartbeat_anomaly(lock_row):
+        return "heartbeat_anomaly"
+    if _workspace_is_soon_expiring_lock(lock_row):
+        return "soon_expiring"
+    return "normal"
+
+
+def _workspace_lock_health_label(lock_row: dict | str) -> str:
+    bucket = lock_row if isinstance(lock_row, str) else _workspace_lock_health_bucket(lock_row)
+    for key, label in WORKSPACE_LOCK_HEALTH_ORDER:
+        if key == bucket:
+            return label
+    return "正常"
+
+
+def _workspace_filter_lock_health(lock_rows: list[dict], health_view: str) -> list[dict]:
+    if health_view == "仅看正常":
+        return [item for item in lock_rows if _workspace_lock_health_bucket(item) == "normal"]
+    if health_view == "仅看即将过期":
+        return [item for item in lock_rows if _workspace_lock_health_bucket(item) == "soon_expiring"]
+    if health_view == "仅看心跳异常":
+        return [item for item in lock_rows if _workspace_lock_health_bucket(item) == "heartbeat_anomaly"]
+    if health_view == "仅看已过期":
+        return [item for item in lock_rows if _workspace_lock_health_bucket(item) == "expired"]
+    if health_view == "仅看失效待清理":
+        return [item for item in lock_rows if _workspace_lock_health_bucket(item) == "stale"]
+    return lock_rows
+
+
+def _workspace_group_lock_rows_by_health(lock_rows: list[dict]) -> dict[str, list[dict]]:
+    groups = {key: [] for key, _ in WORKSPACE_LOCK_HEALTH_ORDER}
+    for item in lock_rows:
+        groups[_workspace_lock_health_bucket(item)].append(item)
+    return groups
+
+
+def _workspace_lock_event_source(event: dict) -> str:
+    extra = event.get("extra_json") if isinstance(event, dict) else {}
+    if not isinstance(extra, dict):
+        extra = {}
+    return str(extra.get("source") or "-").strip() or "-"
+
+
+def _workspace_lock_event_action_label(event: dict) -> str:
+    action_type = str(event.get("action_type") or "").strip()
+    source = _workspace_lock_event_source(event)
+    if action_type == "candidate_lock_acquired":
+        return "领取锁"
+    if action_type == "candidate_lock_released":
+        return "释放锁"
+    if action_type == "candidate_lock_force_released":
+        if source == "admin_expired_cleanup":
+            return "清理过期/失效锁"
+        return "管理员强制解锁"
+    return action_type or "未知动作"
+
+
+def _workspace_lock_event_summary(event: dict, candidate_label: str) -> str:
+    operator_label = str(event.get("operator_name") or event.get("operator_email") or "未知操作人").strip() or "未知操作人"
+    action_label = _workspace_lock_event_action_label(event)
+    candidate_text = candidate_label or "该候选人"
+    admin_operator_label = operator_label if operator_label.startswith("管理员") else f"管理员 {operator_label}"
+    if action_label == "领取锁":
+        return f"{operator_label} 领取了{candidate_text}"
+    if action_label == "释放锁":
+        return f"{operator_label} 释放了{candidate_text}"
+    if action_label == "管理员强制解锁":
+        return f"{admin_operator_label} 强制解锁了{candidate_text}"
+    if action_label == "清理过期/失效锁":
+        return f"{admin_operator_label} 清理了{candidate_text}的过期/失效锁"
+    return f"{operator_label} 对{candidate_text}执行了 {action_label}"
+
+
+def _workspace_filter_lock_view(lock_rows: list[dict], view_mode: str) -> list[dict]:
+    if view_mode == "仅看长时间未释放锁":
+        return [item for item in lock_rows if _workspace_is_long_held_lock(item)]
+    if view_mode == "仅看即将过期锁":
+        return [item for item in lock_rows if _workspace_is_soon_expiring_lock(item)]
+    if view_mode == "仅看心跳异常":
+        return [item for item in lock_rows if _workspace_is_heartbeat_anomaly(item)]
+    if view_mode == "仅看管理员需介入":
+        return [
+            item
+            for item in lock_rows
+            if bool(item.get("is_expired"))
+            or (
+                bool(item.get("has_lock_metadata"))
+                and not bool(item.get("is_locked_effective"))
+                and not bool(item.get("is_expired"))
+            )
+            or _workspace_is_long_held_lock(item)
+        ]
+    return lock_rows
+
+
+def _workspace_lock_sort_key(lock_row: dict, sort_mode: str) -> tuple:
+    candidate_label = str(
+        lock_row.get("candidate_name") or lock_row.get("source_name") or lock_row.get("candidate_id") or ""
+    ).strip().lower()
+    age_minutes = _workspace_lock_age_minutes(lock_row)
+    expires_at = _parse_workspace_timestamp(str(lock_row.get("lock_expires_at") or ""))
+    expires_ts = expires_at.timestamp() if expires_at is not None else None
+
+    if sort_mode == "锁龄（长到短）":
+        return (age_minutes is None, -(age_minutes or 0), candidate_label)
+    if sort_mode == "锁龄（短到长）":
+        return (age_minutes is None, age_minutes if age_minutes is not None else 10**9, candidate_label)
+    if sort_mode == "过期时间（近到远）":
+        return (expires_ts is None, expires_ts if expires_ts is not None else float("inf"), candidate_label)
+    if sort_mode == "过期时间（远到近）":
+        return (expires_ts is None, -(expires_ts or 0), candidate_label)
+    return (candidate_label, str(lock_row.get("candidate_id") or "").strip().lower())
+
+
+def _filter_workspace_lock_rows(
+    lock_rows: list[dict],
+    *,
+    status_filter: str,
+    owner_filter: str,
+) -> list[dict]:
+    result: list[dict] = []
+    for item in lock_rows:
+        status_label = _workspace_lock_status_label(item)
+        owner_label = _workspace_lock_owner_option_label(item)
+        if status_filter == "仅有效锁" and status_label != "有效锁":
+            continue
+        if status_filter == "仅已过期" and status_label != "已过期":
+            continue
+        if status_filter == "仅失效待清理" and status_label != "失效待清理":
+            continue
+        if owner_filter != "全部" and owner_label != owner_filter:
+            continue
+        result.append(item)
+    return result
+
+
+def _render_workspace_admin_lock_panel(batch_id: str) -> None:
+    operator = _current_operator()
+    if not batch_id or not bool(operator.get("is_admin")):
+        return
+
+    lock_rows = list_batch_candidate_lock_states(batch_id)
+    visible_lock_rows = [item for item in lock_rows if bool(item.get("is_locked_effective")) or bool(item.get("has_lock_metadata"))]
+    visible_lock_rows.sort(
+        key=lambda item: (
+            0
+            if bool(item.get("is_locked_effective"))
+            else 1
+            if bool(item.get("is_expired"))
+            else 2,
+            str(item.get("lock_expires_at") or ""),
+            str(item.get("candidate_name") or item.get("source_name") or item.get("candidate_id") or ""),
+        )
+    )
+    effective_count = sum(1 for item in visible_lock_rows if bool(item.get("is_locked_effective")))
+    expired_count = sum(1 for item in visible_lock_rows if bool(item.get("is_expired")))
+    stale_count = sum(
+        1
+        for item in visible_lock_rows
+        if bool(item.get("has_lock_metadata")) and not bool(item.get("is_locked_effective")) and not bool(item.get("is_expired"))
+    )
+    long_held_count = sum(1 for item in visible_lock_rows if _workspace_is_long_held_lock(item))
+    heartbeat_anomaly_count = sum(1 for item in visible_lock_rows if _workspace_is_heartbeat_anomaly(item))
+    health_groups = _workspace_group_lock_rows_by_health(visible_lock_rows)
+
+    with st.expander("管理员锁列表", expanded=False):
+        st.caption(
+            f"当前批次有效锁 {effective_count} 个 ｜ 已过期 {expired_count} 个 ｜ 可清理失效锁 {expired_count + stale_count} 个 ｜ 长时间未释放锁 {long_held_count} 个 ｜ 心跳异常 {heartbeat_anomaly_count} 个"
+        )
+        st.caption("锁健康摘要")
+        summary_cols = st.columns(5)
+        for idx, (bucket_key, label) in enumerate(WORKSPACE_LOCK_HEALTH_ORDER):
+            summary_cols[idx].metric(label, len(health_groups.get(bucket_key, [])))
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            if st.button("刷新当前批次锁状态", key=f"workspace_refresh_lock_panel_{batch_id}", use_container_width=True):
+                st.session_state.workspace_action_feedback = "已刷新当前批次锁状态。"
+                st.session_state.workspace_action_feedback_kind = "info"
+                st.rerun()
+        with action_cols[1]:
+            if st.button(
+                "清理过期 / 失效锁",
+                key=f"workspace_cleanup_expired_locks_{batch_id}",
+                use_container_width=True,
+                disabled=(expired_count + stale_count) <= 0,
+            ):
+                cleaned_count = cleanup_expired_candidate_locks(
+                    batch_id,
+                    operator_user_id=str(operator["user_id"] or ""),
+                    operator_name=str(operator["name"] or ""),
+                    operator_email=str(operator["email"] or ""),
+                    is_admin=True,
+                )
+                st.session_state.workspace_action_feedback = (
+                    f"已清理 {cleaned_count} 个过期 / 失效锁。"
+                    if cleaned_count > 0
+                    else "当前批次没有可清理的过期 / 失效锁。"
+                )
+                st.session_state.workspace_action_feedback_kind = "success" if cleaned_count > 0 else "info"
+                st.rerun()
+
+        row_map = {
+            str(row.get("candidate_id") or "").strip(): row
+            for row in st.session_state.get("v2_rows", [])
+            if isinstance(row, dict) and row.get("candidate_id")
+        }
+
+        st.markdown("#### 最近锁变更")
+        recent_limit_key = f"workspace_recent_lock_events_limit_{batch_id}"
+        recent_view_key = f"workspace_recent_lock_events_view_{batch_id}"
+        recent_cols = st.columns(2)
+        with recent_cols[0]:
+            recent_limit = st.selectbox(
+                "显示条数",
+                options=[10, 20, 30],
+                key=recent_limit_key,
+            )
+        with recent_cols[1]:
+            recent_view = st.selectbox(
+                "记录视图",
+                options=["全部锁变更", "仅看管理员强制处理"],
+                key=recent_view_key,
+            )
+
+        recent_events = list_recent_lock_events(
+            batch_id,
+            limit=int(recent_limit or 30),
+            force_only=recent_view == "仅看管理员强制处理",
+        )
+        if not recent_events:
+            st.caption("当前批次暂无最近锁变更记录。")
+        else:
+            for event in recent_events:
+                candidate_id = str(event.get("candidate_id") or "").strip()
+                candidate_row = row_map.get(candidate_id)
+                candidate_label = (
+                    str(candidate_row.get("姓名") or candidate_row.get("候选人") or "").strip()
+                    if isinstance(candidate_row, dict)
+                    else str(candidate_id or "未命名候选人")
+                )
+                operator_label = str(event.get("operator_name") or event.get("operator_email") or "-").strip() or "-"
+                source_label = _workspace_lock_event_source(event)
+                action_label = _workspace_lock_event_action_label(event)
+                summary_text = _workspace_lock_event_summary(event, candidate_label)
+
+                st.markdown("<div class='module-box'>", unsafe_allow_html=True)
+                event_cols = st.columns([0.22, 0.22, 0.18, 0.18, 0.20])
+                with event_cols[0]:
+                    st.caption("时间")
+                    st.write(str(event.get("created_at") or "-"))
+                with event_cols[1]:
+                    st.caption("候选人")
+                    st.write(candidate_label)
+                    st.caption(f"candidate_id：{candidate_id[:12] + '...' if len(candidate_id) > 12 else (candidate_id or '-')}")
+                with event_cols[2]:
+                    st.caption("动作")
+                    st.write(action_label)
+                with event_cols[3]:
+                    st.caption("操作人")
+                    st.write(operator_label)
+                with event_cols[4]:
+                    st.caption("来源")
+                    st.write(source_label)
+                st.caption(summary_text)
+                if st.button(
+                    "跳转到该候选人",
+                    key=f"workspace_recent_lock_event_focus_{batch_id}_{event.get('action_id') or candidate_id}",
+                    use_container_width=True,
+                    disabled=not isinstance(candidate_row, dict),
+                ):
+                    if not isinstance(candidate_row, dict):
+                        st.session_state.workspace_action_feedback = "未在当前批次中找到该候选人，无法跳转。"
+                        st.session_state.workspace_action_feedback_kind = "warning"
+                    else:
+                        _focus_workspace_candidate(candidate_id, candidate_row, reset_filters=True)
+                        st.session_state.workspace_action_feedback = f"已跳转到候选人：{candidate_label}"
+                        st.session_state.workspace_action_feedback_kind = "success"
+                    st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        if not visible_lock_rows:
+            st.caption("当前批次暂无锁记录。")
+            return
+
+        status_filter_key = f"workspace_admin_lock_status_filter_{batch_id}"
+        owner_filter_key = f"workspace_admin_lock_owner_filter_{batch_id}"
+        view_mode_key = f"workspace_admin_lock_view_mode_{batch_id}"
+        health_view_key = f"workspace_admin_lock_health_view_{batch_id}"
+        sort_mode_key = f"workspace_admin_lock_sort_mode_{batch_id}"
+        group_by_health_key = f"workspace_admin_lock_group_by_health_{batch_id}"
+        status_options = ["全部", "仅有效锁", "仅已过期", "仅失效待清理"]
+        view_options = ["全部锁", "仅看长时间未释放锁", "仅看即将过期锁", "仅看心跳异常", "仅看管理员需介入"]
+        health_view_options = ["全部健康状态", "仅看正常", "仅看即将过期", "仅看心跳异常", "仅看已过期", "仅看失效待清理"]
+        sort_options = ["锁龄（长到短）", "锁龄（短到长）", "过期时间（近到远）", "过期时间（远到近）", "候选人名称"]
+        owner_options = ["全部"]
+        seen_owners: set[str] = set()
+        for item in visible_lock_rows:
+            owner_label = _workspace_lock_owner_option_label(item)
+            if owner_label and owner_label not in seen_owners:
+                seen_owners.add(owner_label)
+                owner_options.append(owner_label)
+
+        if st.session_state.get(status_filter_key) not in status_options:
+            st.session_state[status_filter_key] = "全部"
+        if st.session_state.get(owner_filter_key) not in owner_options:
+            st.session_state[owner_filter_key] = "全部"
+        if st.session_state.get(view_mode_key) not in view_options:
+            st.session_state[view_mode_key] = "全部锁"
+        if st.session_state.get(health_view_key) not in health_view_options:
+            st.session_state[health_view_key] = "全部健康状态"
+        if st.session_state.get(sort_mode_key) not in sort_options:
+            st.session_state[sort_mode_key] = "锁龄（长到短）"
+
+        filter_cols = st.columns(5)
+        with filter_cols[0]:
+            status_filter = st.selectbox(
+                "状态筛选",
+                options=status_options,
+                key=status_filter_key,
+            )
+        with filter_cols[1]:
+            owner_filter = st.selectbox(
+                "锁定人筛选",
+                options=owner_options,
+                key=owner_filter_key,
+            )
+        with filter_cols[2]:
+            view_mode = st.selectbox(
+                "锁视图",
+                options=view_options,
+                key=view_mode_key,
+            )
+        with filter_cols[3]:
+            health_view = st.selectbox(
+                "健康视图",
+                options=health_view_options,
+                key=health_view_key,
+            )
+        with filter_cols[4]:
+            sort_mode = st.selectbox(
+                "排序方式",
+                options=sort_options,
+                key=sort_mode_key,
+            )
+        group_by_health = st.checkbox("按健康状态分组显示", key=group_by_health_key)
+
+        filtered_lock_rows = _filter_workspace_lock_rows(
+            visible_lock_rows,
+            status_filter=status_filter,
+            owner_filter=owner_filter,
+        )
+        filtered_lock_rows = _workspace_filter_lock_view(filtered_lock_rows, view_mode)
+        filtered_lock_rows = _workspace_filter_lock_health(filtered_lock_rows, health_view)
+        filtered_lock_rows = sorted(filtered_lock_rows, key=lambda item: _workspace_lock_sort_key(item, sort_mode))
+
+        if not filtered_lock_rows:
+            st.caption("当前筛选条件下暂无锁记录。")
+            return
+
+        grouped_rows: dict[str, list[dict]] = {}
+        display_lock_rows = filtered_lock_rows
+        if group_by_health:
+            grouped_rows = _workspace_group_lock_rows_by_health(filtered_lock_rows)
+            display_lock_rows = []
+            for bucket_key, _ in WORKSPACE_LOCK_HEALTH_ORDER:
+                display_lock_rows.extend(grouped_rows.get(bucket_key, []))
+        rendered_health_buckets: set[str] = set()
+
+        for item in display_lock_rows:
+            if group_by_health:
+                health_bucket = _workspace_lock_health_bucket(item)
+                if health_bucket not in rendered_health_buckets:
+                    rendered_health_buckets.add(health_bucket)
+                    st.markdown(f"**{_workspace_lock_health_label(health_bucket)}（{len(grouped_rows.get(health_bucket, []))}）**")
+            candidate_id = str(item.get("candidate_id") or "").strip()
+            candidate_row = row_map.get(candidate_id)
+            status_label = _workspace_lock_status_label(item)
+            candidate_label = str(item.get("candidate_name") or item.get("source_name") or candidate_id or "未命名候选人")
+            candidate_id_short = candidate_id[:12] + "..." if len(candidate_id) > 12 else candidate_id
+            lock_owner = str(item.get("lock_owner_name") or item.get("lock_owner_email") or "-")
+            lock_age = _format_workspace_lock_age(str(item.get("lock_acquired_at") or ""))
+            heartbeat_status = _workspace_lock_heartbeat_status_label(item)
+            last_heartbeat_at = str(item.get("lock_last_heartbeat_at") or "-")
+            lock_reason = str(item.get("lock_reason") or "-")
+
+            st.markdown("<div class='module-box'>", unsafe_allow_html=True)
+            info_cols = st.columns([0.34, 0.16, 0.16, 0.17, 0.17])
+            with info_cols[0]:
+                st.markdown(f"**{candidate_label}**")
+                st.caption(f"candidate_id：{candidate_id_short or '-'}")
+            with info_cols[1]:
+                st.caption("状态")
+                st.write(status_label)
+            with info_cols[2]:
+                st.caption("锁定人")
+                st.write(lock_owner)
+            with info_cols[3]:
+                st.caption("锁到")
+                st.write(str(item.get("lock_expires_at") or "-"))
+            with info_cols[4]:
+                st.caption("锁龄")
+                st.write(lock_age)
+
+            st.caption(
+                f"完整 candidate_id：{candidate_id or '-'} ｜ 领取时间：{item.get('lock_acquired_at') or '-'} ｜ 锁原因：{lock_reason}"
+            )
+            st.caption(
+                f"最后心跳时间：{last_heartbeat_at} ｜ 心跳状态：{heartbeat_status}"
+            )
+            action_cols = st.columns([0.52, 0.48])
+            with action_cols[0]:
+                if st.button(
+                    "跳转到该候选人",
+                    key=f"workspace_admin_focus_candidate_{batch_id}_{candidate_id}",
+                    use_container_width=True,
+                    disabled=not isinstance(candidate_row, dict),
+                ):
+                    if not isinstance(candidate_row, dict):
+                        st.session_state.workspace_action_feedback = "未在当前批次中找到该候选人，无法跳转。"
+                        st.session_state.workspace_action_feedback_kind = "warning"
+                    else:
+                        _focus_workspace_candidate(candidate_id, candidate_row, reset_filters=True)
+                        st.session_state.workspace_action_feedback = f"已跳转到候选人：{candidate_label}"
+                        st.session_state.workspace_action_feedback_kind = "success"
+                    st.rerun()
+            with action_cols[1]:
+                if st.button(
+                    "强制解锁",
+                    key=f"workspace_admin_force_unlock_{batch_id}_{candidate_id}",
+                    use_container_width=True,
+                ):
+                    ok, message = release_candidate_lock(
+                        batch_id,
+                        candidate_id,
+                        operator_user_id=str(operator["user_id"] or ""),
+                        operator_name=str(operator["name"] or ""),
+                        operator_email=str(operator["email"] or ""),
+                        is_admin=True,
+                        force=True,
+                    )
+                    refreshed_lock_state = get_candidate_lock_state(batch_id, candidate_id) or _empty_workspace_lock_state()
+                    _sync_workspace_candidate_lock_in_session(candidate_id, refreshed_lock_state)
+                    st.session_state.workspace_action_feedback = (
+                        f"已强制解锁：{candidate_label}"
+                        if ok and bool(item.get("is_locked_effective"))
+                        else message
+                    )
+                    st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _apply_workspace_quick_filter(
+    rows: list[dict],
+    details: dict[str, dict],
+    quick_filter: str,
+) -> list[dict]:
+    selected_filter = str(quick_filter or "全部").strip() or "全部"
+    if selected_filter == "全部":
+        return rows
+
+    filtered_rows: list[dict] = []
+    for row in rows:
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        flags = _workspace_candidate_flags(row, details.get(candidate_id))
+
+        if selected_filter == "仅看未人工处理" and not flags["manual_processed"]:
+            filtered_rows.append(row)
+        elif selected_filter == "仅看高优先级" and flags["manual_priority"] == "高":
+            filtered_rows.append(row)
+        elif selected_filter == "仅看 AI 建议未生成" and flags["ai_status"] == "not_generated":
+            filtered_rows.append(row)
+        elif selected_filter == "仅看 AI 建议已生成但未应用" and flags["ai_generated"] and not flags["ai_applied"]:
+            filtered_rows.append(row)
+        elif selected_filter == "仅看 OCR 弱质量 / OCR 能力缺失" and (flags["ocr_weak"] or flags["ocr_missing"]):
+            filtered_rows.append(row)
+        elif selected_filter == "仅看高风险且待复核" and flags["risk_level"] == "high" and flags["current_pool"] == "待复核候选人":
+            filtered_rows.append(row)
+        elif selected_filter == "仅看我处理中" and flags["self_locked"]:
+            filtered_rows.append(row)
+        elif selected_filter == "仅看他人锁定" and flags["locked_by_other"]:
+            filtered_rows.append(row)
+        elif selected_filter == "仅看未领取" and flags["unlocked"]:
+            filtered_rows.append(row)
+
+    return filtered_rows
+
+
+def _build_workspace_review_metadata(detail: dict, row: dict) -> dict:
+    metadata = _build_ai_review_metadata(detail)
+    metadata["manual_priority"] = str(detail.get("manual_priority") or row.get("处理优先级") or "普通")
+    return metadata
+
+
+def _apply_batch_manual_decision(
+    rows: list[dict],
+    details: dict[str, dict],
+    candidate_ids: list[str],
+    *,
+    manual_decision: str,
+    batch_id: str,
+) -> dict[str, int]:
+    operator = _current_operator()
+    active_jd_title = str(st.session_state.get("workspace_selected_jd_title") or "").strip()
+    review_notes = st.session_state.get("v2_manual_review_notes", {})
+    review_status = st.session_state.get("v2_manual_review_status", {})
+    row_map = {str(row.get("candidate_id") or "").strip(): row for row in rows if row.get("candidate_id")}
+    result = {"updated_count": 0, "skipped_locked_count": 0}
+
+    for candidate_id in candidate_ids:
+        row = row_map.get(str(candidate_id or "").strip())
+        detail = details.get(str(candidate_id or "").strip())
+        if row is None or not isinstance(detail, dict):
+            continue
+
+        if batch_id:
+            can_operate, lock_state = can_user_operate_candidate(
+                batch_id=batch_id,
+                candidate_id=candidate_id,
+                operator_user_id=str(operator["user_id"] or ""),
+                is_admin=bool(operator.get("is_admin")),
+            )
+            _sync_candidate_lock_state(row, detail, lock_state, str(operator["user_id"] or ""))
+            if not can_operate:
+                result["skipped_locked_count"] += 1
+                continue
+
+        current_decision = str(detail.get("manual_decision") or row.get("人工最终结论") or "").strip()
+        if current_decision == manual_decision:
+            review_status[candidate_id] = manual_decision
+            continue
+
+        note_value = str(review_notes.get(candidate_id) or detail.get("manual_note") or row.get("人工备注") or "")
+        current_priority = str(detail.get("manual_priority") or row.get("处理优先级") or "普通")
+        store_ok = True
+        if batch_id:
+            store_ok = upsert_candidate_manual_review(
+                batch_id=batch_id,
+                candidate_id=candidate_id,
+                manual_decision=manual_decision,
+                manual_note=note_value,
+                manual_priority=current_priority,
+                operator_user_id=operator["user_id"],
+                operator_name=operator["name"],
+                operator_email=operator["email"],
+                review_id=str(detail.get("review_id") or ""),
+                jd_title=active_jd_title,
+                source="batch_action",
+                is_admin=bool(operator.get("is_admin")),
+                enforce_lock=True,
+            )
+            if not store_ok:
+                refreshed_lock = get_candidate_lock_state(batch_id, candidate_id)
+                _sync_candidate_lock_state(row, detail, refreshed_lock or _empty_workspace_lock_state(), str(operator["user_id"] or ""))
+                result["skipped_locked_count"] += 1
+                continue
+
+        detail["manual_decision"] = manual_decision
+        detail["manual_note"] = note_value
+        row["人工最终结论"] = manual_decision
+        row["人工备注"] = note_value
+        review_status[candidate_id] = manual_decision
+
+        review_id = str(detail.get("review_id") or "")
+        if review_id:
+            upsert_manual_review(
+                review_id=review_id,
+                manual_decision=manual_decision,
+                manual_note=note_value,
+                reviewed_by_user_id=operator["user_id"],
+                reviewed_by_name=operator["name"],
+                reviewed_by_email=operator["email"],
+                metadata_updates=_build_workspace_review_metadata(detail, row),
+            )
+        result["updated_count"] += 1
+
+    st.session_state.v2_manual_review_status = review_status
+    st.session_state.v2_rows = rows
+    st.session_state.v2_details = details
+    return result
+
+
+def _apply_batch_priority(
+    rows: list[dict],
+    details: dict[str, dict],
+    candidate_ids: list[str],
+    *,
+    manual_priority: str,
+    batch_id: str,
+) -> dict[str, int]:
+    operator = _current_operator()
+    active_jd_title = str(st.session_state.get("workspace_selected_jd_title") or "").strip()
+    row_map = {str(row.get("candidate_id") or "").strip(): row for row in rows if row.get("candidate_id")}
+    result = {"updated_count": 0, "skipped_locked_count": 0}
+
+    for candidate_id in candidate_ids:
+        row = row_map.get(str(candidate_id or "").strip())
+        detail = details.get(str(candidate_id or "").strip())
+        if row is None or not isinstance(detail, dict):
+            continue
+
+        if batch_id:
+            can_operate, lock_state = can_user_operate_candidate(
+                batch_id=batch_id,
+                candidate_id=candidate_id,
+                operator_user_id=str(operator["user_id"] or ""),
+                is_admin=bool(operator.get("is_admin")),
+            )
+            _sync_candidate_lock_state(row, detail, lock_state, str(operator["user_id"] or ""))
+            if not can_operate:
+                result["skipped_locked_count"] += 1
+                continue
+
+        current_priority = str(detail.get("manual_priority") or row.get("处理优先级") or "普通").strip() or "普通"
+        if current_priority == manual_priority:
+            continue
+
+        store_ok = True
+        if batch_id:
+            store_ok = upsert_candidate_manual_review(
+                batch_id=batch_id,
+                candidate_id=candidate_id,
+                manual_priority=manual_priority,
+                operator_user_id=operator["user_id"],
+                operator_name=operator["name"],
+                operator_email=operator["email"],
+                review_id=str(detail.get("review_id") or ""),
+                jd_title=active_jd_title,
+                source="batch_action",
+                is_admin=bool(operator.get("is_admin")),
+                enforce_lock=True,
+            )
+            if not store_ok:
+                refreshed_lock = get_candidate_lock_state(batch_id, candidate_id)
+                _sync_candidate_lock_state(row, detail, refreshed_lock or _empty_workspace_lock_state(), str(operator["user_id"] or ""))
+                result["skipped_locked_count"] += 1
+                continue
+
+        detail["manual_priority"] = manual_priority
+        row["处理优先级"] = manual_priority
+
+        review_id = str(detail.get("review_id") or "")
+        if review_id:
+            upsert_manual_review(
+                review_id=review_id,
+                reviewed_by_user_id=operator["user_id"],
+                reviewed_by_name=operator["name"],
+                reviewed_by_email=operator["email"],
+                metadata_updates=_build_workspace_review_metadata(detail, row),
+            )
+        result["updated_count"] += 1
+
+    st.session_state.v2_rows = rows
+    st.session_state.v2_details = details
+    return result
+
+
+def _batch_generate_ai_reviews(
+    rows: list[dict],
+    details: dict[str, dict],
+    candidate_ids: list[str],
+    *,
+    batch_id: str,
+) -> dict[str, int]:
+    row_map = {str(row.get("candidate_id") or "").strip(): row for row in rows if row.get("candidate_id")}
+    result = {
+        "generated": 0,
+        "stub": 0,
+        "skipped_ready": 0,
+        "skipped_ineligible": 0,
+        "skipped_locked": 0,
+        "failed": 0,
+    }
+    operator = _current_operator()
+
+    for candidate_id in candidate_ids:
+        row = row_map.get(str(candidate_id or "").strip())
+        detail = details.get(str(candidate_id or "").strip())
+        if row is None or not isinstance(detail, dict):
+            result["skipped_ineligible"] += 1
+            continue
+
+        if batch_id:
+            can_operate, lock_state = can_user_operate_candidate(
+                batch_id=batch_id,
+                candidate_id=candidate_id,
+                operator_user_id=str(operator["user_id"] or ""),
+                is_admin=bool(operator.get("is_admin")),
+            )
+            _sync_candidate_lock_state(row, detail, lock_state, str(operator["user_id"] or ""))
+            if not can_operate:
+                result["skipped_locked"] += 1
+                continue
+
+        _normalize_ai_review_state(detail)
+        ai_status = _refresh_ai_review_freshness(detail)
+        if ai_status not in {"not_generated", "outdated"}:
+            if ai_status == "ready":
+                result["skipped_ready"] += 1
+            else:
+                result["skipped_ineligible"] += 1
+            continue
+
+        ok, _, feedback_kind = _generate_ai_review_for_candidate(
+            rows=rows,
+            details=details,
+            selected_row=row,
+            detail=detail,
+            candidate_id=candidate_id,
+            batch_id=batch_id,
+            review_id=str(detail.get("review_id") or ""),
+            force_refresh=False,
+        )
+        if ok:
+            result["generated"] += 1
+            if str(detail.get("ai_source") or "") == "stub":
+                result["stub"] += 1
+        elif feedback_kind == "info":
+            result["skipped_ready"] += 1
+        else:
+            result["failed"] += 1
+
+    st.session_state.v2_rows = rows
+    st.session_state.v2_details = details
+    return result
 
 
 def _candidate_pool_label(screening_result: str) -> str:
@@ -504,10 +2678,11 @@ def _render_history_records(limit: int = 5) -> None:
     for row in history:
         auto_decision = row.get("auto_screening_result") or row.get("screening_result") or "-"
         manual_decision = row.get("manual_decision") or "未标记"
+        reviewer = row.get("reviewed_by_name") or row.get("reviewed_by_email") or "未填写"
         st.markdown(
             f"- {row.get('timestamp', '')}｜"
             f"{row.get('resume_name', '未命名候选人')}｜"
-            f"自动：{auto_decision}｜人工：{manual_decision}"
+            f"自动：{auto_decision}｜人工：{manual_decision}｜操作人：{reviewer}"
         )
 
     st.markdown("**查看单条审核详情**")
@@ -526,6 +2701,8 @@ def _render_history_records(limit: int = 5) -> None:
     st.write(f"自动风险：{_risk_level_label(row.get('auto_risk_level') or row.get('risk_level', 'unknown'))}")
     st.write(f"人工结论：{row.get('manual_decision') or '未标记'}")
     st.write(f"修改时间：{row.get('updated_at') or row.get('timestamp', '-')}")
+    st.write(f"操作人：{row.get('reviewed_by_name') or '未填写'}")
+    st.write(f"操作人邮箱：{row.get('reviewed_by_email') or '未填写'}")
     st.write(f"人工备注：{row.get('manual_note') or '无'}")
 
     st.write("五维评分：")
@@ -560,6 +2737,7 @@ def _render_history_records(limit: int = 5) -> None:
 
 
 def _build_review_record(result: dict, jd_title: str, resume_file: str = "") -> dict:
+    operator = _current_operator()
     parsed_resume = result.get("parsed_resume", {})
     score_details = result.get("score_details", {})
     score_order = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度", "综合推荐度"]
@@ -578,15 +2756,29 @@ def _build_review_record(result: dict, jd_title: str, resume_file: str = "") -> 
         "scores": score_summary,
         "risk_level": risk_result.get("risk_level", "unknown"),
         "auto_risk_level": risk_result.get("risk_level", "unknown"),
+        "reviewed_by_user_id": operator["user_id"],
+        "reviewed_by_name": operator["name"],
+        "reviewed_by_email": operator["email"],
         "screening_result": screening_result.get("screening_result", ""),
         "auto_screening_result": screening_result.get("screening_result", ""),
         "manual_decision": "",
         "manual_note": "",
+        "manual_priority": "普通",
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "screening_reasons": screening_result.get("screening_reasons", []),
         "risk_points": risk_result.get("risk_points", []),
         "interview_summary": interview_plan.get("interview_summary", ""),
         "evidence_snippets": result.get("evidence_snippets", []),
+        "ai_review_status": str(result.get("ai_review_status") or "not_generated"),
+        "ai_input_hash": str(result.get("ai_input_hash") or ""),
+        "ai_prompt_version": str(result.get("ai_prompt_version") or ""),
+        "ai_generated_latency_ms": int(result.get("ai_generated_latency_ms") or 0),
+        "ai_generation_reason": str(result.get("ai_generation_reason") or ""),
+        "ai_refresh_reason": str(result.get("ai_refresh_reason") or ""),
+        "ai_generated_at": str(result.get("ai_generated_at") or ""),
+        "ai_generated_by_name": str(result.get("ai_generated_by_name") or ""),
+        "ai_generated_by_email": str(result.get("ai_generated_by_email") or ""),
+        "ai_review_error": str(result.get("ai_review_error") or ""),
     }
 
 
@@ -596,6 +2788,93 @@ def _normalize_jd_title(input_title: str) -> str:
     if clean:
         return clean
     return (st.session_state.get("selected_jd_title") or "").strip()
+
+
+def _session_user() -> dict[str, object] | None:
+    return get_current_user(st.session_state)
+
+
+def _restore_authenticated_user() -> dict[str, object] | None:
+    session_user = _session_user()
+    if not session_user:
+        return None
+
+    user_id = str(session_user.get("user_id") or "").strip()
+    fresh_user = get_user_by_id(user_id)
+    if not fresh_user or not bool(fresh_user.get("is_active")):
+        logout_user(st.session_state)
+        return None
+
+    login_user(st.session_state, fresh_user)
+    return get_current_user(st.session_state)
+
+
+def _current_user_is_admin() -> bool:
+    session_user = _session_user()
+    return bool(session_user and session_user.get("is_admin"))
+
+
+def _render_login_page() -> None:
+    st.markdown("## 登录 HireMate")
+    st.caption("请先登录后再访问岗位配置、批量初筛与候选人工作台。")
+
+    flash_message = str(st.session_state.pop("auth_flash_message", "") or "").strip()
+    if flash_message:
+        st.info(flash_message)
+
+    total_users = count_users()
+    if total_users <= 0:
+        st.warning("当前系统尚未初始化管理员账号，请先在服务器或容器内执行管理员初始化命令。")
+        st.code(
+            'uv run -- python scripts/bootstrap_admin.py --email admin@example.com --name "管理员" --password "StrongPass123!"',
+            language="bash",
+        )
+        st.caption("公开注册默认关闭。请由部署人员完成首次管理员初始化。")
+        return
+
+    with st.form("hiremate_login_form", clear_on_submit=False):
+        email = st.text_input("登录邮箱", placeholder="name@example.com")
+        password = st.text_input("登录密码", type="password", placeholder="请输入密码")
+        submitted = st.form_submit_button("登录", type="primary", use_container_width=True)
+
+    if submitted:
+        user, error_message = authenticate_user(email, password)
+        if user is None:
+            st.error(error_message or "登录失败，请稍后重试。")
+            return
+
+        mark_login_success(str(user.get("user_id") or ""))
+        fresh_user = get_user_by_id(str(user.get("user_id") or "")) or user
+        login_user(st.session_state, fresh_user)
+        st.session_state.auth_flash_message = f"欢迎回来，{fresh_user.get('name') or fresh_user.get('email')}"
+        st.rerun()
+
+    st.caption("公开注册默认关闭。账号请由管理员统一初始化。")
+
+
+def _render_sidebar_user_panel() -> None:
+    current_user = _session_user() or {}
+    role_label = "管理员" if bool(current_user.get("is_admin")) else "招聘成员"
+
+    st.sidebar.markdown("### 当前登录用户")
+    st.sidebar.write(str(current_user.get("name") or "-"))
+    st.sidebar.caption(str(current_user.get("email") or "-"))
+    st.sidebar.caption(f"角色：{role_label}")
+
+    if st.sidebar.button("退出登录", key="auth_logout_btn", use_container_width=True):
+        logout_user(st.session_state)
+        st.session_state.auth_flash_message = "你已退出登录。"
+        st.rerun()
+
+
+def _current_operator() -> dict[str, str | bool]:
+    current_user = _session_user() or {}
+    return {
+        "user_id": str(current_user.get("user_id") or "").strip(),
+        "name": str(current_user.get("name") or "").strip(),
+        "email": str(current_user.get("email") or "").strip(),
+        "is_admin": bool(current_user.get("is_admin")),
+    }
 
 
 def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
@@ -621,19 +2900,6 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
     )
 
     evidence_snippets = _collect_evidence_snippets(parsed_resume)
-    scoring_cfg = parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {}
-    template_name = scoring_cfg.get("role_template") or scoring_cfg.get("profile_name")
-    role_profile = get_profile_by_name(template_name) if template_name else detect_role_profile(parsed_jd)
-    ai_review_suggestion = run_ai_reviewer(
-        parsed_jd=parsed_jd,
-        parsed_resume=parsed_resume,
-        role_profile=role_profile,
-        scoring_config=scoring_cfg,
-        score_details=score_details,
-        risk_result=risk_result,
-        screening_result=screening_result,
-        evidence_snippets=evidence_snippets,
-    )
 
     return {
         "parsed_jd": parsed_jd,
@@ -644,7 +2910,17 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
         "screening_result": screening_result,
         "interview_plan": interview_plan,
         "evidence_snippets": evidence_snippets,
-        "ai_review_suggestion": ai_review_suggestion,
+        "ai_review_suggestion": {},
+        "ai_review_status": "not_generated",
+        "ai_input_hash": "",
+        "ai_prompt_version": "",
+        "ai_generated_latency_ms": 0,
+        "ai_generation_reason": "",
+        "ai_refresh_reason": "",
+        "ai_generated_at": "",
+        "ai_generated_by_name": "",
+        "ai_generated_by_email": "",
+        "ai_review_error": "",
     }
 
 
@@ -907,6 +3183,9 @@ def _render_job_library() -> None:
             st.markdown(f"**{title}**")
             st.caption(f"JD 摘要：{_jd_summary(rec.get('text', ''), max_len=110)}")
             openings = int(rec.get("openings", 0) or 0)
+            creator_name = rec.get("created_by_name") or ""
+            creator_email = rec.get("created_by_email") or ""
+            creator_display = creator_name or creator_email or "未填写"
             st.caption(
                 f"最近批次时间：{snapshot.get('latest_time', '-')}"
                 f" ｜ 当前空缺人数：{openings}"
@@ -914,6 +3193,7 @@ def _render_job_library() -> None:
                 f" / 待复核 {snapshot.get('review_count', 0)}"
                 f" / 淘汰 {snapshot.get('reject_count', 0)}"
             )
+            st.caption(f"创建人：{creator_display}")
             if title in in_use_titles:
                 st.caption("当前上下文：该岗位正在被批量初筛或工作台使用。")
 
@@ -1248,11 +3528,26 @@ def _render_job_library() -> None:
             },
         }
 
+        is_admin_user = _current_user_is_admin()
+        if not is_admin_user:
+            st.caption("删除类高风险操作仅管理员可执行。")
+
         action_cols = st.columns(5)
         with action_cols[0]:
             if st.button("保存修改", use_container_width=True, key="joblib_update_btn"):
                 try:
-                    update_jd(selected_job, edited_text, openings=int(edited_openings))
+                    operator = _current_operator()
+                    update_jd(
+                        selected_job,
+                        edited_text,
+                        openings=int(edited_openings),
+                        created_by_user_id=operator["user_id"],
+                        created_by_name=operator["name"],
+                        created_by_email=operator["email"],
+                        updated_by_user_id=operator["user_id"],
+                        updated_by_name=operator["name"],
+                        updated_by_email=operator["email"],
+                    )
                     upsert_jd_scoring_config(selected_job, st.session_state.get("joblib_draft_scoring_config", {}))
                     _apply_jd_to_workspace(selected_job)
                     _sync_job_management_drafts(selected_job)
@@ -1263,7 +3558,14 @@ def _render_job_library() -> None:
         with action_cols[1]:
             if st.button("仅更新空缺人数", use_container_width=True, key="joblib_update_openings_btn"):
                 try:
-                    upsert_jd_openings(selected_job, int(edited_openings))
+                    operator = _current_operator()
+                    upsert_jd_openings(
+                        selected_job,
+                        int(edited_openings),
+                        updated_by_user_id=operator["user_id"],
+                        updated_by_name=operator["name"],
+                        updated_by_email=operator["email"],
+                    )
                     upsert_jd_scoring_config(selected_job, st.session_state.get("joblib_draft_scoring_config", {}))
                     _sync_job_management_drafts(selected_job)
                     st.session_state.joblib_flash_success = "空缺人数与评分设置已更新。"
@@ -1271,7 +3573,7 @@ def _render_job_library() -> None:
                 except ValueError as err:
                     st.warning(str(err))
         with action_cols[2]:
-            if st.button("删除岗位", use_container_width=True, key="joblib_delete_btn"):
+            if st.button("删除岗位", use_container_width=True, key="joblib_delete_btn", disabled=not is_admin_user):
                 try:
                     delete_jd(selected_job)
                     if st.session_state.get("selected_jd_title") == selected_job:
@@ -1329,7 +3631,12 @@ def _render_job_library() -> None:
 
             batch_delete_cols = st.columns(2)
             with batch_delete_cols[0]:
-                if st.button("删除所选批次（不可恢复）", key="joblib_delete_batch_btn", use_container_width=True):
+                if st.button(
+                    "删除所选批次（不可恢复）",
+                    key="joblib_delete_batch_btn",
+                    use_container_width=True,
+                    disabled=not is_admin_user,
+                ):
                     if delete_candidate_batch(batch_choice):
                         _after_batch_deleted(selected_job, batch_choice)
                         st.session_state.joblib_flash_success = f"已删除批次：{batch_choice[:12]}…"
@@ -1337,7 +3644,12 @@ def _render_job_library() -> None:
                     else:
                         st.warning("未找到可删除的批次，可能已被删除。")
             with batch_delete_cols[1]:
-                if st.button("清空该岗位所有批次（高风险）", key="joblib_delete_all_batches_btn", use_container_width=True):
+                if st.button(
+                    "清空该岗位所有批次（高风险）",
+                    key="joblib_delete_all_batches_btn",
+                    use_container_width=True,
+                    disabled=not is_admin_user,
+                ):
                     deleted_count = delete_batches_by_jd(selected_job)
                     if deleted_count > 0:
                         _after_batch_deleted(selected_job, batch_choice)
@@ -1355,7 +3667,18 @@ def _render_job_library() -> None:
     new_text = st.text_area("JD 内容", height=180, key="joblib_new_text")
     if st.button("新建岗位", type="primary", key="joblib_create_btn"):
         try:
-            save_jd(new_title, new_text, openings=int(new_openings))
+            operator = _current_operator()
+            save_jd(
+                new_title,
+                new_text,
+                openings=int(new_openings),
+                created_by_user_id=operator["user_id"],
+                created_by_name=operator["name"],
+                created_by_email=operator["email"],
+                updated_by_user_id=operator["user_id"],
+                updated_by_name=operator["name"],
+                updated_by_email=operator["email"],
+            )
             _apply_jd_to_workspace((new_title or "").strip())
             _sync_job_management_drafts((new_title or "").strip())
             st.session_state.joblib_flash_success = "岗位创建成功，已同步到批量初筛。"
@@ -1401,11 +3724,25 @@ def _render_v1() -> None:
         )
         effective_title = _normalize_jd_title(jd_title)
 
+        is_admin_user = _current_user_is_admin()
+        if not is_admin_user:
+            st.caption("删除类高风险操作仅管理员可执行。")
+
         action_cols = st.columns(3)
         with action_cols[0]:
             if st.button("保存 JD", use_container_width=True):
                 try:
-                    save_jd(effective_title, st.session_state.jd_text)
+                    operator = _current_operator()
+                    save_jd(
+                        effective_title,
+                        st.session_state.jd_text,
+                        created_by_user_id=operator["user_id"],
+                        created_by_name=operator["name"],
+                        created_by_email=operator["email"],
+                        updated_by_user_id=operator["user_id"],
+                        updated_by_name=operator["name"],
+                        updated_by_email=operator["email"],
+                    )
                     st.success("JD 已保存。")
                 except ValueError as err:
                     st.warning(str(err))
@@ -1413,13 +3750,23 @@ def _render_v1() -> None:
         with action_cols[1]:
             if st.button("更新当前 JD", use_container_width=True):
                 try:
-                    update_jd(effective_title, st.session_state.jd_text)
+                    operator = _current_operator()
+                    update_jd(
+                        effective_title,
+                        st.session_state.jd_text,
+                        created_by_user_id=operator["user_id"],
+                        created_by_name=operator["name"],
+                        created_by_email=operator["email"],
+                        updated_by_user_id=operator["user_id"],
+                        updated_by_name=operator["name"],
+                        updated_by_email=operator["email"],
+                    )
                     st.success("JD 已更新。")
                 except ValueError as err:
                     st.warning(str(err))
 
         with action_cols[2]:
-            if st.button("删除当前 JD", use_container_width=True):
+            if st.button("删除当前 JD", use_container_width=True, disabled=not is_admin_user):
                 try:
                     delete_jd(effective_title)
                     st.session_state.jd_text = ""
@@ -1464,7 +3811,7 @@ def _render_v1() -> None:
             )
             if message:
                 st.caption(f"提取说明：{message}")
-            notice = _extract_notice(quality or "weak")
+            notice = _extract_notice(quality or "weak", message)
             if notice:
                 st.warning(notice)
 
@@ -1546,6 +3893,7 @@ def _render_v1() -> None:
 
 def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> None:
     """批量初筛执行器：仅负责批量解析与自动分流。"""
+    operator = _current_operator()
     rows: list[dict] = []
     details: dict[str, dict] = {}
     progress = st.progress(0)
@@ -1614,7 +3962,14 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
     st.session_state.v2_rows = rows
     st.session_state.v2_details = details
 
-    batch_id = save_candidate_batch(jd_title=jd_title, rows=rows, details=details)
+    batch_id = save_candidate_batch(
+        jd_title=jd_title,
+        rows=rows,
+        details=details,
+        created_by_user_id=operator["user_id"],
+        created_by_name=operator["name"],
+        created_by_email=operator["email"],
+    )
     st.session_state.v2_current_batch_id = batch_id
     st.session_state.workspace_selected_jd_title = (jd_title or "").strip() or "未命名岗位"
 
@@ -1644,6 +3999,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
     pass_count = sum(1 for row in rows if _current_candidate_pool(row) == "通过候选人")
     review_count = sum(1 for row in rows if _current_candidate_pool(row) == "待复核候选人")
     reject_count = sum(1 for row in rows if _current_candidate_pool(row) == "淘汰候选人")
+    current_operator = _current_operator()
     pool_counts = {
         "待复核候选人": review_count,
         "通过候选人": pass_count,
@@ -1661,15 +4017,37 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         )
 
         action_feedback = st.session_state.pop("workspace_action_feedback", "")
+        action_feedback_kind = st.session_state.pop("workspace_action_feedback_kind", "success")
         pool_move_feedback = st.session_state.pop("workspace_pool_move_feedback", "")
         pool_empty_feedback = st.session_state.pop("workspace_pool_empty_feedback", "")
         if action_feedback:
-            st.success(action_feedback)
+            if action_feedback_kind == "warning":
+                st.warning(action_feedback)
+            elif action_feedback_kind == "info":
+                st.info(action_feedback)
+            else:
+                st.success(action_feedback)
         if pool_move_feedback:
             st.info(pool_move_feedback)
         if pool_empty_feedback:
             st.warning(pool_empty_feedback)
 
+        quick_filter = st.selectbox(
+            "快捷筛选（今日处理视角）",
+            options=[
+                "全部",
+                "仅看未人工处理",
+                "仅看高优先级",
+                "仅看我处理中",
+                "仅看他人锁定",
+                "仅看未领取",
+                "仅看 AI 建议未生成",
+                "仅看 AI 建议已生成但未应用",
+                "仅看 OCR 弱质量 / OCR 能力缺失",
+                "仅看高风险且待复核",
+            ],
+            key="workspace_quick_filter",
+        )
         search_kw = st.text_input("搜索候选人（姓名）", value="", key="workspace_search")
         risk_filter = st.selectbox(
             "按风险等级筛选",
@@ -1690,19 +4068,188 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         )
 
         filtered_rows = [row for row in rows if _current_candidate_pool(row) == selected_pool_label]
+        filtered_rows = _apply_workspace_quick_filter(filtered_rows, details, quick_filter)
         filtered_rows = search_by_name(filtered_rows, search_kw)
         filtered_rows = filter_by_risk(filtered_rows, risk_filter)
         filtered_rows = sort_rows(filtered_rows, sort_key)
 
-        context_key = "|".join(
-            [
-                str(st.session_state.get("workspace_selected_jd_title", "")),
-                str(st.session_state.get("workspace_preferred_batch_id", "")),
-                str(selected_pool_label),
-                str((search_kw or "").strip().lower()),
-                str(risk_filter),
-                str(sort_key),
-            ]
+        selection_scope = _workspace_selection_scope()
+        all_candidate_ids = [str(row.get("candidate_id") or "").strip() for row in rows if row.get("candidate_id")]
+        filtered_candidate_ids = [str(row.get("candidate_id") or "").strip() for row in filtered_rows if row.get("candidate_id")]
+        selected_candidate_ids_all = _get_workspace_selected_candidate_ids(rows, selection_scope)
+        selected_candidate_id_set = set(selected_candidate_ids_all)
+        selected_rows_all = [row for row in rows if str(row.get("candidate_id") or "").strip() in selected_candidate_id_set]
+
+        st.markdown("**批量操作**")
+        st.caption(f"当前已勾选 {len(selected_candidate_ids_all)} 人；当前筛选结果 {len(filtered_rows)} 人。")
+
+        selection_cols = st.columns(2)
+        with selection_cols[0]:
+            if st.button(
+                "勾选当前筛选结果",
+                key="workspace_select_filtered_candidates",
+                use_container_width=True,
+                disabled=not filtered_candidate_ids,
+            ):
+                changed = _set_workspace_selected_candidate_ids(
+                    selection_scope,
+                    filtered_candidate_ids,
+                    selected=True,
+                )
+                st.session_state.workspace_action_feedback = f"已勾选当前筛选结果中的 {len(filtered_candidate_ids)} 人。"
+                st.session_state.workspace_action_feedback_kind = "success" if changed > 0 else "info"
+                st.rerun()
+        with selection_cols[1]:
+            if st.button(
+                "清空当前批次勾选",
+                key="workspace_clear_selected_candidates",
+                use_container_width=True,
+                disabled=not selected_candidate_ids_all,
+            ):
+                _set_workspace_selected_candidate_ids(
+                    selection_scope,
+                    all_candidate_ids,
+                    selected=False,
+                )
+                st.session_state.workspace_action_feedback = "已清空当前批次勾选候选人。"
+                st.session_state.workspace_action_feedback_kind = "info"
+                st.rerun()
+
+        batch_action_cols = st.columns(2)
+        active_batch_id = str(st.session_state.get("workspace_preferred_batch_id") or "").strip()
+        with batch_action_cols[0]:
+            if st.button(
+                "批量标记为待复核",
+                key="workspace_batch_mark_pending",
+                use_container_width=True,
+                disabled=not selected_candidate_ids_all,
+            ):
+                batch_result = _apply_batch_manual_decision(
+                    rows=rows,
+                    details=details,
+                    candidate_ids=selected_candidate_ids_all,
+                    manual_decision="待复核",
+                    batch_id=active_batch_id,
+                )
+                updated_count = int(batch_result.get("updated_count", 0))
+                skipped_locked_count = int(batch_result.get("skipped_locked_count", 0))
+                st.session_state.workspace_action_feedback = (
+                    f"已更新 {updated_count} 个，跳过 {skipped_locked_count} 个（被其他 HR 锁定）。"
+                    if (updated_count > 0 or skipped_locked_count > 0)
+                    else "勾选候选人当前已处于“待复核”状态，无需重复标记。"
+                )
+                st.session_state.workspace_action_feedback_kind = "success" if updated_count > 0 else "info"
+                st.rerun()
+        with batch_action_cols[1]:
+            if st.button(
+                "批量标记为淘汰",
+                key="workspace_batch_mark_reject",
+                use_container_width=True,
+                disabled=not selected_candidate_ids_all,
+            ):
+                batch_result = _apply_batch_manual_decision(
+                    rows=rows,
+                    details=details,
+                    candidate_ids=selected_candidate_ids_all,
+                    manual_decision="淘汰",
+                    batch_id=active_batch_id,
+                )
+                updated_count = int(batch_result.get("updated_count", 0))
+                skipped_locked_count = int(batch_result.get("skipped_locked_count", 0))
+                st.session_state.workspace_action_feedback = (
+                    f"已更新 {updated_count} 个，跳过 {skipped_locked_count} 个（被其他 HR 锁定）。"
+                    if (updated_count > 0 or skipped_locked_count > 0)
+                    else "勾选候选人当前已处于“淘汰”状态，无需重复标记。"
+                )
+                st.session_state.workspace_action_feedback_kind = "success" if updated_count > 0 else "info"
+                st.rerun()
+
+        priority_cols = st.columns([0.58, 0.42])
+        with priority_cols[0]:
+            batch_priority = st.selectbox(
+                "批量设置处理优先级",
+                options=["高", "中", "普通", "低"],
+                index=2,
+                key="workspace_batch_priority_select",
+            )
+        with priority_cols[1]:
+            if st.button(
+                "应用优先级",
+                key="workspace_batch_apply_priority",
+                use_container_width=True,
+                disabled=not selected_candidate_ids_all,
+            ):
+                batch_result = _apply_batch_priority(
+                    rows=rows,
+                    details=details,
+                    candidate_ids=selected_candidate_ids_all,
+                    manual_priority=batch_priority,
+                    batch_id=active_batch_id,
+                )
+                updated_count = int(batch_result.get("updated_count", 0))
+                skipped_locked_count = int(batch_result.get("skipped_locked_count", 0))
+                st.session_state.workspace_action_feedback = (
+                    f"已更新 {updated_count} 个，跳过 {skipped_locked_count} 个（被其他 HR 锁定）。"
+                    if (updated_count > 0 or skipped_locked_count > 0)
+                    else f"勾选候选人的处理优先级已是“{batch_priority}”。"
+                )
+                st.session_state.workspace_action_feedback_kind = "success" if updated_count > 0 else "info"
+                st.rerun()
+
+        generate_cols = st.columns(2)
+        with generate_cols[0]:
+            if st.button(
+                "批量生成 AI 建议",
+                key="workspace_batch_generate_ai",
+                use_container_width=True,
+                disabled=not selected_candidate_ids_all,
+            ):
+                with st.spinner("正在为勾选候选人批量生成 AI 建议..."):
+                    batch_result = _batch_generate_ai_reviews(
+                        rows=rows,
+                        details=details,
+                        candidate_ids=selected_candidate_ids_all,
+                        batch_id=active_batch_id,
+                    )
+                generated_count = batch_result.get("generated", 0)
+                skipped_ready = batch_result.get("skipped_ready", 0)
+                skipped_ineligible = batch_result.get("skipped_ineligible", 0)
+                skipped_locked = batch_result.get("skipped_locked", 0)
+                failed_count = batch_result.get("failed", 0)
+                stub_count = batch_result.get("stub", 0)
+                if generated_count > 0:
+                    st.session_state.workspace_action_feedback = (
+                        f"批量生成 AI 建议完成：新增 {generated_count} 人，"
+                        f"跳过已有效 {skipped_ready} 人，"
+                        f"跳过被锁定 {skipped_locked} 人，跳过其他状态 {skipped_ineligible} 人，失败 {failed_count} 人。"
+                        f"{' 其中 stub fallback ' + str(stub_count) + ' 人。' if stub_count > 0 else ''}"
+                    )
+                    st.session_state.workspace_action_feedback_kind = "warning" if (failed_count > 0 or stub_count > 0) else "success"
+                else:
+                    st.session_state.workspace_action_feedback = (
+                        f"本次未新增 AI 建议：跳过已有效 {skipped_ready} 人，"
+                        f"跳过被锁定 {skipped_locked} 人，跳过其他状态 {skipped_ineligible} 人，失败 {failed_count} 人。"
+                    )
+                    st.session_state.workspace_action_feedback_kind = "info" if failed_count == 0 else "warning"
+                st.rerun()
+        with generate_cols[1]:
+            st.download_button(
+                "批量导出勾选候选人 CSV",
+                data=rows_to_csv_bytes(selected_rows_all),
+                file_name=f"hiremate_selected_candidates_{active_batch_id[:12] or 'session'}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                disabled=not selected_candidate_ids_all,
+            )
+
+        context_key = _workspace_context_cache_key(
+            selected_jd=str(st.session_state.get("workspace_selected_jd_title", "")),
+            batch_id=str(st.session_state.get("workspace_preferred_batch_id", "")),
+            pool_label=str(selected_pool_label),
+            quick_filter=str(quick_filter),
+            search_kw=str(search_kw or ""),
+            risk_filter=str(risk_filter),
+            sort_key=str(sort_key),
         )
         if "workspace_selected_candidate_by_context" not in st.session_state:
             st.session_state.workspace_selected_candidate_by_context = {}
@@ -1723,25 +4270,46 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
                 is_active = row_candidate_id == selected_candidate_id
 
                 label_prefix = "🟢 当前审核中｜" if is_active else ""
-                if st.button(
-                    f"{label_prefix}{display_name}",
-                    key=f"workspace_list_pick_{context_key}_{row_candidate_id}",
-                    use_container_width=True,
-                    type="primary" if is_active else "secondary",
-                ):
-                    selected_cache[context_key] = row_candidate_id
-                    st.session_state.workspace_selected_candidate_by_context = selected_cache
-                    st.rerun()
+                row_pick_cols = st.columns([0.18, 0.82], gap="small")
+                with row_pick_cols[0]:
+                    st.checkbox(
+                        "勾选候选人",
+                        key=_workspace_selection_key(selection_scope, row_candidate_id),
+                        label_visibility="collapsed",
+                    )
+                with row_pick_cols[1]:
+                    if st.button(
+                        f"{label_prefix}{display_name}",
+                        key=f"workspace_list_pick_{context_key}_{row_candidate_id}",
+                        use_container_width=True,
+                        type="primary" if is_active else "secondary",
+                    ):
+                        selected_cache[context_key] = row_candidate_id
+                        st.session_state.workspace_selected_candidate_by_context = selected_cache
+                        st.rerun()
 
                 parse_status = row.get("解析状态", "-")
                 parse_tag = row.get("解析标签", "")
+                detail_for_row = details.get(row_candidate_id) if isinstance(details.get(row_candidate_id), dict) else {}
+                lock_badge = str(row.get("锁定状态") or detail_for_row.get("lock_status") or "未领取")
+                if bool(detail_for_row.get("is_locked_effective")):
+                    if str(detail_for_row.get("lock_owner_user_id") or "") == str(current_operator.get("user_id") or ""):
+                        lock_badge = "我处理中"
+                    else:
+                        lock_badge = "他人锁定"
+                elif not str(row.get("锁定状态") or "").strip():
+                    lock_badge = "未领取"
+                lock_owner = str(row.get("锁定人") or detail_for_row.get("lock_owner_name") or detail_for_row.get("lock_owner_email") or "-")
                 row_note = [
                     f"候选池：{_current_candidate_pool(row)}",
+                    f"协作：{lock_badge}",
                     f"风险：{_risk_level_label(row.get('风险等级', 'unknown'))}",
                     f"优先级：{row.get('处理优先级', '普通')}",
                     f"解析状态：{parse_status}{(' ' + parse_tag) if parse_tag else ''}",
                 ]
                 st.caption(" ｜ ".join(row_note))
+                if lock_badge != "未领取":
+                    st.caption(f"锁定人：{lock_owner} ｜ 锁截止：{row.get('锁过期时间') or detail_for_row.get('lock_expires_at') or '-'}")
                 st.caption(f"审核摘要：{row.get('审核摘要', '暂无摘要')} ")
                 st.divider()
 
@@ -1756,7 +4324,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             selected_cache[context_key] = ""
             st.session_state.workspace_selected_candidate_by_context = selected_cache
             selected_candidate_id = ""
-            st.info("当前筛选结果为空，请切换候选池、筛选条件或批次后继续。")
+            st.info("当前筛选结果为空，请切换候选池、快捷筛选、风险筛选、搜索条件或批次后继续。")
 
     with detail_col:
         st.subheader("候选人审核报告")
@@ -1769,11 +4337,18 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             st.info("当前候选人详情不可用，请在左侧重新选择候选人。")
             return
 
+        _normalize_ai_review_state(detail)
         cand_id = selected_candidate_id
         selected_row = next((item for item in rows if item.get("candidate_id") == cand_id), {})
         parsed_resume = detail.get("parsed_resume", {})
         extract_info = detail.get("extract_info", {})
         risk_result = detail.get("risk_result", {})
+        parse_status = str(selected_row.get("解析状态") or extract_info.get("parse_status") or "-")
+        operator = current_operator
+        active_batch_id = str(st.session_state.get("workspace_preferred_batch_id") or "").strip()
+        lock_state = _refresh_workspace_candidate_lock_state(active_batch_id, cand_id, selected_row, detail)
+        can_edit_claimed, lock_edit_message = _can_edit_claimed_candidate(active_batch_id, lock_state, operator)
+        operator_display = operator["name"] or operator["email"] or "未填写"
 
         current_pool = _current_candidate_pool(selected_row) or "未分配"
         auto_decision = detail["screening_result"]["screening_result"]
@@ -1783,7 +4358,92 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         timeline_summary = _build_timeline_summary(parsed_resume, risk_result)
         timeline_clear = "是" if timeline_summary.get("时间线不清晰风险", "否") == "否" else "否"
 
+        st.caption(f"当前操作人：{operator_display}")
         st.caption("审核摘要条")
+        if active_batch_id:
+            lock_status_label = "未领取"
+            if bool(lock_state.get("is_locked_effective")):
+                lock_status_label = "我处理中" if _is_candidate_self_locked(lock_state, operator) else "他人锁定"
+            st.markdown("**协作处理状态**")
+            st.caption(
+                f"状态：{lock_status_label} ｜ 锁定人：{_lock_owner_display(lock_state)} ｜ "
+                f"锁到：{lock_state.get('lock_expires_at') or '-'} ｜ 我是否可编辑：{'可编辑' if can_edit_claimed else '只读'}"
+            )
+            lock_action_cols = st.columns(3)
+            with lock_action_cols[0]:
+                if st.button(
+                    "领取并开始处理",
+                    key=f"claim_candidate_lock_{cand_id}",
+                    use_container_width=True,
+                    disabled=bool(lock_state.get("is_locked_effective")),
+                ):
+                    ok, new_lock_state = acquire_candidate_lock(
+                        active_batch_id,
+                        cand_id,
+                        operator_user_id=str(operator["user_id"] or ""),
+                        operator_name=str(operator["name"] or ""),
+                        operator_email=str(operator["email"] or ""),
+                        ttl_minutes=WORKSPACE_LOCK_TTL_MINUTES,
+                        force=False,
+                    )
+                    _sync_candidate_lock_state(selected_row, detail, new_lock_state, str(operator["user_id"] or ""))
+                    st.session_state.workspace_action_feedback = (
+                        "已领取当前候选人，进入可编辑状态。"
+                        if ok
+                        else "领取失败，当前候选人可能已被其他 HR 抢先领取。"
+                    )
+                    st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                    st.rerun()
+            with lock_action_cols[1]:
+                if st.button(
+                    "释放锁",
+                    key=f"release_candidate_lock_{cand_id}",
+                    use_container_width=True,
+                    disabled=not _is_candidate_self_locked(lock_state, operator),
+                ):
+                    ok, message = release_candidate_lock(
+                        active_batch_id,
+                        cand_id,
+                        operator_user_id=str(operator["user_id"] or ""),
+                        operator_name=str(operator["name"] or ""),
+                        operator_email=str(operator["email"] or ""),
+                        is_admin=bool(operator.get("is_admin")),
+                        force=False,
+                    )
+                    refreshed_lock_state = get_candidate_lock_state(active_batch_id, cand_id) or _empty_workspace_lock_state()
+                    _sync_candidate_lock_state(selected_row, detail, refreshed_lock_state, str(operator["user_id"] or ""))
+                    st.session_state.workspace_action_feedback = message
+                    st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                    st.rerun()
+            with lock_action_cols[2]:
+                if st.button(
+                    "管理员强制解锁",
+                    key=f"force_release_candidate_lock_{cand_id}",
+                    use_container_width=True,
+                    disabled=not (
+                        bool(operator.get("is_admin"))
+                        and bool(lock_state.get("is_locked_effective"))
+                        and not _is_candidate_self_locked(lock_state, operator)
+                    ),
+                ):
+                    ok, message = release_candidate_lock(
+                        active_batch_id,
+                        cand_id,
+                        operator_user_id=str(operator["user_id"] or ""),
+                        operator_name=str(operator["name"] or ""),
+                        operator_email=str(operator["email"] or ""),
+                        is_admin=bool(operator.get("is_admin")),
+                        force=True,
+                    )
+                    refreshed_lock_state = get_candidate_lock_state(active_batch_id, cand_id) or _empty_workspace_lock_state()
+                    _sync_candidate_lock_state(selected_row, detail, refreshed_lock_state, str(operator["user_id"] or ""))
+                    st.session_state.workspace_action_feedback = message
+                    st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                    st.rerun()
+            if not can_edit_claimed:
+                st.info(lock_edit_message)
+        else:
+            can_edit_claimed = True
         summary_cols = st.columns(6)
         summary_cols[0].caption(f"当前候选池\n\n{current_pool}")
         summary_cols[1].caption(f"自动初筛结论\n\n{auto_decision}")
@@ -1826,93 +4486,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             st.markdown(f"- {fp}")
         st.caption(f"面试总结：{interview_plan.get('interview_summary', '')}")
 
-        st.markdown("**6) AI 审核建议**")
-        ai_suggestion = detail.get("ai_review_suggestion") or {}
-        ai_cfg = ((detail.get("parsed_jd") or {}).get("scoring_config") or {}).get("ai_reviewer") or {}
-        ai_mode = str(ai_cfg.get("ai_reviewer_mode") or ai_suggestion.get("mode") or "off")
-        ai_enabled = bool(ai_cfg.get("enable_ai_reviewer", False)) and ai_mode != "off"
-
-        if not ai_enabled:
-            st.caption("当前岗位未启用 AI 审核员。")
-        else:
-            if (ai_suggestion.get("meta") or {}).get("source") == "stub":
-                st.info("当前为本地预留模式（mock/stub），部署后可启用真实模型。")
-
-            st.caption(f"AI 审核模式：{ai_mode}")
-            st.write(f"AI 审核摘要：{ai_suggestion.get('review_summary') or '暂无'}")
-
-            st.caption("AI 补充证据建议")
-            evidence_updates = ai_suggestion.get("evidence_updates") or []
-            if evidence_updates:
-                for item in evidence_updates:
-                    st.markdown(f"- [{item.get('source', 'AI')}] {item.get('text', '')}")
-            else:
-                st.caption("暂无建议。")
-
-            st.caption("AI 关键时间点补充")
-            timeline_updates = ai_suggestion.get("timeline_updates") or []
-            if timeline_updates:
-                for item in timeline_updates:
-                    st.markdown(f"- {item.get('label', '时间点')}：{item.get('value', '')}")
-            else:
-                st.caption("暂无建议。")
-
-            st.caption("AI 风险调整建议")
-            risk_adjustment = ai_suggestion.get("risk_adjustment") or {}
-            if risk_adjustment:
-                st.markdown(f"- 建议风险等级：{_risk_level_label(str(risk_adjustment.get('suggested_risk_level') or 'unknown'))}")
-                if risk_adjustment.get("reason"):
-                    st.caption(f"说明：{risk_adjustment.get('reason')}")
-            else:
-                st.caption("暂无建议。")
-
-            st.caption("AI 分数调整建议")
-            score_adjustments = ai_suggestion.get("score_adjustments") or []
-            if score_adjustments:
-                for item in score_adjustments:
-                    st.markdown(
-                        f"- {item.get('dimension', '-')}: Δ{item.get('suggested_delta', 0)} (max {item.get('max_delta', 1)})"
-                    )
-                    if item.get("reason"):
-                        st.caption(f"  说明：{item.get('reason')}")
-            else:
-                st.caption("暂无建议。")
-
-            st.caption(f"AI 推荐动作建议：{ai_suggestion.get('recommended_action') or 'no_action'}")
-
-            if ai_mode == "human_approve":
-                apply_cols = st.columns(4)
-                with apply_cols[0]:
-                    if st.button("应用 AI 证据建议", key=f"apply_ai_evidence_{cand_id}", use_container_width=True):
-                        added = _apply_ai_evidence_suggestions(detail, evidence_updates)
-                        st.session_state.v2_details = details
-                        st.success(f"已应用 {added} 条 AI 证据建议。")
-                        st.rerun()
-                with apply_cols[1]:
-                    if st.button("应用 AI 分数建议", key=f"apply_ai_scores_{cand_id}", use_container_width=True):
-                        applied = _apply_ai_score_suggestions(detail, selected_row, ai_suggestion)
-                        st.session_state.v2_rows = rows
-                        st.session_state.v2_details = details
-                        st.success(f"已应用 {applied} 项分数建议。")
-                        st.rerun()
-                with apply_cols[2]:
-                    if st.button("应用 AI 风险建议", key=f"apply_ai_risk_{cand_id}", use_container_width=True):
-                        ok = _apply_ai_risk_suggestion(detail, selected_row, ai_suggestion)
-                        st.session_state.v2_rows = rows
-                        st.session_state.v2_details = details
-                        st.success("已应用 AI 风险建议。" if ok else "当前无可应用的风险建议。")
-                        st.rerun()
-                with apply_cols[3]:
-                    if st.button("应用 AI 建议", key=f"apply_ai_all_{cand_id}", use_container_width=True):
-                        added = _apply_ai_evidence_suggestions(detail, evidence_updates)
-                        applied = _apply_ai_score_suggestions(detail, selected_row, ai_suggestion)
-                        ok = _apply_ai_risk_suggestion(detail, selected_row, ai_suggestion)
-                        st.session_state.v2_rows = rows
-                        st.session_state.v2_details = details
-                        st.success(f"已应用 AI 建议：证据 {added} 条、分数 {applied} 项、风险 {'已更新' if ok else '无变更'}。")
-                        st.rerun()
-
-        st.markdown("**7) 五维评分（辅助信息）**")
+        st.markdown("**6) 五维评分（辅助信息）**")
         score_details = detail.get("score_details") or {}
         st.caption(
             _score_brief_summary(
@@ -1920,6 +4494,8 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
                 timeline_summary=timeline_summary,
             )
         )
+        if "scores" in (detail.get("ai_applied_actions") or []):
+            st.caption("当前评分包含已人工确认的 AI 建议修正。")
         with st.expander("展开查看五维评分详情", expanded=False):
             ordered_dims = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度", "综合推荐度"]
             for dim_name in ordered_dims:
@@ -1935,7 +4511,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
                     for ev in evidences:
                         st.markdown(f"- {ev}")
 
-        st.markdown("**8) 原始提取与解析信息**")
+        st.markdown("**7) 原始提取与解析信息**")
         with st.expander("展开查看原始提取与解析信息", expanded=False):
             method_raw = extract_info.get("method", "text")
             quality_raw = extract_info.get("quality", "weak")
@@ -1960,7 +4536,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         review_notes = st.session_state.get("v2_manual_review_notes", {})
         review_status = st.session_state.get("v2_manual_review_status", {})
 
-        st.markdown("**9) 人工备注与人工决策**")
+        st.markdown("**8) 人工备注与人工决策**")
         note_value = review_notes.get(cand_id, "")
         note_input = st.text_area(
             "人工备注",
@@ -1971,22 +4547,51 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         )
         review_notes[cand_id] = note_input
         st.session_state.v2_manual_review_notes = review_notes
-        if st.button("保存人工备注", key=f"manual_note_save_{cand_id}", use_container_width=True):
-            if review_id:
-                ok = upsert_manual_review(review_id=review_id, manual_note=note_input)
-                if ok:
-                    st.success("人工备注已写入操作留痕。")
-                else:
-                    st.warning("未找到对应审核记录，未能写入备注。")
-            else:
-                st.warning("当前候选人缺少留痕 ID，无法写入备注。")
-            active_batch_id = st.session_state.get("workspace_preferred_batch_id", "")
+        if st.button(
+            "保存人工备注",
+            key=f"manual_note_save_{cand_id}",
+            use_container_width=True,
+            disabled=not can_edit_claimed,
+        ):
+            batch_ok = True
             if active_batch_id:
-                upsert_candidate_manual_review(
+                batch_ok = upsert_candidate_manual_review(
                     batch_id=active_batch_id,
                     candidate_id=cand_id,
                     manual_note=note_input,
+                    operator_user_id=operator["user_id"],
+                    operator_name=operator["name"],
+                    operator_email=operator["email"],
+                    review_id=review_id,
+                    jd_title=str(st.session_state.get("workspace_selected_jd_title") or ""),
+                    source="workspace",
+                    is_admin=bool(operator.get("is_admin")),
+                    enforce_lock=True,
                 )
+            if not batch_ok:
+                refreshed_lock_state = get_candidate_lock_state(active_batch_id, cand_id) or _empty_workspace_lock_state()
+                _sync_candidate_lock_state(selected_row, detail, refreshed_lock_state, str(operator["user_id"] or ""))
+                st.session_state.workspace_action_feedback = "当前候选人已被其他 HR 锁定，人工备注未保存。"
+                st.session_state.workspace_action_feedback_kind = "warning"
+                st.rerun()
+            detail["manual_note"] = note_input
+            selected_row["人工备注"] = note_input
+            if review_id:
+                ok = upsert_manual_review(
+                    review_id=review_id,
+                    manual_note=note_input,
+                    reviewed_by_user_id=operator["user_id"],
+                    reviewed_by_name=operator["name"],
+                    reviewed_by_email=operator["email"],
+                    metadata_updates=_build_workspace_review_metadata(detail, selected_row),
+                )
+                if not ok:
+                    st.warning("未找到对应审核记录，未能写入备注。")
+            else:
+                st.warning("当前候选人缺少留痕 ID，无法写入备注。")
+            st.session_state.v2_rows = rows
+            st.session_state.v2_details = details
+            st.success("人工备注已写入操作留痕。")
 
         current_priority = detail.get("manual_priority") or selected_row.get("处理优先级") or "普通"
         priority_options = ["高", "中", "普通", "低"]
@@ -1998,18 +4603,45 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             index=priority_options.index(current_priority),
             key=f"manual_priority_{cand_id}",
         )
-        if st.button("保存处理优先级", key=f"manual_priority_save_{cand_id}", use_container_width=True):
+        if st.button(
+            "保存处理优先级",
+            key=f"manual_priority_save_{cand_id}",
+            use_container_width=True,
+            disabled=not can_edit_claimed,
+        ):
+            batch_ok = True
+            if active_batch_id:
+                batch_ok = upsert_candidate_manual_review(
+                    batch_id=active_batch_id,
+                    candidate_id=cand_id,
+                    manual_priority=selected_priority,
+                    operator_user_id=operator["user_id"],
+                    operator_name=operator["name"],
+                    operator_email=operator["email"],
+                    review_id=review_id,
+                    jd_title=str(st.session_state.get("workspace_selected_jd_title") or ""),
+                    source="workspace",
+                    is_admin=bool(operator.get("is_admin")),
+                    enforce_lock=True,
+                )
+            if not batch_ok:
+                refreshed_lock_state = get_candidate_lock_state(active_batch_id, cand_id) or _empty_workspace_lock_state()
+                _sync_candidate_lock_state(selected_row, detail, refreshed_lock_state, str(operator["user_id"] or ""))
+                st.session_state.workspace_action_feedback = "当前候选人已被其他 HR 锁定，处理优先级未保存。"
+                st.session_state.workspace_action_feedback_kind = "warning"
+                st.rerun()
             detail["manual_priority"] = selected_priority
             for row_item in rows:
                 if row_item.get("candidate_id") == cand_id:
                     row_item["处理优先级"] = selected_priority
                     break
-            active_batch_id = st.session_state.get("workspace_preferred_batch_id", "")
-            if active_batch_id:
-                upsert_candidate_manual_review(
-                    batch_id=active_batch_id,
-                    candidate_id=cand_id,
-                    manual_priority=selected_priority,
+            if review_id:
+                upsert_manual_review(
+                    review_id=review_id,
+                    reviewed_by_user_id=operator["user_id"],
+                    reviewed_by_name=operator["name"],
+                    reviewed_by_email=operator["email"],
+                    metadata_updates=_build_workspace_review_metadata(detail, selected_row),
                 )
             st.session_state.v2_rows = rows
             st.session_state.v2_details = details
@@ -2017,22 +4649,47 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             st.rerun()
 
         def _apply_manual_decision(manual_decision: str) -> None:
-            review_status[cand_id] = manual_decision
-            detail["manual_decision"] = manual_decision
-            for row in rows:
-                if row.get("candidate_id") == cand_id:
-                    row["人工最终结论"] = manual_decision
-                    break
-            if review_id:
-                upsert_manual_review(review_id=review_id, manual_decision=manual_decision, manual_note=note_input)
-            active_batch_id = st.session_state.get("workspace_preferred_batch_id", "")
+            batch_ok = True
             if active_batch_id:
-                upsert_candidate_manual_review(
+                batch_ok = upsert_candidate_manual_review(
                     batch_id=active_batch_id,
                     candidate_id=cand_id,
                     manual_decision=manual_decision,
                     manual_note=note_input,
                     manual_priority=detail.get("manual_priority") or selected_row.get("处理优先级") or "普通",
+                    operator_user_id=operator["user_id"],
+                    operator_name=operator["name"],
+                    operator_email=operator["email"],
+                    review_id=review_id,
+                    jd_title=str(st.session_state.get("workspace_selected_jd_title") or ""),
+                    source="workspace",
+                    is_admin=bool(operator.get("is_admin")),
+                    enforce_lock=True,
+                )
+            if not batch_ok:
+                refreshed_lock_state = get_candidate_lock_state(active_batch_id, cand_id) or _empty_workspace_lock_state()
+                _sync_candidate_lock_state(selected_row, detail, refreshed_lock_state, str(operator["user_id"] or ""))
+                st.session_state.workspace_action_feedback = "当前候选人已被其他 HR 锁定，人工结论未保存。"
+                st.session_state.workspace_action_feedback_kind = "warning"
+                st.rerun()
+
+            review_status[cand_id] = manual_decision
+            detail["manual_decision"] = manual_decision
+            detail["manual_note"] = note_input
+            for row in rows:
+                if row.get("candidate_id") == cand_id:
+                    row["人工最终结论"] = manual_decision
+                    row["人工备注"] = note_input
+                    break
+            if review_id:
+                upsert_manual_review(
+                    review_id=review_id,
+                    manual_decision=manual_decision,
+                    manual_note=note_input,
+                    reviewed_by_user_id=operator["user_id"],
+                    reviewed_by_name=operator["name"],
+                    reviewed_by_email=operator["email"],
+                    metadata_updates=_build_workspace_review_metadata(detail, selected_row),
                 )
 
             st.session_state.v2_manual_review_status = review_status
@@ -2062,19 +4719,383 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
 
         tag_cols = st.columns(3)
         with tag_cols[0]:
-            if st.button("通过", key=f"manual_pass_{cand_id}", use_container_width=True):
+            if st.button("通过", key=f"manual_pass_{cand_id}", use_container_width=True, disabled=not can_edit_claimed):
                 _apply_manual_decision("通过")
         with tag_cols[1]:
-            if st.button("待复核", key=f"manual_pending_{cand_id}", use_container_width=True):
+            if st.button("待复核", key=f"manual_pending_{cand_id}", use_container_width=True, disabled=not can_edit_claimed):
                 _apply_manual_decision("待复核")
         with tag_cols[2]:
-            if st.button("淘汰", key=f"manual_reject_{cand_id}", use_container_width=True):
+            if st.button("淘汰", key=f"manual_reject_{cand_id}", use_container_width=True, disabled=not can_edit_claimed):
                 _apply_manual_decision("淘汰")
 
         st.session_state.v2_manual_review_status = review_status
         current_tag = st.session_state.v2_manual_review_status.get(cand_id)
         if current_tag:
             st.caption(f"当前人工最终决策：{current_tag}")
+
+        st.markdown("**9) AI 审核建议（辅助决策区）**")
+        _normalize_ai_review_state(detail)
+        ai_suggestion = detail.get("ai_review_suggestion") if isinstance(detail.get("ai_review_suggestion"), dict) else {}
+        ai_cfg = ((detail.get("parsed_jd") or {}).get("scoring_config") or {}).get("ai_reviewer") or {}
+        ai_mode = str(ai_cfg.get("ai_reviewer_mode") or ai_suggestion.get("mode") or "off")
+        ai_enabled = bool(ai_cfg.get("enable_ai_reviewer", False)) and ai_mode != "off"
+        ai_meta = ai_suggestion.get("meta") if isinstance(ai_suggestion.get("meta"), dict) else {}
+        active_batch_id = st.session_state.get("workspace_preferred_batch_id", "")
+        ai_applied_actions = detail.get("ai_applied_actions") if isinstance(detail.get("ai_applied_actions"), list) else []
+        ai_status = _refresh_ai_review_freshness(detail)
+        current_input_hash = _current_ai_input_hash(detail)
+        stored_input_hash = str(detail.get("ai_input_hash") or "").strip()
+        display_input_hash = stored_input_hash[:12] if stored_input_hash else "-"
+        source_label = detail.get("ai_source") or ai_meta.get("source") or "-"
+        model_label = detail.get("ai_model") or ai_meta.get("model") or "-"
+        prompt_version = detail.get("ai_prompt_version") or ai_meta.get("prompt_version") or "-"
+        latency_ms = int(detail.get("ai_generated_latency_ms") or ai_meta.get("generated_latency_ms") or 0)
+        latency_label = f"{latency_ms} ms" if latency_ms > 0 else "-"
+        lock_key = _ai_generation_lock_key(cand_id, active_batch_id, review_id)
+        generation_locks = st.session_state.setdefault("workspace_ai_generation_locks", {})
+        generation_in_progress = bool(generation_locks.get(lock_key))
+        ai_generate_disabled = generation_in_progress or (
+            bool(active_batch_id)
+            and bool(lock_state.get("is_locked_effective"))
+            and not _is_candidate_self_locked(lock_state, operator)
+        )
+
+        if not ai_enabled:
+            st.caption("当前岗位未启用 AI reviewer。")
+            return
+
+        st.caption("AI 建议默认不生效，需人工点击应用。")
+        st.caption(
+            f"状态：{_ai_review_status_label(ai_status)}｜source：{source_label}｜model：{model_label}｜"
+            f"prompt version：{prompt_version}｜input hash：{display_input_hash}｜latency：{latency_label}"
+        )
+        if detail.get("ai_generated_at"):
+            generated_by = detail.get("ai_generated_by_name") or detail.get("ai_generated_by_email") or "未记录"
+            refresh_reason = detail.get("ai_refresh_reason") or detail.get("ai_generation_reason") or "-"
+            st.caption(f"最近生成：{detail.get('ai_generated_at')}｜生成人：{generated_by}｜生成原因：{refresh_reason}")
+        if generation_in_progress:
+            st.info("AI 审核建议正在生成中，请稍候。")
+        if ai_status == "ready" and stored_input_hash and stored_input_hash == current_input_hash:
+            st.info("当前建议基于最新规则结果，无需刷新。")
+        if ai_status == "outdated":
+            st.warning("检测到输入已变化，建议刷新 AI 审核建议。")
+        if ai_status == "failed" and detail.get("ai_review_error"):
+            st.warning(f"最近一次生成失败：{detail.get('ai_review_error')}")
+        if source_label == "stub":
+            st.info(
+                f"当前为 fallback 结果，仅用于辅助参考："
+                f"{ai_meta.get('reason') or detail.get('ai_review_error') or '未获取到真实模型结果'}"
+            )
+
+        generate_cols = st.columns(2)
+        with generate_cols[0]:
+            if st.button(
+                "生成 AI 审核建议",
+                key=f"generate_ai_review_{cand_id}",
+                use_container_width=True,
+                disabled=ai_generate_disabled,
+            ):
+                ok, message, feedback_kind = _generate_ai_review_for_candidate(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    force_refresh=False,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = feedback_kind
+                st.rerun()
+        with generate_cols[1]:
+            if st.button(
+                "刷新 AI 审核建议",
+                key=f"refresh_ai_review_{cand_id}",
+                use_container_width=True,
+                disabled=ai_generate_disabled,
+            ):
+                ok, message, feedback_kind = _generate_ai_review_for_candidate(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    force_refresh=True,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = feedback_kind
+                st.rerun()
+
+        if not ai_suggestion:
+            st.caption("当前尚未生成 AI 审核建议。")
+            return
+
+        preview = _build_ai_change_preview(detail, selected_row, ai_cfg, ai_suggestion)
+        evidence_updates = ai_suggestion.get("evidence_updates") or []
+        timeline_updates = ai_suggestion.get("timeline_updates") or []
+        risk_adjustment = ai_suggestion.get("risk_adjustment") or {}
+        score_adjustments = ai_suggestion.get("score_adjustments") or []
+
+        st.write(f"AI 审核摘要：{ai_suggestion.get('review_summary') or '暂无'}")
+
+        st.caption("建议变更预览")
+        if preview["score_rows"]:
+            for item in preview["score_rows"]:
+                st.markdown(
+                    f"- {item['dimension']}：当前 {item['current_score']}，建议 {item['suggested_delta']:+}，"
+                    f"应用后 {item['next_score']}｜原因：{item['reason'] or '-'}"
+                )
+        else:
+            st.caption("本次无改分预览。")
+
+        st.markdown(
+            f"- 风险等级：当前 {_risk_level_label(preview['current_risk'])}，"
+            f"建议 {_risk_level_label(preview['suggested_risk'])}，"
+            f"{'会变化' if preview['risk_changed'] else '无变化'}"
+        )
+        if preview["allow_direct_change"]:
+            st.markdown(
+                f"- 自动结论：当前 {preview['current_decision'] or '-'}，"
+                f"预估应用后 {preview['estimated_decision'] or '-'}"
+            )
+        else:
+            st.markdown(
+                f"- 自动结论：当前 {preview['current_decision'] or '-'}。"
+                "本次不会自动改变候选池/自动结论。"
+            )
+        st.markdown(f"- 证据建议：预计新增 {preview['evidence_add_count']} 条")
+        st.markdown(f"- 时间线建议：预计新增 {preview['timeline_add_count']} 条")
+
+        st.caption("AI 建议内容")
+        st.caption("AI 补充证据建议")
+        if evidence_updates:
+            for item in evidence_updates:
+                st.markdown(f"- [{item.get('source', 'AI')}] {item.get('text', '')}")
+        else:
+            st.caption("暂无建议。")
+
+        st.caption("AI 关键时间线补充")
+        if timeline_updates:
+            for item in timeline_updates:
+                st.markdown(f"- {item.get('label', '时间点')}：{item.get('value', '')}")
+        else:
+            st.caption("暂无建议。")
+
+        st.caption("AI 风险调整建议")
+        if risk_adjustment:
+            st.markdown(
+                f"- 建议风险等级：{_risk_level_label(str(risk_adjustment.get('suggested_risk_level') or 'unknown'))}"
+            )
+            if risk_adjustment.get("reason"):
+                st.caption(f"说明：{risk_adjustment.get('reason')}")
+        else:
+            st.caption("暂无建议。")
+
+        st.caption("AI 改分建议")
+        if score_adjustments:
+            for item in score_adjustments:
+                st.markdown(
+                    f"- {item.get('dimension', '-')}：{int(item.get('suggested_delta', 0) or 0):+d}"
+                    f" (max {item.get('max_delta', 1)})"
+                )
+                if item.get("reason"):
+                    st.caption(f"说明：{item.get('reason')}")
+        else:
+            st.caption("暂无建议。")
+
+        st.caption(f"AI 推荐动作建议：{ai_suggestion.get('recommended_action') or 'no_action'}")
+
+        if detail.get("ai_applied"):
+            action_labels = {
+                "evidence": "证据建议",
+                "timeline": "时间线建议",
+                "risk": "风险建议",
+                "scores": "改分建议",
+            }
+            applied_label = "、".join(action_labels.get(action, action) for action in ai_applied_actions) or "AI 建议"
+            applied_by = detail.get("ai_applied_by_name") or detail.get("ai_applied_by_email") or "未记录"
+            st.success(f"已应用：{applied_label}")
+            st.caption(
+                f"应用人：{applied_by}｜应用时间：{detail.get('ai_applied_at') or '-'}｜"
+                f"来源：{detail.get('ai_source') or '-'}｜模式：{detail.get('ai_mode') or ai_mode}｜"
+                f"模型：{detail.get('ai_model') or ai_meta.get('model') or '-'}"
+            )
+        if detail.get("ai_reverted"):
+            reverted_actions = detail.get("ai_reverted_actions") if isinstance(detail.get("ai_reverted_actions"), list) else []
+            reverted_by = detail.get("ai_reverted_by_name") or detail.get("ai_reverted_by_email") or "未记录"
+            st.caption(
+                f"最近撤回：{'、'.join(reverted_actions) or 'AI 建议'}｜撤回人：{reverted_by}｜"
+                f"撤回时间：{detail.get('ai_reverted_at') or '-'}"
+            )
+
+        has_evidence = bool(evidence_updates)
+        has_timeline = bool(timeline_updates)
+        has_risk = bool(risk_adjustment and risk_adjustment.get("suggested_risk_level"))
+        has_scores = bool(score_adjustments)
+        has_any_action = has_evidence or has_timeline or has_risk or has_scores
+        has_baseline = bool(detail.get("ai_baseline_saved"))
+        has_applied_scores = "scores" in ai_applied_actions
+
+        action_cols = st.columns(4)
+        with action_cols[0]:
+            if st.button(
+                "应用 AI 证据建议",
+                key=f"apply_ai_evidence_{cand_id}",
+                use_container_width=True,
+                disabled=(not has_evidence) or (not can_edit_claimed),
+            ):
+                ok, message = _apply_ai_suggestions_to_candidate(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    ai_cfg=ai_cfg,
+                    ai_suggestion=ai_suggestion,
+                    apply_evidence=True,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                st.rerun()
+
+        with action_cols[1]:
+            if st.button(
+                "应用 AI 风险建议",
+                key=f"apply_ai_risk_{cand_id}",
+                use_container_width=True,
+                disabled=(not has_risk) or (not can_edit_claimed),
+            ):
+                ok, message = _apply_ai_suggestions_to_candidate(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    ai_cfg=ai_cfg,
+                    ai_suggestion=ai_suggestion,
+                    apply_risk=True,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                st.rerun()
+
+        with action_cols[2]:
+            if st.button(
+                "应用 AI 改分建议",
+                key=f"apply_ai_scores_{cand_id}",
+                use_container_width=True,
+                disabled=(not has_scores) or (not can_edit_claimed),
+            ):
+                ok, message = _apply_ai_suggestions_to_candidate(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    ai_cfg=ai_cfg,
+                    ai_suggestion=ai_suggestion,
+                    apply_scores=True,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                st.rerun()
+
+        with action_cols[3]:
+            if st.button(
+                "应用全部建议",
+                key=f"apply_ai_all_{cand_id}",
+                use_container_width=True,
+                disabled=(not has_any_action) or (not can_edit_claimed),
+            ):
+                ok, message = _apply_ai_suggestions_to_candidate(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    ai_cfg=ai_cfg,
+                    ai_suggestion=ai_suggestion,
+                    apply_evidence=has_evidence,
+                    apply_timeline=has_timeline,
+                    apply_risk=has_risk,
+                    apply_scores=has_scores,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                st.rerun()
+
+        revert_cols = st.columns(3)
+        with revert_cols[0]:
+            if st.button(
+                "撤回 AI 改分建议",
+                key=f"revert_ai_scores_{cand_id}",
+                use_container_width=True,
+                disabled=(not (has_baseline and has_applied_scores)) or (not can_edit_claimed),
+            ):
+                ok, message = _revert_ai_application_from_baseline(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    full_restore=False,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                st.rerun()
+        with revert_cols[1]:
+            if st.button(
+                "恢复原始规则结果",
+                key=f"restore_ai_baseline_{cand_id}",
+                use_container_width=True,
+                disabled=(not has_baseline) or (not can_edit_claimed),
+            ):
+                ok, message = _revert_ai_application_from_baseline(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                    full_restore=True,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                st.rerun()
+        with revert_cols[2]:
+            if st.button(
+                "清除 AI 应用状态",
+                key=f"clear_ai_state_{cand_id}",
+                use_container_width=True,
+                disabled=(not (detail.get("ai_applied") or detail.get("ai_baseline_saved") or detail.get("ai_reverted"))) or (not can_edit_claimed),
+            ):
+                ok, message = _clear_ai_application_state_for_candidate(
+                    rows=rows,
+                    details=details,
+                    selected_row=selected_row,
+                    detail=detail,
+                    candidate_id=cand_id,
+                    batch_id=active_batch_id,
+                    review_id=review_id,
+                )
+                st.session_state.workspace_action_feedback = message
+                st.session_state.workspace_action_feedback_kind = "success" if ok else "warning"
+                st.rerun()
+        return
 
 
 def _render_batch_screening() -> None:
@@ -2135,9 +5156,13 @@ def _render_batch_screening() -> None:
         has_image = any(str(getattr(f, "name", "")).lower().endswith((".png", ".jpg", ".jpeg")) for f in uploaded_files)
         has_pdf = any(str(getattr(f, "name", "")).lower().endswith(".pdf") for f in uploaded_files)
         if has_image and not ocr_caps.get("image_ocr_available", False):
-            st.info("当前环境未启用图片 OCR，图片简历可能无法稳定识别，建议改用 txt/docx 或部署后启用 OCR。")
+            missing = ", ".join((ocr_caps.get("missing_deps") or []) + (ocr_caps.get("missing_runtime") or []))
+            suffix = f"（缺失：{missing}）" if missing else ""
+            st.warning(f"当前环境未启用图片 OCR{suffix}，图片简历可能无法稳定识别，建议改用 txt/docx 或在部署环境补齐 OCR。")
         if has_pdf and not ocr_caps.get("pdf_ocr_available", False):
-            st.info("当前环境未启用 PDF OCR fallback，扫描版 PDF 可能无法稳定识别。")
+            missing = ", ".join((ocr_caps.get("missing_deps") or []) + (ocr_caps.get("missing_runtime") or []))
+            suffix = f"（缺失：{missing}）" if missing else ""
+            st.warning(f"当前环境未启用 PDF OCR fallback{suffix}，扫描版 PDF 可能无法稳定识别。")
 
     st.markdown("**提取质量预检查**")
     st.caption("先检查每份简历的提取方式与提取质量，再执行初筛。")
@@ -2270,6 +5295,7 @@ def _render_candidate_workspace() -> None:
             st.info("暂无候选池数据，请先在“批量初筛”页面上传简历并运行初筛。")
             return
         st.caption("当前展示的是本次会话结果（尚未检测到持久化岗位候选池）。")
+        _render_workspace_batch_overview(rows, details)
         _render_candidate_workspace_panel(rows, details)
         return
 
@@ -2315,6 +5341,8 @@ def _render_candidate_workspace() -> None:
 
     rows = payload.get("rows", [])
     details = payload.get("details", {})
+    st.session_state.v2_rows = rows
+    st.session_state.v2_details = details
     current_pool = st.session_state.get("workspace_pool_top_radio", "")
     if current_pool not in {"待复核候选人", "通过候选人", "淘汰候选人"}:
         current_pool = "待复核候选人" if int(payload.get("review_count", 0) or 0) > 0 else "通过候选人"
@@ -2329,6 +5357,10 @@ def _render_candidate_workspace() -> None:
         f"当前批次总人数：{payload.get('total_resumes', len(rows))} ｜ "
         f"通过：{payload.get('pass_count', 0)} ｜ 待复核：{payload.get('review_count', 0)} ｜ 淘汰：{payload.get('reject_count', 0)}"
     )
+
+    if rows:
+        _render_workspace_batch_overview(rows, details)
+        _render_workspace_admin_lock_panel(selected_batch_id)
 
     with st.expander("切换岗位/批次", expanded=False):
         chosen_jd = st.selectbox("选择岗位候选池", options=jd_titles, index=default_jd_index, key="workspace_jd_switch")
@@ -2352,8 +5384,16 @@ def _render_candidate_workspace() -> None:
             else:
                 st.warning("该岗位暂无可切换批次。")
 
+        is_admin_user = _current_user_is_admin()
+        if not is_admin_user:
+            st.caption("删除当前批次仅管理员可执行。")
         st.caption("删除提示：删除当前批次后会自动切换到该岗位最新剩余批次。")
-        if st.button("删除当前批次（不可恢复）", key="workspace_delete_current_batch", use_container_width=True):
+        if st.button(
+            "删除当前批次（不可恢复）",
+            key="workspace_delete_current_batch",
+            use_container_width=True,
+            disabled=not is_admin_user,
+        ):
             current_bid = st.session_state.get("workspace_preferred_batch_id", "")
             if not current_bid:
                 st.warning("当前没有可删除的批次。")
@@ -2364,9 +5404,6 @@ def _render_candidate_workspace() -> None:
             else:
                 st.warning("当前批次删除失败，可能已被删除。")
 
-    st.session_state.v2_rows = rows
-    st.session_state.v2_details = details
-
     if not rows:
         st.info("当前批次暂无候选人，请返回“批量初筛”上传简历，或在上方切换其他批次继续审核。")
         return
@@ -2375,7 +5412,15 @@ def _render_candidate_workspace() -> None:
 
 st.set_page_config(page_title="HireMate", page_icon="🧠", layout="wide")
 _inject_page_style()
+
+current_user = _restore_authenticated_user()
+if not current_user:
+    _render_hero()
+    _render_login_page()
+    st.stop()
+
 _render_hero()
+_render_sidebar_user_panel()
 
 st.sidebar.markdown("### 开发调试")
 st.sidebar.checkbox(

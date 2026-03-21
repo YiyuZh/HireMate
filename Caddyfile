@@ -1,3 +1,4 @@
+# Public-IP HTTP reverse proxy for initial cloud deployment.
 :80 {
     encode gzip
     reverse_proxy hiremate:8501

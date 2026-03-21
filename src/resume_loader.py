@@ -10,9 +10,30 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 FALLBACK_TEXT = "【未提取到稳定文本，请手动修正后再评估】"
+
+
+def _tesseract_available() -> bool:
+    try:
+        import pytesseract
+    except ModuleNotFoundError:
+        return False
+
+    if shutil.which("tesseract") is None:
+        return False
+
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
+        return False
+    return True
+
+
+def _poppler_available() -> bool:
+    return shutil.which("pdfinfo") is not None and shutil.which("pdftoppm") is not None
 
 
 def _decode_text_bytes(raw: bytes) -> str:
@@ -82,8 +103,16 @@ def _extract_pdf_with_ocr(file_obj) -> str:
     except ModuleNotFoundError as exc:
         raise ValueError("PDF OCR 需要 pytesseract（未安装）。") from exc
 
+    if not _poppler_available():
+        raise ValueError("PDF OCR 需要 poppler（缺少 pdfinfo/pdftoppm）。")
+    if not _tesseract_available():
+        raise ValueError("PDF OCR 需要 tesseract（未安装或未加入 PATH）。")
+
     raw = file_obj.getvalue()
-    images = convert_from_bytes(raw, dpi=200)
+    try:
+        images = convert_from_bytes(raw, dpi=200)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"PDF OCR 调用 poppler 失败（{exc}）。") from exc
     ocr_lines: list[str] = []
     for image in images:
         line = (pytesseract.image_to_string(image, lang="chi_sim+eng") or "").strip()
@@ -105,6 +134,9 @@ def _extract_image_with_ocr(file_obj) -> str:
         import pytesseract
     except ModuleNotFoundError as exc:
         raise ValueError("图片 OCR 需要 pytesseract（未安装）。") from exc
+
+    if not _tesseract_available():
+        raise ValueError("图片 OCR 需要 tesseract（未安装或未加入 PATH）。")
 
     file_obj.seek(0)
     image = Image.open(file_obj)
@@ -147,7 +179,13 @@ def _safe_result(text: str, method: str, quality: str, message: str) -> dict:
 
 def _pdf_result_with_fallback(file_obj) -> dict:
     """PDF：文本优先，质量弱时 OCR fallback，并保障返回稳定。"""
-    pdf_text = _load_pdf_text(file_obj)
+    pdf_text = ""
+    pdf_text_error = ""
+    try:
+        pdf_text = _load_pdf_text(file_obj)
+    except Exception as exc:  # noqa: BLE001
+        pdf_text_error = str(exc)
+
     if not _is_text_quality_weak(pdf_text):
         return _safe_result(pdf_text, method="text", quality="ok", message="PDF 普通文本提取成功。")
 
@@ -157,11 +195,13 @@ def _pdf_result_with_fallback(file_obj) -> dict:
         ocr_text = _extract_pdf_with_ocr(file_obj)
     except ValueError as exc:
         # OCR 依赖缺失：不崩溃，返回弱质量可用结构
-        msg = f"PDF 文本提取质量较弱，OCR 不可用（{exc}），建议人工检查或改用 txt/docx。"
+        prefix = f"PDF 文本提取失败（{pdf_text_error}）。" if pdf_text_error else "PDF 文本提取质量较弱。"
+        msg = f"{prefix} OCR 不可用（{exc}），建议人工检查或改用 txt/docx。"
         return _safe_result(pdf_text, method="text", quality="weak", message=msg)
     except Exception as exc:  # noqa: BLE001
         # OCR 运行失败：同样不崩溃
-        msg = f"PDF 文本提取质量较弱，OCR 调用失败（{exc}），建议人工检查或改用 txt/docx。"
+        prefix = f"PDF 文本提取失败（{pdf_text_error}）。" if pdf_text_error else "PDF 文本提取质量较弱。"
+        msg = f"{prefix} OCR 调用失败（{exc}），建议人工检查或改用 txt/docx。"
         return _safe_result(pdf_text, method="text", quality="weak", message=msg)
 
     # OCR 成功后仍做质量判定
@@ -217,12 +257,21 @@ def check_ocr_capabilities() -> dict:
     except ModuleNotFoundError:
         missing.append("pdf2image")
 
-    image_ocr_available = all(dep not in missing for dep in ["pillow", "pytesseract"])
-    pdf_ocr_available = all(dep not in missing for dep in ["pdf2image", "pytesseract"])
+    runtime_missing: list[str] = []
+    tesseract_ok = _tesseract_available()
+    poppler_ok = _poppler_available()
+    if not tesseract_ok:
+        runtime_missing.append("tesseract")
+    if not poppler_ok:
+        runtime_missing.append("poppler")
+
+    image_ocr_available = all(dep not in missing for dep in ["pillow", "pytesseract"]) and tesseract_ok
+    pdf_ocr_available = all(dep not in missing for dep in ["pdf2image", "pytesseract"]) and tesseract_ok and poppler_ok
     return {
         "image_ocr_available": image_ocr_available,
         "pdf_ocr_available": pdf_ocr_available,
         "missing_deps": sorted(set(missing)),
+        "missing_runtime": sorted(set(runtime_missing)),
     }
 
 def _demo_read(path: str) -> None:

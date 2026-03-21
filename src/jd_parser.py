@@ -209,7 +209,7 @@ def parse_jd(jd_text: str) -> dict[str, str | list[str]]:
 
 if __name__ == "__main__":
     # 本地测试示例：
-    # cd ai_recruiting_screener
+    # cd HireMate
     # python src/jd_parser.py
     sample_jd = """
     职位名称：AI 产品经理实习生

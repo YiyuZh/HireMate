@@ -18,7 +18,6 @@ from src.resume_parser import parse_resume
 from src.role_profiles import detect_role_profile, get_profile_by_name
 from src.risk_analyzer import analyze_risk
 from src.scorer import score_candidate, to_score_values
-from src.utils import save_json
 
 
 # 与 scoring_rules.md 对齐的权重（百分比）
@@ -231,14 +230,12 @@ def run_screening(jd_text: str, resume_text: str, risk_level: str | None = None)
         "ai_review_suggestion": ai_review_suggestion,
     }
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_json(f"data/screening_result_{timestamp}.json", result)
     return result
 
 
 if __name__ == "__main__":
     # 本地测试示例：
-    # cd ai_recruiting_screener
+    # cd HireMate
     # python src/screener.py
     demo_scores_detail = {
         "教育背景匹配度": {"score": 4, "reason": "", "evidence": []},

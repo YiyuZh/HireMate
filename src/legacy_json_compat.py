@@ -1,139 +1,19 @@
-"""SQLite helpers for HireMate persistence."""
+"""Legacy JSON migration helpers for one-time SQLite bootstrap."""
 
 from __future__ import annotations
 
-import copy
-import json
-import sqlite3
-import threading
-from datetime import datetime
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .db import get_connection, get_db_backend, get_meta, json_dumps, json_loads, now_str, set_meta
 from .role_profiles import build_default_scoring_config
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DB_PATH = DATA_DIR / "hiremate.db"
-JD_JSON_PATH = DATA_DIR / "jd_store.json"
-CANDIDATE_JSON_PATH = DATA_DIR / "candidate_pool_store.json"
-REVIEW_JSON_PATH = DATA_DIR / "review_history.json"
-
 _DEFAULT_PROFILE_NAME = "AI产品经理 / 大模型产品经理"
-
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS jobs (
-    title TEXT PRIMARY KEY,
-    jd_text TEXT NOT NULL,
-    openings INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS job_scoring_configs (
-    job_title TEXT PRIMARY KEY,
-    scoring_config_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (job_title) REFERENCES jobs(title) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS candidate_batches (
-    batch_id TEXT PRIMARY KEY,
-    jd_title TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    total_resumes INTEGER NOT NULL DEFAULT 0,
-    candidate_count INTEGER NOT NULL DEFAULT 0,
-    pass_count INTEGER NOT NULL DEFAULT 0,
-    review_count INTEGER NOT NULL DEFAULT 0,
-    reject_count INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS candidate_rows (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL,
-    candidate_id TEXT NOT NULL,
-    candidate_name TEXT NOT NULL DEFAULT '',
-    source_name TEXT NOT NULL DEFAULT '',
-    parse_status TEXT NOT NULL DEFAULT '',
-    screening_result TEXT NOT NULL DEFAULT '',
-    risk_level TEXT NOT NULL DEFAULT 'unknown',
-    candidate_pool TEXT NOT NULL DEFAULT '',
-    manual_decision TEXT NOT NULL DEFAULT '',
-    manual_note TEXT NOT NULL DEFAULT '',
-    manual_priority TEXT NOT NULL DEFAULT '',
-    review_summary TEXT NOT NULL DEFAULT '',
-    scores_json TEXT NOT NULL DEFAULT '{}',
-    extract_info_json TEXT NOT NULL DEFAULT '{}',
-    row_json TEXT NOT NULL DEFAULT '{}',
-    detail_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(batch_id, candidate_id),
-    FOREIGN KEY (batch_id) REFERENCES candidate_batches(batch_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS reviews (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    review_id TEXT NOT NULL DEFAULT '',
-    timestamp TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    jd_title TEXT NOT NULL DEFAULT '',
-    resume_name TEXT NOT NULL DEFAULT '',
-    resume_file TEXT NOT NULL DEFAULT '',
-    auto_screening_result TEXT NOT NULL DEFAULT '',
-    auto_risk_level TEXT NOT NULL DEFAULT 'unknown',
-    manual_decision TEXT NOT NULL DEFAULT '',
-    manual_note TEXT NOT NULL DEFAULT '',
-    scores_json TEXT NOT NULL DEFAULT '{}',
-    screening_reasons_json TEXT NOT NULL DEFAULT '[]',
-    risk_points_json TEXT NOT NULL DEFAULT '[]',
-    interview_summary TEXT NOT NULL DEFAULT '',
-    evidence_snippets_json TEXT NOT NULL DEFAULT '[]',
-    record_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_review_id_nonempty
-ON reviews(review_id)
-WHERE review_id <> '';
-
-CREATE INDEX IF NOT EXISTS idx_candidate_batches_jd_created
-ON candidate_batches(jd_title, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_candidate_rows_batch
-ON candidate_rows(batch_id);
-
-CREATE INDEX IF NOT EXISTS idx_candidate_rows_batch_manual
-ON candidate_rows(batch_id, manual_decision);
-
-CREATE INDEX IF NOT EXISTS idx_reviews_timestamp
-ON reviews(timestamp DESC, id DESC);
-"""
-
-_INIT_LOCK = threading.Lock()
-_SCHEMA_READY = False
-_MIGRATION_READY = False
-
-
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def json_loads(payload: str | None, default: Any) -> Any:
-    if not payload:
-        return copy.deepcopy(default)
-    try:
-        return json.loads(payload)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return copy.deepcopy(default)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_LEGACY_DATA_DIR = _PROJECT_ROOT / "data"
+_BOOTSTRAP_DATA_DIR = _PROJECT_ROOT / "bootstrap_data"
 
 
 def _default_scoring_config() -> dict[str, Any]:
@@ -147,74 +27,41 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _configure_connection(conn: sqlite3.Connection) -> None:
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA busy_timeout = 30000")
-
-
-def ensure_database() -> None:
-    global _SCHEMA_READY
-    if _SCHEMA_READY and DB_PATH.exists():
-        return
-
-    with _INIT_LOCK:
-        if _SCHEMA_READY and DB_PATH.exists():
-            return
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        try:
-            _configure_connection(conn)
-            conn.executescript(_SCHEMA_SQL)
-            conn.commit()
-        finally:
-            conn.close()
-
-        _SCHEMA_READY = True
-
-
-def get_connection() -> sqlite3.Connection:
-    ensure_database()
-    ensure_legacy_migration()
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    _configure_connection(conn)
-    return conn
-
-
-def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
-    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    if row is None:
-        return None
-    return str(row["value"])
-
-
-def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
-    conn.execute(
-        """
-        INSERT INTO meta(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (key, value),
-    )
-
-
 def _read_json_file(path: Path, default: Any) -> Any:
     if not path.exists():
-        return copy.deepcopy(default)
+        return default
     try:
         content = path.read_text(encoding="utf-8")
     except OSError:
-        return copy.deepcopy(default)
+        return default
     return json_loads(content, default)
 
 
-def _table_has_rows(conn: sqlite3.Connection, table_name: str) -> bool:
-    row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
-    return row is not None
+def _iter_legacy_data_dirs() -> list[Path]:
+    candidates: list[Path] = []
+    raw_env_dir = os.getenv("HIREMATE_LEGACY_DATA_DIR", "").strip()
+    if raw_env_dir:
+        candidates.append(Path(raw_env_dir))
+    candidates.append(_BOOTSTRAP_DATA_DIR)
+    candidates.append(_DEFAULT_LEGACY_DATA_DIR)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        normalized = str(path.resolve()) if path.exists() else str(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(path)
+    return unique
+
+
+def _find_legacy_json_file(filename: str) -> Path | None:
+    for data_dir in _iter_legacy_data_dirs():
+        candidate = data_dir / filename
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _job_record_from_json(raw: Any) -> dict[str, Any]:
@@ -251,9 +98,7 @@ def _candidate_batch_from_json(item: dict[str, Any]) -> dict[str, Any]:
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-        candidate_id = str(candidate.get("candidate_id") or f"cand-{uuid4().hex[:8]}").strip()
-        if not candidate_id:
-            candidate_id = f"cand-{uuid4().hex[:8]}"
+        candidate_id = str(candidate.get("candidate_id") or f"cand-{uuid4().hex[:8]}").strip() or f"cand-{uuid4().hex[:8]}"
         row_payload = candidate.get("row") if isinstance(candidate.get("row"), dict) else {}
         detail_payload = candidate.get("detail") if isinstance(candidate.get("detail"), dict) else {}
         normalized_candidates.append(
@@ -327,7 +172,14 @@ def _review_record_from_json(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _should_skip_migration(conn: sqlite3.Connection, meta_key: str, table_name: str) -> bool:
+def _table_has_rows(conn, table_name: str) -> bool:
+    row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
+    return row is not None
+
+
+def _should_skip_migration(conn, meta_key: str, table_name: str, force: bool) -> bool:
+    if force:
+        return False
     if get_meta(conn, meta_key) == "1":
         return True
     if _table_has_rows(conn, table_name):
@@ -336,12 +188,13 @@ def _should_skip_migration(conn: sqlite3.Connection, meta_key: str, table_name: 
     return False
 
 
-def _migrate_jobs_if_needed(conn: sqlite3.Connection) -> None:
+def _migrate_jobs_if_needed(conn, force: bool) -> None:
     meta_key = "migration.jobs.json.v1"
-    if _should_skip_migration(conn, meta_key, "jobs"):
+    if _should_skip_migration(conn, meta_key, "jobs", force):
         return
 
-    data = _read_json_file(JD_JSON_PATH, {})
+    source = _find_legacy_json_file("jd_store.json")
+    data = _read_json_file(source, {}) if source else {}
     if not isinstance(data, dict):
         set_meta(conn, meta_key, "1")
         return
@@ -383,12 +236,13 @@ def _migrate_jobs_if_needed(conn: sqlite3.Connection) -> None:
     set_meta(conn, meta_key, "1")
 
 
-def _migrate_candidate_batches_if_needed(conn: sqlite3.Connection) -> None:
+def _migrate_candidate_batches_if_needed(conn, force: bool) -> None:
     meta_key = "migration.candidate_batches.json.v1"
-    if _should_skip_migration(conn, meta_key, "candidate_batches"):
+    if _should_skip_migration(conn, meta_key, "candidate_batches", force):
         return
 
-    data = _read_json_file(CANDIDATE_JSON_PATH, [])
+    source = _find_legacy_json_file("candidate_pool_store.json")
+    data = _read_json_file(source, []) if source else []
     if not isinstance(data, list):
         set_meta(conn, meta_key, "1")
         return
@@ -463,12 +317,13 @@ def _migrate_candidate_batches_if_needed(conn: sqlite3.Connection) -> None:
     set_meta(conn, meta_key, "1")
 
 
-def _migrate_reviews_if_needed(conn: sqlite3.Connection) -> None:
+def _migrate_reviews_if_needed(conn, force: bool) -> None:
     meta_key = "migration.reviews.json.v1"
-    if _should_skip_migration(conn, meta_key, "reviews"):
+    if _should_skip_migration(conn, meta_key, "reviews", force):
         return
 
-    data = _read_json_file(REVIEW_JSON_PATH, [])
+    source = _find_legacy_json_file("review_history.json")
+    data = _read_json_file(source, []) if source else []
     if not isinstance(data, list):
         set_meta(conn, meta_key, "1")
         return
@@ -510,24 +365,14 @@ def _migrate_reviews_if_needed(conn: sqlite3.Connection) -> None:
     set_meta(conn, meta_key, "1")
 
 
-def ensure_legacy_migration() -> None:
-    global _MIGRATION_READY
-    if _MIGRATION_READY and DB_PATH.exists():
+def migrate_legacy_json_if_needed(force: bool = False) -> None:
+    if get_db_backend() != "sqlite":
         return
-
-    with _INIT_LOCK:
-        if _MIGRATION_READY and DB_PATH.exists():
-            return
-
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        try:
-            _configure_connection(conn)
-            conn.executescript(_SCHEMA_SQL)
-            _migrate_jobs_if_needed(conn)
-            _migrate_candidate_batches_if_needed(conn)
-            _migrate_reviews_if_needed(conn)
-            conn.commit()
-        finally:
-            conn.close()
-
-        _MIGRATION_READY = True
+    conn = get_connection()
+    try:
+        with conn:
+            _migrate_jobs_if_needed(conn, force=force)
+            _migrate_candidate_batches_if_needed(conn, force=force)
+            _migrate_reviews_if_needed(conn, force=force)
+    finally:
+        conn.close()

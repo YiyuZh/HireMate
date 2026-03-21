@@ -58,7 +58,14 @@ def filter_by_risk(rows: list[dict], risk_filter: str) -> list[dict]:
     """按风险等级筛选候选人列表。"""
     if risk_filter == "全部":
         return rows
-    return [row for row in rows if (row.get("风险等级") or "unknown") == risk_filter]
+    risk_mapping = {
+        "低风险": "low",
+        "中风险": "medium",
+        "高风险": "high",
+        "未知风险": "unknown",
+    }
+    target = risk_mapping.get((risk_filter or "").strip(), (risk_filter or "").strip().lower())
+    return [row for row in rows if str(row.get("风险等级") or "unknown").lower() == target]
 
 
 def search_by_name(rows: list[dict], keyword: str) -> list[dict]:

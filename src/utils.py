@@ -10,12 +10,20 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except ModuleNotFoundError:
+    _load_dotenv = None
 
 
 def load_env() -> None:
-    """加载 .env 环境变量。"""
-    load_dotenv()
+    """尽力加载 .env；缺少 python-dotenv 时静默跳过。"""
+    if _load_dotenv is None:
+        return
+    try:
+        _load_dotenv()
+    except Exception:
+        return
 
 
 def save_json(path: str | Path, payload: dict) -> None:

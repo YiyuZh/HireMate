@@ -4,8 +4,9 @@ services:
     container_name: hiremate
     restart: unless-stopped
     volumes:
-      - ./data:/app/data
+      - hiremate_data:/app/data
     environment:
+      HIREMATE_DB_PATH: /app/data/hiremate.db
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       MODEL_NAME: ${MODEL_NAME:-gpt-4o-mini}
@@ -16,7 +17,6 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
@@ -25,5 +25,6 @@ services:
       - hiremate
 
 volumes:
+  hiremate_data:
   caddy_data:
   caddy_config:

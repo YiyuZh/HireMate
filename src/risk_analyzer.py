@@ -213,7 +213,7 @@ def detect_risks(scores: dict[str, int], resume_text: str, resume_data: dict[str
 
 if __name__ == "__main__":
     # 本地测试示例：
-    # cd ai_recruiting_screener
+    # cd HireMate
     # python src/risk_analyzer.py
     demo_resume = {
         "education": "某大学 本科",

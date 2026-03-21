@@ -319,7 +319,7 @@ def parse_resume(resume_text: str) -> dict[str, Any]:
 
 if __name__ == "__main__":
     # 本地测试示例：
-    # cd ai_recruiting_screener
+    # cd HireMate
     # python src/resume_parser.py
     sample_resume = """
     姓名：张三

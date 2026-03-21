@@ -19,17 +19,18 @@
 重点要保留：
 - `app.py`
 - `src/`
-- `data/`
 - `Dockerfile`
 - `docker-compose.yml`
 - `Caddyfile`
 
-如果你本地已经有旧 JSON 数据：
+如果你本地已经有旧数据，分两种情况：
+- 如果已经是 SQLite：优先保留 `data/hiremate.db`
+- 如果还是旧 JSON：可选上传下面这些迁移源文件
 - `data/jd_store.json`
 - `data/candidate_pool_store.json`
 - `data/review_history.json`
 
-也一起上传。第一次启动时会自动迁移到 `data/hiremate.db`。
+SQLite 会作为运行时唯一主存储；旧 JSON 只用于第一次启动时自动迁移到 `/app/data/hiremate.db`。
 
 ## 2. 进入项目目录
 
@@ -96,23 +97,23 @@ http://你的公网IP
 当前数据会落在：
 
 ```text
-data/hiremate.db
+/app/data/hiremate.db
 ```
 
-Docker Compose 已挂载：
+Docker Compose 当前使用 named volume 持久化：
 
 ```text
-./data -> /app/data
+hiremate_data -> /app/data
 ```
 
-所以容器重建后数据还在，只要服务器上的项目目录没删。
+所以容器重建后数据还在，不依赖项目目录下的 `./data` bind mount。
 
 ## 8. 首次启动后的检查项
 
 建议你启动后做这几步：
 
 1. 打开岗位配置页，确认历史岗位还在
-2. 看 `data/hiremate.db` 是否已经生成
+2. 进入容器确认 `/app/data/hiremate.db` 是否已经生成
 3. 新建一个测试岗位
 4. 上传 1 份 txt 简历跑一次批量初筛
 5. 进入候选人工作台，确认候选池、人工备注、人工决策能保存
@@ -165,12 +166,12 @@ docker compose logs -f hiremate
 
 ### 3. 想备份数据
 
-直接备份整个 `data/` 目录即可，重点是：
+直接备份 named volume 对应的数据目录，或先进入容器导出 `/app/data` 下的数据库文件。重点是：
 
 ```text
-data/hiremate.db
-data/hiremate.db-shm
-data/hiremate.db-wal
+/app/data/hiremate.db
+/app/data/hiremate.db-shm
+/app/data/hiremate.db-wal
 ```
 
 更稳妥的方式是先停服务再备份：
