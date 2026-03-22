@@ -11,13 +11,201 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 OPENAI_DEFAULT_API_BASE = "https://api.openai.com/v1"
+DEEPSEEK_DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 AI_REVIEWER_PROMPT_VERSION = "v1"
+AI_RULE_SUGGESTER_PROMPT_VERSION = "v1"
 ALLOWED_RISK_LEVELS = {"low", "medium", "high", "unknown"}
 ALLOWED_ACTIONS = {"proceed", "manual_review", "hold", "no_action"}
+AI_PROVIDER_OPTIONS = ["openai", "openai_compatible", "deepseek", "azure_openai", "anthropic", "mock"]
+OPENAI_COMPATIBLE_PROVIDERS = {"openai", "openai_compatible", "deepseek"}
+OPENAI_JSON_SCHEMA_PROVIDERS = {"openai"}
+OPENAI_JSON_OBJECT_PROVIDERS = {"deepseek"}
+API_BASE_REQUIRED_PROVIDERS = {"openai_compatible"}
+MOCK_PROVIDERS = {"mock"}
+_LATEST_AI_CALL_STATUS: dict[str, Any] = {}
+AI_PROVIDER_DEFAULTS = {
+    "openai": {
+        "model": "gpt-4o-mini",
+        "api_base": OPENAI_DEFAULT_API_BASE,
+        "api_key_env_name": "OPENAI_API_KEY",
+    },
+    "openai_compatible": {
+        "model": "gpt-4o-mini",
+        "api_base": "",
+        "api_key_env_name": "OPENAI_API_KEY",
+    },
+    "deepseek": {
+        "model": "deepseek-chat",
+        "api_base": DEEPSEEK_DEFAULT_API_BASE,
+        "api_key_env_name": "DEEPSEEK_API_KEY",
+    },
+    "azure_openai": {
+        "model": "gpt-4o-mini",
+        "api_base": "",
+        "api_key_env_name": "AZURE_OPENAI_API_KEY",
+    },
+    "anthropic": {
+        "model": "claude-3-5-sonnet-latest",
+        "api_base": "",
+        "api_key_env_name": "ANTHROPIC_API_KEY",
+    },
+    "mock": {
+        "model": "mock",
+        "api_base": "",
+        "api_key_env_name": "",
+    },
+}
+
+
+def _record_latest_ai_call_status(
+    *,
+    purpose: str,
+    runtime_cfg: dict[str, Any],
+    source: str,
+    success: bool,
+    reason: str = "",
+    request_id: str = "",
+) -> None:
+    global _LATEST_AI_CALL_STATUS
+    api_key_env_name = str(runtime_cfg.get("api_key_env_name") or "")
+    api_key_present = bool(os.getenv(api_key_env_name, "").strip()) if api_key_env_name else False
+    _LATEST_AI_CALL_STATUS = {
+        "timestamp": int(round(perf_counter() * 1000)),
+        "purpose": str(purpose or "generic"),
+        "provider": str(runtime_cfg.get("provider") or ""),
+        "model": str(runtime_cfg.get("model") or ""),
+        "api_base": str(runtime_cfg.get("api_base") or ""),
+        "api_key_env_name": api_key_env_name,
+        "api_key_present": api_key_present,
+        "source": str(source or ""),
+        "success": bool(success),
+        "reason": str(reason or ""),
+        "failure_reason": "" if success else str(reason or ""),
+        "request_id": str(request_id or ""),
+    }
+
+
+def get_latest_ai_call_status() -> dict[str, Any]:
+    return dict(_LATEST_AI_CALL_STATUS)
+AI_MODEL_PRESETS = {
+    "openai": [
+        {"label": "GPT-4o Mini", "value": "gpt-4o-mini"},
+        {"label": "GPT-4o", "value": "gpt-4o"},
+        {"label": "GPT-4.1 Mini", "value": "gpt-4.1-mini"},
+        {"label": "GPT-4.1", "value": "gpt-4.1"},
+    ],
+    "openai_compatible": [
+        {"label": "OpenAI GPT-4o Mini", "value": "gpt-4o-mini"},
+        {"label": "OpenAI GPT-4o", "value": "gpt-4o"},
+        {"label": "OpenAI GPT-4.1 Mini", "value": "gpt-4.1-mini"},
+        {"label": "OpenAI GPT-4.1", "value": "gpt-4.1"},
+        {"label": "DeepSeek-V3.2 Chat (deepseek-chat)", "value": "deepseek-chat"},
+        {"label": "DeepSeek-V3.2 Reasoner (deepseek-reasoner)", "value": "deepseek-reasoner"},
+    ],
+    "deepseek": [
+        {"label": "DeepSeek-V3.2 Chat (deepseek-chat)", "value": "deepseek-chat"},
+        {"label": "DeepSeek-V3.2 Reasoner (deepseek-reasoner)", "value": "deepseek-reasoner"},
+    ],
+    "azure_openai": [
+        {"label": "GPT-4o Mini", "value": "gpt-4o-mini"},
+        {"label": "GPT-4o", "value": "gpt-4o"},
+        {"label": "GPT-4.1 Mini", "value": "gpt-4.1-mini"},
+    ],
+    "anthropic": [
+        {"label": "Claude 3.5 Sonnet", "value": "claude-3-5-sonnet-latest"},
+    ],
+    "mock": [
+        {"label": "Mock", "value": "mock"},
+    ],
+}
 
 
 def get_ai_reviewer_prompt_version() -> str:
     return AI_REVIEWER_PROMPT_VERSION
+
+
+def get_ai_rule_suggester_prompt_version() -> str:
+    return AI_RULE_SUGGESTER_PROMPT_VERSION
+
+
+def get_ai_provider_options() -> list[str]:
+    return list(AI_PROVIDER_OPTIONS)
+
+
+def get_ai_model_presets(provider: str) -> list[dict[str, str]]:
+    provider_norm = str(provider or "openai").strip().lower()
+    presets = AI_MODEL_PRESETS.get(provider_norm) or AI_MODEL_PRESETS["openai"]
+    return [dict(item) for item in presets]
+
+
+def get_default_ai_model(provider: str) -> str:
+    provider_norm = str(provider or "openai").strip().lower()
+    return str((AI_PROVIDER_DEFAULTS.get(provider_norm) or AI_PROVIDER_DEFAULTS["openai"]).get("model") or "")
+
+
+def get_default_ai_api_base(provider: str) -> str:
+    provider_norm = str(provider or "openai").strip().lower()
+    return str((AI_PROVIDER_DEFAULTS.get(provider_norm) or AI_PROVIDER_DEFAULTS["openai"]).get("api_base") or "")
+
+
+def get_default_ai_api_key_env_name(provider: str) -> str:
+    provider_norm = str(provider or "openai").strip().lower()
+    return str((AI_PROVIDER_DEFAULTS.get(provider_norm) or AI_PROVIDER_DEFAULTS["openai"]).get("api_key_env_name") or "")
+
+
+def provider_requires_explicit_api_base(provider: str) -> bool:
+    provider_norm = str(provider or "").strip().lower()
+    return provider_norm in API_BASE_REQUIRED_PROVIDERS
+
+
+def resolve_ai_api_base(provider: str, configured_api_base: str = "") -> str:
+    clean = str(configured_api_base or "").strip()
+    return clean or get_default_ai_api_base(provider)
+
+
+def resolve_ai_api_key_env_name(provider: str, configured_env_name: str = "") -> str:
+    clean = str(configured_env_name or "").strip()
+    return clean or get_default_ai_api_key_env_name(provider)
+
+
+def resolve_ai_runtime_config(ai_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = dict(ai_cfg or {})
+    provider = str(cfg.get("provider") or "openai").strip().lower() or "openai"
+    model = str(cfg.get("model") or "").strip() or get_default_ai_model(provider)
+    api_base = resolve_ai_api_base(provider, str(cfg.get("api_base") or ""))
+    api_key_env_name = resolve_ai_api_key_env_name(provider, str(cfg.get("api_key_env_name") or ""))
+    return {
+        **cfg,
+        "provider": provider,
+        "model": model,
+        "api_base": api_base,
+        "api_key_env_name": api_key_env_name,
+    }
+
+
+def _provider_supports_json_schema(provider: str) -> bool:
+    provider_norm = str(provider or "").strip().lower()
+    return provider_norm in OPENAI_JSON_SCHEMA_PROVIDERS
+
+
+def _provider_supports_json_object(provider: str) -> bool:
+    provider_norm = str(provider or "").strip().lower()
+    return provider_norm in OPENAI_JSON_OBJECT_PROVIDERS
+
+
+def _resolve_openai_compatible_endpoint(runtime_cfg: dict[str, Any]) -> str:
+    provider = str(runtime_cfg.get("provider") or "openai").strip().lower()
+    api_base = str(runtime_cfg.get("api_base") or "").strip()
+    if provider_requires_explicit_api_base(provider) and not api_base:
+        raise RuntimeError(f"missing api_base for provider {provider}")
+    return _build_openai_chat_url(api_base or get_default_ai_api_base(provider))
+
+
+def _stub_reason_for_provider(provider: str) -> str:
+    provider_norm = str(provider or "").strip().lower()
+    if provider_norm in MOCK_PROVIDERS:
+        return "mock provider selected, using structured stub fallback"
+    return f"provider {provider_norm or '-'} not implemented, using stub fallback"
 
 
 def _default_ai_reviewer_config() -> dict[str, Any]:
@@ -143,10 +331,14 @@ def get_ai_reviewer_output_schema(mode: str = "suggest_only") -> dict[str, Any]:
 def _response_json_schema(mode: str = "suggest_only") -> dict[str, Any]:
     schema = dict(get_ai_reviewer_output_schema(mode))
     schema.pop("mode_note", None)
+    return _json_schema_response_format("hiremate_ai_reviewer_output", schema)
+
+
+def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "hiremate_ai_reviewer_output",
+            "name": name,
             "strict": True,
             "schema": schema,
         },
@@ -204,6 +396,274 @@ def build_ai_reviewer_prompt(
         "以下是审核输入：\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
+
+
+def _scoring_threshold_keys() -> list[str]:
+    return ["pass_line", "review_line", "min_experience", "min_skill", "min_expression"]
+
+
+def _build_ai_rule_suggester_schema(profile_name: str, current_cfg: dict[str, Any]) -> dict[str, Any]:
+    weights = (current_cfg.get("weights") or {}) if isinstance(current_cfg, dict) else {}
+    hard_thresholds = (current_cfg.get("hard_thresholds") or current_cfg.get("hard_flags") or {}) if isinstance(current_cfg, dict) else {}
+    weight_keys = [str(key) for key in weights.keys()] or [
+        "教育背景匹配度",
+        "相关经历匹配度",
+        "技能匹配度",
+        "表达完整度",
+    ]
+    hard_keys = [str(key) for key in hard_thresholds.keys()]
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["role_template", "weights", "hard_thresholds", "screening_thresholds", "risk_focus", "notes"],
+        "properties": {
+            "role_template": {"type": "string"},
+            "weights": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": weight_keys,
+                "properties": {key: {"type": "number"} for key in weight_keys},
+            },
+            "hard_thresholds": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": hard_keys,
+                "properties": {key: {"type": "boolean"} for key in hard_keys},
+            },
+            "screening_thresholds": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": _scoring_threshold_keys(),
+                "properties": {key: {"type": "integer"} for key in _scoring_threshold_keys()},
+            },
+            "risk_focus": {"type": "array", "items": {"type": "string"}},
+            "notes": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def build_ai_rule_suggester_prompt(profile_name: str, current_cfg: dict[str, Any], jd_text: str) -> str:
+    schema = _build_ai_rule_suggester_schema(profile_name, current_cfg)
+    payload = {
+        "role_template": profile_name,
+        "current_scoring_config": current_cfg,
+        "jd_text": jd_text,
+    }
+    return (
+        "你是招聘评分规则优化助手，但规则评分器仍然是主评分器。\n"
+        "请基于当前岗位 JD 与现有评分配置，给出更适合该岗位的评分细则建议。\n"
+        "只允许输出结构化 JSON，不要输出额外解释。\n"
+        "要求：\n"
+        "1. weights 保持 0-1 之间的数值；\n"
+        "2. screening_thresholds 保持 1-5 的整数；\n"
+        "3. hard_thresholds 只能输出布尔值；\n"
+        "4. notes 用简短中文说明建议依据；\n"
+        "5. 不要发明 JD 中不存在的硬性要求。\n"
+        f"目标 schema：\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
+        f"输入：\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _normalize_ai_rule_suggestion_output(
+    raw_output: dict[str, Any],
+    profile_name: str,
+    current_cfg: dict[str, Any],
+    ai_cfg: dict[str, Any],
+    *,
+    source: str,
+    reason: str,
+    prompt_preview: str,
+    request_id: str = "",
+) -> dict[str, Any]:
+    defaults = current_cfg if isinstance(current_cfg, dict) else {}
+    weights_default = dict(defaults.get("weights") or {})
+    hard_default = dict(defaults.get("hard_thresholds") or defaults.get("hard_flags") or {})
+    threshold_default = dict(defaults.get("screening_thresholds") or defaults.get("thresholds") or {})
+    risk_focus_default = list(defaults.get("risk_focus") or [])
+
+    if not isinstance(raw_output, dict):
+        raise ValueError("AI rule suggester response is not an object")
+
+    role_template = str(raw_output.get("role_template") or profile_name).strip() or profile_name
+
+    weights_raw = raw_output.get("weights")
+    if not isinstance(weights_raw, dict):
+        raise ValueError("weights must be an object")
+    weights = {}
+    for key, default_value in weights_default.items():
+        try:
+            weights[key] = float(weights_raw.get(key, default_value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"weights.{key} must be numeric") from exc
+
+    hard_raw = raw_output.get("hard_thresholds")
+    if not isinstance(hard_raw, dict):
+        raise ValueError("hard_thresholds must be an object")
+    hard_thresholds = {key: bool(hard_raw.get(key, default_value)) for key, default_value in hard_default.items()}
+
+    thresholds_raw = raw_output.get("screening_thresholds")
+    if not isinstance(thresholds_raw, dict):
+        raise ValueError("screening_thresholds must be an object")
+    screening_thresholds = {}
+    for key in _scoring_threshold_keys():
+        try:
+            screening_thresholds[key] = int(thresholds_raw.get(key, threshold_default.get(key, 0)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"screening_thresholds.{key} must be an integer") from exc
+
+    risk_focus_raw = raw_output.get("risk_focus")
+    if not isinstance(risk_focus_raw, list):
+        raise ValueError("risk_focus must be a list")
+    risk_focus = [str(item).strip() for item in risk_focus_raw if str(item).strip()] or risk_focus_default
+
+    notes_raw = raw_output.get("notes")
+    if not isinstance(notes_raw, list):
+        raise ValueError("notes must be a list")
+    notes = [str(item).strip() for item in notes_raw if str(item).strip()]
+
+    return {
+        "role_template": role_template,
+        "weights": weights,
+        "hard_thresholds": hard_thresholds,
+        "screening_thresholds": screening_thresholds,
+        "risk_focus": risk_focus,
+        "notes": notes,
+        "meta": {
+            "source": source,
+            "reason": reason,
+            "provider": ai_cfg.get("provider"),
+            "model": ai_cfg.get("model"),
+            "api_base": ai_cfg.get("api_base"),
+            "api_key_env_name": ai_cfg.get("api_key_env_name"),
+            "prompt_version": AI_RULE_SUGGESTER_PROMPT_VERSION,
+            "prompt_preview": prompt_preview,
+            "request_id": request_id,
+        },
+    }
+
+
+def _build_stub_ai_rule_suggestion(
+    profile_name: str,
+    current_cfg: dict[str, Any],
+    jd_text: str,
+    ai_cfg: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    keywords = [key for key in ["SQL", "Python", "A/B", "访谈", "RAG", "Prompt"] if key.lower() in (jd_text or "").lower()]
+    return {
+        "role_template": profile_name,
+        "weights": dict(current_cfg.get("weights") or {}),
+        "hard_thresholds": dict(current_cfg.get("hard_thresholds") or current_cfg.get("hard_flags") or {}),
+        "screening_thresholds": dict(current_cfg.get("screening_thresholds") or current_cfg.get("thresholds") or {}),
+        "risk_focus": list(current_cfg.get("risk_focus") or []),
+        "notes": [
+            "当前返回为 stub fallback，默认保留现有评分细则结构。",
+            "真实 API 可用后，可基于岗位 JD 生成更具体的权重和门槛建议。",
+            f"JD 关键词命中：{keywords if keywords else '无明显额外信号'}",
+        ],
+        "meta": {
+            "source": "stub",
+            "reason": reason,
+            "provider": ai_cfg.get("provider"),
+            "model": ai_cfg.get("model"),
+            "api_base": ai_cfg.get("api_base"),
+            "api_key_env_name": ai_cfg.get("api_key_env_name"),
+            "prompt_version": AI_RULE_SUGGESTER_PROMPT_VERSION,
+        },
+    }
+
+
+def run_ai_rule_suggester(profile_name: str, current_cfg: dict[str, Any], jd_text: str, ai_cfg: dict[str, Any]) -> dict[str, Any]:
+    runtime_cfg = resolve_ai_runtime_config(ai_cfg)
+    if not runtime_cfg.get("enable_ai_rule_suggester"):
+        output = _attach_runtime_meta(
+            _build_stub_ai_rule_suggestion(
+                profile_name,
+                current_cfg,
+                jd_text,
+                runtime_cfg,
+                reason="AI rule suggester not enabled",
+            ),
+            0,
+            prompt_version=AI_RULE_SUGGESTER_PROMPT_VERSION,
+        )
+        _record_latest_ai_call_status(
+            purpose="ai_rule_suggester",
+            runtime_cfg=runtime_cfg,
+            source="stub",
+            success=False,
+            reason="AI rule suggester not enabled",
+        )
+        return output
+
+    prompt_preview = build_ai_rule_suggester_prompt(profile_name, current_cfg, jd_text)
+    provider = str(runtime_cfg.get("provider") or "openai").strip().lower()
+    started_at = perf_counter()
+
+    if provider in MOCK_PROVIDERS:
+        fallback_reason = _stub_reason_for_provider(provider)
+    elif provider in OPENAI_COMPATIBLE_PROVIDERS:
+        try:
+            raw_output, request_id = _call_openai_compatible_json_api(
+                runtime_cfg,
+                system_prompt=(
+                    "You optimize structured hiring scoring rules. "
+                    "Return only JSON that matches the requested schema."
+                ),
+                user_prompt=prompt_preview,
+                schema_name="hiremate_ai_rule_suggester_output",
+                json_schema=_build_ai_rule_suggester_schema(profile_name, current_cfg),
+                prefer_structured_output=_provider_supports_json_schema(provider),
+            )
+            output = _attach_runtime_meta(
+                _normalize_ai_rule_suggestion_output(
+                    raw_output,
+                    profile_name,
+                    current_cfg,
+                    runtime_cfg,
+                    source="api",
+                    reason=f"{provider} chat completions json output",
+                    prompt_preview=prompt_preview,
+                    request_id=request_id,
+                ),
+                int(round((perf_counter() - started_at) * 1000)),
+                prompt_version=AI_RULE_SUGGESTER_PROMPT_VERSION,
+            )
+            _record_latest_ai_call_status(
+                purpose="ai_rule_suggester",
+                runtime_cfg=runtime_cfg,
+                source="api",
+                success=True,
+                reason=f"{provider} chat completions json output",
+                request_id=request_id,
+            )
+            return output
+        except Exception as exc:  # noqa: BLE001
+            fallback_reason = f"api fallback: {exc}"
+    else:
+        fallback_reason = _stub_reason_for_provider(provider)
+
+    output = _attach_runtime_meta(
+        _build_stub_ai_rule_suggestion(
+            profile_name,
+            current_cfg,
+            jd_text,
+            runtime_cfg,
+            reason=fallback_reason,
+        ),
+        int(round((perf_counter() - started_at) * 1000)),
+        prompt_version=AI_RULE_SUGGESTER_PROMPT_VERSION,
+    )
+    _record_latest_ai_call_status(
+        purpose="ai_rule_suggester",
+        runtime_cfg=runtime_cfg,
+        source="stub",
+        success=False,
+        reason=fallback_reason,
+    )
+    return output
 
 
 def _empty_ai_review_output(reason: str = "AI reviewer disabled") -> dict[str, Any]:
@@ -269,12 +729,110 @@ def _build_openai_chat_url(api_base: str) -> str:
     return base.rstrip("/") + "/chat/completions"
 
 
-def _attach_runtime_meta(result: dict[str, Any], latency_ms: int) -> dict[str, Any]:
+def _parse_json_object_content(payload: str) -> dict[str, Any]:
+    text = _strip_json_wrappers(payload)
+    if not text:
+        raise RuntimeError("empty model content")
+
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidate = text[start : end + 1].strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if not isinstance(parsed, dict):
+            raise RuntimeError("model content is not a json object")
+        return parsed
+
+    raise RuntimeError("model content is not valid json") from last_error
+
+
+def _call_openai_compatible_json_api(
+    ai_cfg: dict[str, Any],
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    schema_name: str,
+    json_schema: dict[str, Any] | None = None,
+    prefer_structured_output: bool = False,
+) -> tuple[dict[str, Any], str]:
+    runtime_cfg = resolve_ai_runtime_config(ai_cfg)
+    provider = str(runtime_cfg.get("provider") or "openai")
+    if provider not in OPENAI_COMPATIBLE_PROVIDERS:
+        raise RuntimeError(f"provider {provider} not implemented")
+
+    endpoint = _resolve_openai_compatible_endpoint(runtime_cfg)
+    api_key_env_name = str(runtime_cfg.get("api_key_env_name") or "").strip()
+    api_key = os.getenv(api_key_env_name, "").strip()
+    if not api_key:
+        raise RuntimeError(f"missing api key env: {api_key_env_name}")
+
+    body: dict[str, Any] = {
+        "model": runtime_cfg.get("model") or get_default_ai_model(provider),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+    }
+    if json_schema and prefer_structured_output and _provider_supports_json_schema(provider):
+        body["response_format"] = _json_schema_response_format(schema_name, json_schema)
+    elif json_schema and _provider_supports_json_object(provider):
+        body["response_format"] = {"type": "json_object"}
+
+    request_payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urlrequest.Request(
+        endpoint,
+        data=request_payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlrequest.urlopen(req, timeout=25) as response:
+            raw_response = response.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        payload = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"http {exc.code}: {payload[:240]}") from exc
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"network error: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("timeout") from exc
+
+    try:
+        parsed_response = json.loads(raw_response)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("api response is not valid json") from exc
+
+    choice = ((parsed_response.get("choices") or [{}])[0]) or {}
+    message = choice.get("message") or {}
+    refusal = message.get("refusal")
+    if refusal:
+        raise RuntimeError(f"model refused: {refusal}")
+
+    content = _extract_message_text(message.get("content"))
+    output = _parse_json_object_content(content)
+    return output, str(parsed_response.get("id") or "")
+
+
+def _attach_runtime_meta(result: dict[str, Any], latency_ms: int, *, prompt_version: str = AI_REVIEWER_PROMPT_VERSION) -> dict[str, Any]:
     meta = result.get("meta")
     if not isinstance(meta, dict):
         meta = {}
         result["meta"] = meta
-    meta["prompt_version"] = AI_REVIEWER_PROMPT_VERSION
+    meta["prompt_version"] = prompt_version
     meta["generated_latency_ms"] = max(0, int(latency_ms or 0))
     return result
 
@@ -387,6 +945,8 @@ def _normalize_success_output(
             "reason": reason,
             "provider": ai_cfg.get("provider"),
             "model": ai_cfg.get("model"),
+            "api_base": ai_cfg.get("api_base"),
+            "api_key_env_name": ai_cfg.get("api_key_env_name"),
             "role_template": role_profile.get("profile_name", "通用岗位模板"),
             "allow_break_hard_thresholds": bool(limit_cfg.get("allow_break_hard_thresholds", False)),
             "allow_direct_recommendation_change": bool(
@@ -403,79 +963,26 @@ def _call_openai_reviewer_api(
     ai_cfg: dict[str, Any],
     prompt_preview: str,
 ) -> tuple[dict[str, Any], str]:
-    api_key_env_name = str(ai_cfg.get("api_key_env_name") or "OPENAI_API_KEY").strip() or "OPENAI_API_KEY"
-    api_key = os.getenv(api_key_env_name, "").strip()
-    if not api_key:
-        raise RuntimeError(f"missing api key env: {api_key_env_name}")
-
-    endpoint = _build_openai_chat_url(str(ai_cfg.get("api_base") or ""))
-    body = {
-        "model": ai_cfg.get("model") or "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an AI reviewer in a hiring workflow. "
-                    "Rules remain primary. "
-                    "Return only strict JSON that matches the provided schema."
-                ),
-            },
-            {"role": "user", "content": prompt_preview},
-        ],
-        "temperature": 0,
-        "response_format": _response_json_schema(str(ai_cfg.get("ai_reviewer_mode") or "suggest_only")),
-    }
-
-    request_payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urlrequest.Request(
-        endpoint,
-        data=request_payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
+    schema = dict(get_ai_reviewer_output_schema(str(ai_cfg.get("ai_reviewer_mode") or "suggest_only")))
+    schema.pop("mode_note", None)
+    return _call_openai_compatible_json_api(
+        ai_cfg,
+        system_prompt=(
+            "You are an AI reviewer in a hiring workflow. "
+            "Rules remain primary. "
+            "Return only JSON that matches the provided schema."
+        ),
+        user_prompt=prompt_preview,
+        schema_name="hiremate_ai_reviewer_output",
+        json_schema=schema,
+        prefer_structured_output=True,
     )
-
-    try:
-        with urlrequest.urlopen(req, timeout=25) as response:
-            raw_response = response.read().decode("utf-8")
-    except urlerror.HTTPError as exc:
-        payload = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"http {exc.code}: {payload[:240]}") from exc
-    except urlerror.URLError as exc:
-        raise RuntimeError(f"network error: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise RuntimeError("timeout") from exc
-
-    try:
-        parsed_response = json.loads(raw_response)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("api response is not valid json") from exc
-
-    choice = ((parsed_response.get("choices") or [{}])[0]) or {}
-    message = choice.get("message") or {}
-    refusal = message.get("refusal")
-    if refusal:
-        raise RuntimeError(f"model refused: {refusal}")
-
-    content = _extract_message_text(message.get("content"))
-    content = _strip_json_wrappers(content)
-    if not content:
-        raise RuntimeError("empty model content")
-
-    try:
-        output = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("model content is not valid json") from exc
-
-    return output, str(parsed_response.get("id") or "")
 
 
 def _build_stub_ai_review_output(
     parsed_resume: dict[str, Any],
     role_profile: dict[str, Any],
-    scoring_config: dict[str, Any] | None,
+    ai_cfg: dict[str, Any],
     screening_result: dict[str, Any],
     score_details: dict[str, Any],
     risk_result: dict[str, Any],
@@ -483,7 +990,6 @@ def _build_stub_ai_review_output(
     prompt_preview: str,
     reason: str,
 ) -> dict[str, Any]:
-    ai_cfg = _normalize_ai_reviewer_config(scoring_config)
     caps = ai_cfg.get("capabilities") or {}
     limit_cfg = ai_cfg.get("score_adjustment_limit") or {}
 
@@ -559,6 +1065,8 @@ def _build_stub_ai_review_output(
             "reason": reason,
             "provider": ai_cfg.get("provider"),
             "model": ai_cfg.get("model"),
+            "api_base": ai_cfg.get("api_base"),
+            "api_key_env_name": ai_cfg.get("api_key_env_name"),
             "role_template": role_profile.get("profile_name", "通用岗位模板"),
             "allow_break_hard_thresholds": bool(limit_cfg.get("allow_break_hard_thresholds", False)),
             "allow_direct_recommendation_change": bool(
@@ -568,6 +1076,73 @@ def _build_stub_ai_review_output(
             "schema": get_ai_reviewer_output_schema(ai_cfg.get("ai_reviewer_mode", "suggest_only")),
         },
     }
+
+
+def test_ai_connection(ai_cfg: dict[str, Any], *, purpose: str = "generic") -> dict[str, Any]:
+    runtime_cfg = resolve_ai_runtime_config(ai_cfg)
+    provider = str(runtime_cfg.get("provider") or "openai")
+    api_key_env_name = str(runtime_cfg.get("api_key_env_name") or "")
+    api_key_present = bool(os.getenv(api_key_env_name, "").strip()) if api_key_env_name else False
+    result = {
+        "provider": provider,
+        "model": str(runtime_cfg.get("model") or ""),
+        "api_base": str(runtime_cfg.get("api_base") or ""),
+        "api_key_env_name": api_key_env_name or "-",
+        "api_key_present": api_key_present,
+        "success": False,
+        "reason": "",
+        "request_id": "",
+        "purpose": purpose,
+        "latency_ms": 0,
+    }
+
+    if provider in MOCK_PROVIDERS:
+        result["success"] = True
+        result["reason"] = "mock provider, skipped real network call"
+        return result
+
+    if provider not in OPENAI_COMPATIBLE_PROVIDERS:
+        result["reason"] = f"provider {provider} not implemented"
+        return result
+
+    if provider_requires_explicit_api_base(provider) and not str(runtime_cfg.get("api_base") or "").strip():
+        result["reason"] = f"missing api_base for provider {provider}"
+        return result
+
+    if not api_key_present:
+        result["reason"] = f"missing api key env: {api_key_env_name}"
+        return result
+
+    started_at = perf_counter()
+    try:
+        output, request_id = _call_openai_compatible_json_api(
+            runtime_cfg,
+            system_prompt="Return only JSON.",
+            user_prompt=(
+                "Return a JSON object with exactly these fields: "
+                '{"status":"ok","message":"connection ok","provider_echo":"<provider>"}'
+            ),
+            schema_name="hiremate_ai_connection_test",
+            json_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["status", "message", "provider_echo"],
+                "properties": {
+                    "status": {"type": "string"},
+                    "message": {"type": "string"},
+                    "provider_echo": {"type": "string"},
+                },
+            },
+            prefer_structured_output=_provider_supports_json_schema(provider),
+        )
+        result["success"] = True
+        result["reason"] = str(output.get("message") or "connection ok")
+        result["request_id"] = request_id
+    except Exception as exc:  # noqa: BLE001
+        result["reason"] = str(exc)
+
+    result["latency_ms"] = int(round((perf_counter() - started_at) * 1000))
+    return result
 
 
 def run_ai_reviewer(
@@ -581,9 +1156,17 @@ def run_ai_reviewer(
     evidence_snippets: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
     """Generate structured AI reviewer suggestions."""
-    ai_cfg = _normalize_ai_reviewer_config(scoring_config)
+    ai_cfg = resolve_ai_runtime_config(_normalize_ai_reviewer_config(scoring_config))
     if not ai_cfg.get("enable_ai_reviewer") or ai_cfg.get("ai_reviewer_mode") == "off":
-        return _attach_runtime_meta(_empty_ai_review_output("AI reviewer not enabled"), 0)
+        output = _attach_runtime_meta(_empty_ai_review_output("AI reviewer not enabled"), 0)
+        _record_latest_ai_call_status(
+            purpose="ai_reviewer",
+            runtime_cfg=ai_cfg,
+            source="stub",
+            success=False,
+            reason="AI reviewer not enabled",
+        )
+        return output
 
     prompt_preview = build_ai_reviewer_prompt(
         parsed_jd=parsed_jd,
@@ -598,31 +1181,42 @@ def run_ai_reviewer(
 
     provider = str(ai_cfg.get("provider") or "openai").strip().lower()
     started_at = perf_counter()
-    if provider == "openai":
+    if provider in MOCK_PROVIDERS:
+        fallback_reason = _stub_reason_for_provider(provider)
+    elif provider in OPENAI_COMPATIBLE_PROVIDERS:
         try:
             raw_output, request_id = _call_openai_reviewer_api(ai_cfg, prompt_preview)
-            return _attach_runtime_meta(
+            output = _attach_runtime_meta(
                 _normalize_success_output(
                     raw_output=raw_output,
                     ai_cfg=ai_cfg,
                     role_profile=role_profile,
                     prompt_preview=prompt_preview,
                     source="api",
-                    reason="openai chat completions structured output",
+                    reason=f"{provider} chat completions json output",
                     request_id=request_id,
                 ),
                 int(round((perf_counter() - started_at) * 1000)),
             )
+            _record_latest_ai_call_status(
+                purpose="ai_reviewer",
+                runtime_cfg=ai_cfg,
+                source="api",
+                success=True,
+                reason=f"{provider} chat completions json output",
+                request_id=request_id,
+            )
+            return output
         except Exception as exc:  # noqa: BLE001
             fallback_reason = f"api fallback: {exc}"
     else:
-        fallback_reason = f"provider {provider} not implemented, using stub fallback"
+        fallback_reason = _stub_reason_for_provider(provider)
 
-    return _attach_runtime_meta(
+    output = _attach_runtime_meta(
         _build_stub_ai_review_output(
             parsed_resume=parsed_resume,
             role_profile=role_profile,
-            scoring_config=scoring_config,
+            ai_cfg=ai_cfg,
             screening_result=screening_result,
             score_details=score_details,
             risk_result=risk_result,
@@ -632,3 +1226,11 @@ def run_ai_reviewer(
         ),
         int(round((perf_counter() - started_at) * 1000)),
     )
+    _record_latest_ai_call_status(
+        purpose="ai_reviewer",
+        runtime_cfg=ai_cfg,
+        source="stub",
+        success=False,
+        reason=fallback_reason,
+    )
+    return output

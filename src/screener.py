@@ -15,19 +15,9 @@ from src.ai_reviewer import run_ai_reviewer
 from src.interviewer import build_interview_plan
 from src.jd_parser import parse_jd
 from src.resume_parser import parse_resume
-from src.role_profiles import detect_role_profile, get_profile_by_name
+from src.role_profiles import DEFAULT_SCREENING_THRESHOLDS, detect_role_profile, get_profile_by_name
 from src.risk_analyzer import analyze_risk
 from src.scorer import score_candidate, to_score_values
-
-
-# 与 scoring_rules.md 对齐的权重（百分比）
-WEIGHTS = {
-    "教育背景匹配度": 0.15,
-    "相关经历匹配度": 0.30,
-    "技能匹配度": 0.25,
-    "表达完整度": 0.15,
-    "综合推荐度": 0.15,
-}
 
 
 def _ensure_score_values(scores_input: dict[str, Any]) -> dict[str, int]:
@@ -45,15 +35,6 @@ def _ensure_score_values(scores_input: dict[str, Any]) -> dict[str, int]:
 
     # 纯分数字典
     return {k: int(v) for k, v in scores_input.items()}
-
-
-def _calc_weighted_total(score_values: dict[str, int]) -> float:
-    """按 scoring_rules.md 计算百分制总分。"""
-    total = 0.0
-    for dim, w in WEIGHTS.items():
-        s = score_values.get(dim, 1)
-        total += (s / 5) * w * 100
-    return round(total, 2)
 
 
 def _infer_risk_level_from_risks(risks: list[str]) -> str | None:
@@ -76,6 +57,7 @@ def build_screening_decision(
     scores_input: dict[str, Any],
     risk_level: str | None = None,
     risks: list[str] | None = None,
+    scoring_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """根据评分与风险修正规则输出最终初筛结论。
 
@@ -83,6 +65,7 @@ def build_screening_decision(
     - scores_input: 详细评分结果（score_candidate）或纯分数字典（to_score_values）
     - risk_level: 可选，high/medium/low
     - risks: 可选，风险文本列表（用于无 risk_level 时的占位推断）
+    - scoring_config: 可选，岗位评分配置；筛选结论与评分展示共用同一份门槛配置
 
     输出：
     - screening_result: 推荐进入下一轮 / 建议人工复核 / 暂不推荐
@@ -91,25 +74,39 @@ def build_screening_decision(
     """
     score_values = _ensure_score_values(scores_input)
 
+    overall_score = score_values.get("综合推荐度", 1)
     exp_score = score_values.get("相关经历匹配度", 1)
     skill_score = score_values.get("技能匹配度", 1)
     expression_score = score_values.get("表达完整度", 1)
-    total_score = _calc_weighted_total(score_values)
+    cfg = scoring_config if isinstance(scoring_config, dict) else {}
+    thresholds = cfg.get("screening_thresholds") if isinstance(cfg.get("screening_thresholds"), dict) else cfg.get("thresholds")
+    thresholds = {**DEFAULT_SCREENING_THRESHOLDS, **(thresholds or {})}
+
+    pass_line = int(thresholds.get("pass_line", DEFAULT_SCREENING_THRESHOLDS["pass_line"]) or DEFAULT_SCREENING_THRESHOLDS["pass_line"])
+    review_line = int(thresholds.get("review_line", DEFAULT_SCREENING_THRESHOLDS["review_line"]) or DEFAULT_SCREENING_THRESHOLDS["review_line"])
+    min_exp = int(thresholds.get("min_experience", DEFAULT_SCREENING_THRESHOLDS["min_experience"]) or DEFAULT_SCREENING_THRESHOLDS["min_experience"])
+    min_skill = int(thresholds.get("min_skill", DEFAULT_SCREENING_THRESHOLDS["min_skill"]) or DEFAULT_SCREENING_THRESHOLDS["min_skill"])
+    min_expression = int(thresholds.get("min_expression", DEFAULT_SCREENING_THRESHOLDS["min_expression"]) or DEFAULT_SCREENING_THRESHOLDS["min_expression"])
 
     gating_signals = {
-        "total_score": total_score,
+        "overall_score": overall_score,
         "experience_score": exp_score,
         "skills_score": skill_score,
         "expression_score": expression_score,
-        "hard_gate_experience": exp_score >= 3,
-        "hard_gate_skills": skill_score >= 3,
-        "hard_gate_expression": expression_score >= 2,
+        "pass_line": pass_line,
+        "review_line": review_line,
+        "min_experience": min_exp,
+        "min_skill": min_skill,
+        "min_expression": min_expression,
+        "hard_gate_experience": exp_score >= min_exp,
+        "hard_gate_skills": skill_score >= min_skill,
+        "hard_gate_expression": expression_score >= min_expression,
     }
 
-    # 1) 基于 scoring_rules.md 的基础结论
-    if total_score >= 75 and exp_score >= 3 and skill_score >= 3:
+    # 1) 基于岗位配置的基础结论
+    if overall_score >= pass_line and exp_score >= min_exp and skill_score >= min_skill and expression_score >= min_expression:
         base_result = "推荐进入下一轮"
-    elif total_score < 60 or exp_score <= 2 or skill_score <= 2 or expression_score == 1:
+    elif overall_score < review_line or exp_score < min_exp or skill_score < min_skill or expression_score < min_expression:
         base_result = "暂不推荐"
     else:
         base_result = "建议人工复核"
@@ -132,8 +129,8 @@ def build_screening_decision(
 
     # 3) 结论理由（2-4条）
     reasons: list[str] = [
-        f"加权总分为 {total_score}（规则阈值：>=75 推荐，60-74 复核，<60 暂不推荐）。",
-        f"关键门槛：相关经历={exp_score}、技能={skill_score}、表达完整度={expression_score}。",
+        f"综合推荐度为 {overall_score}/5（岗位阈值：>= {pass_line} 推荐，< {review_line} 暂不推荐，其余建议复核）。",
+        f"关键门槛：相关经历={exp_score}/{min_exp}、技能={skill_score}/{min_skill}、表达完整度={expression_score}/{min_expression}。",
     ]
 
     if normalized_risk:
@@ -185,6 +182,7 @@ def run_screening(jd_text: str, resume_text: str, risk_level: str | None = None)
         scores_input=score_details,
         risk_level=(risk_level or risk_result.get("risk_level")),
         risks=risk_result.get("risk_points", []),
+        scoring_config=parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {},
     )
 
     interview_plan = build_interview_plan(

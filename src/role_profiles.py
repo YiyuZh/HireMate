@@ -5,12 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 
+WEIGHT_TOTAL_TOLERANCE = 1e-6
+
+
 DEFAULT_WEIGHTS: dict[str, float] = {
     "教育背景匹配度": 0.25,
     "相关经历匹配度": 0.25,
     "技能匹配度": 0.25,
     "表达完整度": 0.25,
 }
+BASE_WEIGHT_KEYS: tuple[str, ...] = tuple(DEFAULT_WEIGHTS.keys())
 
 DEFAULT_SCREENING_THRESHOLDS: dict[str, int] = {
     "pass_line": 4,
@@ -19,6 +23,56 @@ DEFAULT_SCREENING_THRESHOLDS: dict[str, int] = {
     "min_skill": 2,
     "min_expression": 2,
 }
+
+
+def filter_base_weights(
+    weights: dict[str, Any] | None,
+    *,
+    fallback: dict[str, float] | None = None,
+) -> dict[str, float]:
+    source = weights if isinstance(weights, dict) else {}
+    fallback_weights = fallback if isinstance(fallback, dict) and fallback else DEFAULT_WEIGHTS
+    filtered: dict[str, float] = {}
+    for dim in BASE_WEIGHT_KEYS:
+        raw_value = source.get(dim, fallback_weights.get(dim, DEFAULT_WEIGHTS.get(dim, 0.0)))
+        try:
+            filtered[dim] = max(0.0, float(raw_value or 0.0))
+        except (TypeError, ValueError):
+            filtered[dim] = max(0.0, float(fallback_weights.get(dim, DEFAULT_WEIGHTS.get(dim, 0.0)) or 0.0))
+    return filtered
+
+
+def weight_total(weights: dict[str, Any] | None) -> float:
+    filtered = filter_base_weights(weights)
+    return float(sum(filtered.values()))
+
+
+def is_weight_total_valid(weights: dict[str, Any] | None, *, tolerance: float = WEIGHT_TOTAL_TOLERANCE) -> bool:
+    return abs(weight_total(weights) - 1.0) <= float(tolerance)
+
+
+def normalize_weights(
+    weights: dict[str, Any] | None,
+    *,
+    fallback: dict[str, float] | None = None,
+) -> dict[str, float]:
+    fallback_weights = filter_base_weights(fallback or DEFAULT_WEIGHTS, fallback=DEFAULT_WEIGHTS)
+    filtered = filter_base_weights(weights, fallback=fallback_weights)
+    total = sum(filtered.values())
+    if total <= WEIGHT_TOTAL_TOLERANCE:
+        return dict(fallback_weights)
+
+    scaled = {dim: (filtered[dim] / total) * 100.0 for dim in BASE_WEIGHT_KEYS}
+    floored = {dim: int(scaled[dim]) for dim in BASE_WEIGHT_KEYS}
+    remainder = max(0, 100 - sum(floored.values()))
+    ranked_dims = sorted(
+        BASE_WEIGHT_KEYS,
+        key=lambda dim: (scaled[dim] - floored[dim], scaled[dim]),
+        reverse=True,
+    )
+    for dim in ranked_dims[:remainder]:
+        floored[dim] += 1
+    return {dim: floored[dim] / 100.0 for dim in BASE_WEIGHT_KEYS}
 
 
 AI_PM_PROFILE: dict[str, Any] = {
@@ -158,7 +212,10 @@ def merge_scoring_config(profile: dict[str, Any], scoring_config: dict[str, Any]
     cfg = scoring_config or {}
     profile_defaults = build_default_scoring_config(profile.get("profile_name", "通用岗位模板"))
 
-    custom_weights = cfg.get("weights") if isinstance(cfg.get("weights"), dict) else {}
+    custom_weights = filter_base_weights(
+        cfg.get("weights") if isinstance(cfg.get("weights"), dict) else {},
+        fallback=profile_defaults["weights"],
+    ) if isinstance(cfg.get("weights"), dict) else {}
     custom_thresholds = cfg.get("screening_thresholds") if isinstance(cfg.get("screening_thresholds"), dict) else {}
     if not custom_thresholds and isinstance(cfg.get("thresholds"), dict):
         custom_thresholds = cfg.get("thresholds")
@@ -168,7 +225,7 @@ def merge_scoring_config(profile: dict[str, Any], scoring_config: dict[str, Any]
 
     merged = {
         "role_template": cfg.get("role_template") or cfg.get("profile_name") or profile_defaults.get("role_template"),
-        "weights": {**profile_defaults["weights"], **custom_weights},
+        "weights": filter_base_weights({**profile_defaults["weights"], **custom_weights}, fallback=profile_defaults["weights"]),
         "screening_thresholds": {**profile_defaults["screening_thresholds"], **custom_thresholds},
         "hard_thresholds": {**profile_defaults.get("hard_thresholds", {}), **custom_hard},
         "risk_focus": cfg.get("risk_focus") if isinstance(cfg.get("risk_focus"), list) else profile_defaults.get("risk_focus", []),

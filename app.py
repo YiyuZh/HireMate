@@ -13,8 +13,16 @@ from uuid import uuid4
 
 import streamlit as st
 
-from src.auth import authenticate_user, get_current_user, login_user, logout_user, mark_login_success
-from src.db import init_db
+from src.auth import (
+    authenticate_user,
+    create_user_account,
+    get_current_user,
+    login_user,
+    logout_user,
+    mark_login_success,
+    reset_user_password,
+)
+from src.db import get_connection, init_db
 from src.interviewer import build_interview_plan
 from src.legacy_json_compat import migrate_legacy_json_if_needed
 from src.utils import load_env
@@ -38,17 +46,43 @@ from src.candidate_store import (
     upsert_candidate_manual_review,
 )
 from src.jd_parser import parse_jd
+from src.jd_loader import load_jd_file
 from src.jd_store import delete_jd, list_jd_records, list_jds, load_jd, save_jd, update_jd, upsert_jd_openings
 from src.jd_store import load_jd_scoring_config, upsert_jd_scoring_config
-from src.role_profiles import build_default_scoring_config, detect_role_profile, get_profile_by_name, get_profile_options
+from src.role_profiles import (
+    BASE_WEIGHT_KEYS,
+    build_default_scoring_config,
+    detect_role_profile,
+    get_profile_by_name,
+    get_profile_options,
+    is_weight_total_valid,
+    merge_scoring_config,
+    normalize_weights,
+    weight_total,
+)
 from src.resume_loader import check_ocr_capabilities, load_resume_file
 from src.resume_parser import parse_resume
 from src.review_store import append_review, list_reviews, upsert_manual_review
 from src.risk_analyzer import analyze_risk
-from src.ai_reviewer import get_ai_reviewer_prompt_version, run_ai_reviewer
+from src.ai_reviewer import (
+    get_latest_ai_call_status,
+    get_ai_model_presets,
+    get_ai_provider_options,
+    get_ai_reviewer_prompt_version,
+    get_default_ai_api_base,
+    get_default_ai_api_key_env_name,
+    get_default_ai_model,
+    provider_requires_explicit_api_base,
+    resolve_ai_api_base,
+    resolve_ai_api_key_env_name,
+    resolve_ai_runtime_config,
+    run_ai_reviewer,
+    run_ai_rule_suggester,
+    test_ai_connection,
+)
 from src.scorer import score_candidate, to_score_values
 from src.screener import build_screening_decision
-from src.user_store import count_users, get_user_by_id
+from src.user_store import count_users, get_user_by_id, list_users, set_user_active, set_user_admin
 from src.v2_workspace import (
     build_candidate_row,
     filter_by_risk,
@@ -278,6 +312,57 @@ def _resolve_parse_status(quality: str, message: str) -> str:
     return "弱质量识别"
 
 
+def _extract_parse_status(extract_result: dict) -> str:
+    return str(
+        extract_result.get("parse_status")
+        or _resolve_parse_status(
+            str(extract_result.get("quality") or "weak"),
+            str(extract_result.get("message") or ""),
+        )
+    )
+
+
+def _can_enter_batch_screening(extract_result: dict) -> bool:
+    if bool(extract_result.get("should_skip")):
+        return False
+    return bool(extract_result.get("can_evaluate", True))
+
+
+def _batch_screening_entry_label(extract_result: dict) -> str:
+    if not _can_enter_batch_screening(extract_result):
+        return "否（建议跳过或人工处理）"
+    if str(extract_result.get("quality") or "weak").lower() == "weak":
+        return "是（建议人工复核）"
+    return "是"
+
+
+def _render_batch_ocr_health_panel(ocr_caps: dict) -> None:
+    image_ok = bool(ocr_caps.get("image_ocr_available"))
+    pdf_ok = bool(ocr_caps.get("pdf_ocr_available"))
+    missing_deps = ", ".join(ocr_caps.get("missing_deps") or []) or "-"
+    missing_runtime = ", ".join(ocr_caps.get("missing_runtime") or []) or "-"
+
+    st.markdown("**OCR 健康检查**")
+    cols = st.columns(4)
+    cols[0].metric("图片 OCR", "可用" if image_ok else "不可用")
+    cols[1].metric("PDF OCR fallback", "可用" if pdf_ok else "不可用")
+    cols[2].metric("缺失 Python 依赖", missing_deps)
+    cols[3].metric("缺失 runtime", missing_runtime)
+    if not image_ok or not pdf_ok:
+        st.warning("当前 OCR 能力不完整：txt/docx 可继续，可提文本的 PDF 也可继续；扫描版 PDF/图片可能不可稳定识别。")
+
+
+def _build_batch_preview_row(file_obj, extract_result: dict) -> dict:
+    return {
+        "文件名": getattr(file_obj, "name", ""),
+        "提取方式": _extract_method_label(str(extract_result.get("method") or "text")),
+        "提取质量": _extract_quality_label(str(extract_result.get("quality") or "weak")),
+        "提取说明": str(extract_result.get("message") or ""),
+        "解析状态": _extract_parse_status(extract_result),
+        "是否可进入批量初筛": _batch_screening_entry_label(extract_result),
+    }
+
+
 def _business_reason(dim: str, detail: dict) -> str:
     """将评分理由转成短句业务表达。"""
     score = detail.get("score")
@@ -505,8 +590,14 @@ def _recalculate_overall_score(detail: dict) -> None:
     if not isinstance(score_details, dict):
         return
 
-    base_dims = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度"]
-    weights = (((detail.get("parsed_jd") or {}).get("scoring_config") or {}).get("weights") or {})
+    parsed_jd = detail.get("parsed_jd") if isinstance(detail.get("parsed_jd"), dict) else {}
+    raw_cfg = parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {}
+    template_name = raw_cfg.get("role_template") or raw_cfg.get("profile_name")
+    base_profile = get_profile_by_name(template_name) if template_name else detect_role_profile(parsed_jd)
+    resolved_cfg, _ = merge_scoring_config(base_profile, raw_cfg)
+
+    base_dims = list(BASE_WEIGHT_KEYS)
+    weights = resolved_cfg.get("weights") if isinstance(resolved_cfg.get("weights"), dict) else {}
 
     weighted_sum = 0.0
     weight_total = 0.0
@@ -1237,6 +1328,7 @@ def _refresh_candidate_after_ai_application(detail: dict, selected_row: dict, ai
             scores_input=detail.get("score_details") or {},
             risk_level=risk_level,
             risks=risk_result.get("risk_points", []),
+            scoring_config=((detail.get("parsed_jd") or {}).get("scoring_config") or {}),
         )
         selected_row["初筛结论"] = current_screening.get("screening_result", "")
         selected_row["候选池"] = _candidate_pool_label(selected_row.get("初筛结论", ""))
@@ -2814,6 +2906,758 @@ def _current_user_is_admin() -> bool:
     return bool(session_user and session_user.get("is_admin"))
 
 
+def _format_user_datetime(value: str) -> str:
+    return str(value or "").strip() or "-"
+
+
+def _format_user_option(user: dict) -> str:
+    email = str(user.get("email") or "").strip() or "-"
+    name = str(user.get("name") or "").strip()
+    return f"{email} ({name})" if name else email
+
+
+def _count_active_admins(users: list[dict]) -> int:
+    return sum(1 for user in users if bool(user.get("is_admin")) and bool(user.get("is_active")))
+
+
+def _is_last_active_admin(users: list[dict], user_id: str) -> bool:
+    lookup = str(user_id or "").strip()
+    target = next((user for user in users if str(user.get("user_id") or "").strip() == lookup), None)
+    if not target:
+        return False
+    if not bool(target.get("is_admin")) or not bool(target.get("is_active")):
+        return False
+    return _count_active_admins(users) <= 1
+
+
+def _render_admin_account_management() -> None:
+    if not _current_user_is_admin():
+        return
+
+    users = list_users()
+    users_by_id = {
+        str(user.get("user_id") or "").strip(): user
+        for user in users
+        if str(user.get("user_id") or "").strip()
+    }
+    user_ids = list(users_by_id.keys())
+    current_user = _session_user() or {}
+    current_user_id = str(current_user.get("user_id") or "").strip()
+
+    with st.expander("管理员账号管理", expanded=False):
+        st.caption("仅管理员可见。公开注册保持关闭，账号统一由管理员创建、重置密码和调整权限。")
+        st.caption("安全提示：不会展示 password_hash，也不会在页面回显明文密码。")
+
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("账号总数", len(users))
+        metric_cols[1].metric("启用中", sum(1 for user in users if bool(user.get("is_active"))))
+        metric_cols[2].metric("管理员", sum(1 for user in users if bool(user.get("is_admin"))))
+        metric_cols[3].metric("启用中的管理员", _count_active_admins(users))
+
+        tabs = st.tabs(["账号列表", "新建账号", "账号维护"])
+
+        with tabs[0]:
+            if not users:
+                st.info("当前还没有可管理的账号。")
+            else:
+                st.dataframe(
+                    [
+                        {
+                            "email": str(user.get("email") or ""),
+                            "name": str(user.get("name") or ""),
+                            "is_admin": "是" if bool(user.get("is_admin")) else "否",
+                            "is_active": "启用" if bool(user.get("is_active")) else "停用",
+                            "created_at": _format_user_datetime(str(user.get("created_at") or "")),
+                            "last_login_at": _format_user_datetime(str(user.get("last_login_at") or "")),
+                        }
+                        for user in users
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with tabs[1]:
+            with st.form("admin_create_user_form", clear_on_submit=True):
+                new_email = st.text_input("邮箱", placeholder="name@example.com")
+                new_name = st.text_input("姓名", placeholder="请输入姓名")
+                new_password = st.text_input("密码", type="password", placeholder="至少 8 位")
+                create_cols = st.columns(2)
+                new_is_admin = create_cols[0].checkbox("设为管理员", value=False)
+                new_is_active = create_cols[1].checkbox("创建后立即启用", value=True)
+                create_submitted = st.form_submit_button("新建账号", type="primary", use_container_width=True)
+
+            if create_submitted:
+                try:
+                    created_user = create_user_account(
+                        email=new_email,
+                        name=new_name,
+                        password=new_password,
+                        is_active=bool(new_is_active),
+                        is_admin=bool(new_is_admin),
+                    )
+                    st.session_state.joblib_flash_success = f"账号已创建：{created_user.get('email') or new_email}"
+                    st.rerun()
+                except ValueError as err:
+                    st.warning(str(err))
+
+        with tabs[2]:
+            if not user_ids:
+                st.info("当前还没有可维护的账号。")
+            else:
+                selected_user_id = st.selectbox(
+                    "按邮箱选择账号",
+                    options=user_ids,
+                    format_func=lambda uid: _format_user_option(users_by_id.get(uid, {})),
+                    key="admin_account_selected_user",
+                )
+                target_user = users_by_id.get(selected_user_id, {})
+                target_email = str(target_user.get("email") or "")
+                target_name = str(target_user.get("name") or "").strip() or "-"
+                target_is_active = bool(target_user.get("is_active"))
+                target_is_admin = bool(target_user.get("is_admin"))
+
+                st.caption(
+                    f"当前账号：{target_email} ｜ 姓名：{target_name} ｜ "
+                    f"状态：{'启用' if target_is_active else '停用'} ｜ "
+                    f"权限：{'管理员' if target_is_admin else '普通用户'}"
+                )
+                if _is_last_active_admin(users, selected_user_id):
+                    st.info("该账号是当前最后一个启用中的管理员，不能被停用，也不能取消管理员权限。")
+
+                with st.form("admin_reset_password_form", clear_on_submit=True):
+                    reset_password_value = st.text_input("新密码", type="password", placeholder="请输入新密码，至少 8 位")
+                    reset_submitted = st.form_submit_button("重置密码", use_container_width=True)
+
+                if reset_submitted:
+                    try:
+                        if reset_user_password(selected_user_id, reset_password_value):
+                            st.session_state.joblib_flash_success = f"已重置密码：{target_email}"
+                            st.rerun()
+                        st.warning("密码重置失败，请确认目标账号是否存在。")
+                    except ValueError as err:
+                        st.warning(str(err))
+
+                action_cols = st.columns(2)
+                with action_cols[0]:
+                    active_label = "停用账号" if target_is_active else "启用账号"
+                    if st.button(active_label, key="admin_toggle_user_active_btn", use_container_width=True):
+                        next_active = not target_is_active
+                        if not next_active and _is_last_active_admin(users, selected_user_id):
+                            st.warning("不能停用当前最后一个启用中的管理员账号。请先保留或新增其他管理员。")
+                        elif set_user_active(selected_user_id, next_active):
+                            if not next_active and selected_user_id == current_user_id:
+                                st.session_state.auth_flash_message = "当前账号已被停用，请联系其他管理员。"
+                            else:
+                                st.session_state.joblib_flash_success = f"已{'启用' if next_active else '停用'}账号：{target_email}"
+                            st.rerun()
+                        else:
+                            st.warning("账号状态更新失败，请稍后重试。")
+
+                with action_cols[1]:
+                    admin_label = "取消管理员" if target_is_admin else "设为管理员"
+                    if st.button(admin_label, key="admin_toggle_user_admin_btn", use_container_width=True):
+                        next_is_admin = not target_is_admin
+                        if not next_is_admin and _is_last_active_admin(users, selected_user_id):
+                            st.warning("不能取消当前最后一个启用中的管理员权限。请先保留或新增其他管理员。")
+                        elif set_user_admin(selected_user_id, next_is_admin):
+                            st.session_state.joblib_flash_success = (
+                                f"已将 {target_email} {'设为管理员' if next_is_admin else '取消管理员权限'}。"
+                            )
+                            st.rerun()
+                        else:
+                            st.warning("管理员权限更新失败，请稍后重试。")
+
+
+def _health_check_result(label: str, status: str, message: str, *, details: dict | None = None) -> dict[str, object]:
+    return {
+        "label": str(label or "").strip(),
+        "status": str(status or "fail").strip().lower() or "fail",
+        "message": str(message or "").strip(),
+        "details": details if isinstance(details, dict) else {},
+    }
+
+
+def _health_status_label(status: str) -> str:
+    mapping = {
+        "pass": "通过",
+        "warning": "告警",
+        "fail": "失败",
+    }
+    return mapping.get(str(status or "").strip().lower(), "失败")
+
+
+def _run_rw_probe_for_users_table() -> dict[str, object]:
+    probe_user_id = f"health_user_{uuid4().hex}"
+    probe_email = f"health_{uuid4().hex[:12]}@local.invalid"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT COUNT(1) AS total_count FROM users").fetchone()
+        total_count = int(row["total_count"] or 0) if row is not None else 0
+        conn.execute(
+            """
+            INSERT INTO users(
+                user_id, email, name, password_hash,
+                is_active, is_admin, created_at, updated_at, last_login_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                probe_user_id,
+                probe_email,
+                "Health Check Probe",
+                "health_check_probe_hash",
+                1,
+                0,
+                ts,
+                ts,
+                "",
+            ),
+        )
+        inserted = conn.execute("SELECT email FROM users WHERE user_id = ?", (probe_user_id,)).fetchone()
+        if inserted is None:
+            raise RuntimeError("users probe row not readable after insert")
+        conn.rollback()
+        return _health_check_result(
+            "users 表可读写",
+            "pass",
+            f"users 表读写正常，当前共有 {total_count} 个账号；写入探针已回滚。",
+            details={"user_count": total_count, "probe_email": probe_email},
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return _health_check_result("users 表可读写", "fail", f"users 表读写检查失败：{exc}")
+    finally:
+        conn.close()
+
+
+def _run_rw_probe_for_jobs_table() -> dict[str, object]:
+    probe_title = f"SMOKE_HEALTH_JOB_{uuid4().hex[:10]}"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT COUNT(1) AS total_count FROM jobs").fetchone()
+        total_count = int(row["total_count"] or 0) if row is not None else 0
+        conn.execute(
+            """
+            INSERT INTO jobs(
+                title, jd_text, openings,
+                created_by_user_id, created_by_name, created_by_email,
+                updated_by_user_id, updated_by_name, updated_by_email,
+                created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                probe_title,
+                "Health check JD probe",
+                1,
+                "health_probe",
+                "Health Check",
+                "health@local.invalid",
+                "health_probe",
+                "Health Check",
+                "health@local.invalid",
+                ts,
+                ts,
+            ),
+        )
+        inserted = conn.execute("SELECT title FROM jobs WHERE title = ?", (probe_title,)).fetchone()
+        if inserted is None:
+            raise RuntimeError("jobs probe row not readable after insert")
+        conn.rollback()
+        return _health_check_result(
+            "jobs 表可读写",
+            "pass",
+            f"jobs 表读写正常，当前共有 {total_count} 个岗位；写入探针已回滚。",
+            details={"job_count": total_count, "probe_title": probe_title},
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return _health_check_result("jobs 表可读写", "fail", f"jobs 表读写检查失败：{exc}")
+    finally:
+        conn.close()
+
+
+def _collect_ai_provider_health_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for provider in get_ai_provider_options():
+        api_key_env_name = get_default_ai_api_key_env_name(provider)
+        env_detected = bool(os.getenv(api_key_env_name or "", "").strip()) if api_key_env_name else False
+        api_base = resolve_ai_api_base(provider, "")
+        api_base_required = provider_requires_explicit_api_base(provider)
+        live_supported = provider in {"openai", "openai_compatible", "deepseek"}
+        if provider == "mock":
+            status = "pass"
+            note = "本地 mock，可直接用于结构化 fallback。"
+        elif live_supported and env_detected and (bool(api_base) or not api_base_required):
+            status = "pass"
+            note = "真实调用基础配置已具备。"
+        elif live_supported:
+            status = "warning"
+            note = "真实调用配置不完整，运行时可能 fallback 到 stub。"
+        else:
+            status = "warning"
+            note = "当前 provider 仅保留配置入口，未实现真实调用。"
+
+        rows.append(
+            {
+                "provider": provider,
+                "status": _health_status_label(status),
+                "live_call": "是" if live_supported else "否",
+                "api_key_env_name": api_key_env_name or "-",
+                "env_detected": "是" if env_detected else "否",
+                "api_base": api_base or "-",
+                "api_base_required": "是" if api_base_required else "否",
+                "note": note,
+            }
+        )
+    return rows
+
+
+def _run_system_health_checks() -> dict[str, object]:
+    results: list[dict[str, object]] = []
+
+    try:
+        with get_connection() as conn:
+            row = conn.execute("SELECT 1 AS ok").fetchone()
+            backend = str(getattr(conn, "backend", "unknown") or "unknown")
+            if row is None or int(row["ok"] or 0) != 1:
+                raise RuntimeError("database ping returned unexpected result")
+        results.append(_health_check_result("数据库连接", "pass", f"数据库连接正常，backend={backend}。", details={"backend": backend}))
+    except Exception as exc:  # noqa: BLE001
+        results.append(_health_check_result("数据库连接", "fail", f"数据库连接失败：{exc}"))
+
+    results.append(_run_rw_probe_for_users_table())
+    results.append(_run_rw_probe_for_jobs_table())
+
+    try:
+        ocr_caps = check_ocr_capabilities()
+        image_ok = bool(ocr_caps.get("image_ocr_available"))
+        pdf_ok = bool(ocr_caps.get("pdf_ocr_available"))
+        status = "pass" if image_ok and pdf_ok else "warning"
+        results.append(
+            _health_check_result(
+                "OCR capability",
+                status,
+                f"图片 OCR={'可用' if image_ok else '不可用'}，PDF OCR fallback={'可用' if pdf_ok else '不可用'}。",
+                details=ocr_caps,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        results.append(_health_check_result("OCR capability", "fail", f"OCR 能力检查失败：{exc}"))
+        ocr_caps = {}
+
+    ai_rows = _collect_ai_provider_health_rows()
+    live_ready = sum(1 for row in ai_rows if row.get("live_call") == "是" and row.get("status") == "通过")
+    ai_status = "pass" if live_ready > 0 else "warning"
+    results.append(
+        _health_check_result(
+            "AI provider 配置状态",
+            ai_status,
+            f"当前共有 {live_ready} 个可真实调用的 provider 配置已就绪；其余 provider 可能走 stub 或仅保留配置入口。",
+            details={"providers": ai_rows},
+        )
+    )
+
+    try:
+        jobs = list_jds()
+        job_count = len(jobs)
+        results.append(
+            _health_check_result(
+                "当前是否存在岗位",
+                "pass" if job_count > 0 else "warning",
+                f"当前岗位数量：{job_count}。",
+                details={"job_count": job_count, "sample_titles": jobs[:5]},
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        results.append(_health_check_result("当前是否存在岗位", "fail", f"岗位读取失败：{exc}"))
+
+    try:
+        with get_connection() as conn:
+            row = conn.execute("SELECT COUNT(1) AS total_count FROM candidate_batches").fetchone()
+            batch_count = int(row["total_count"] or 0) if row is not None else 0
+        batch_titles = list_candidate_jd_titles()
+        results.append(
+            _health_check_result(
+                "当前是否存在批次",
+                "pass" if batch_count > 0 else "warning",
+                f"当前批次数量：{batch_count}。",
+                details={"batch_count": batch_count, "jd_titles": batch_titles[:5]},
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        results.append(_health_check_result("当前是否存在批次", "fail", f"批次读取失败：{exc}"))
+
+    summary = {
+        "pass": sum(1 for item in results if item.get("status") == "pass"),
+        "warning": sum(1 for item in results if item.get("status") == "warning"),
+        "fail": sum(1 for item in results if item.get("status") == "fail"),
+    }
+    return {"summary": summary, "results": results, "ocr": ocr_caps, "ai_rows": ai_rows}
+
+
+def _build_smoke_test_jd_text() -> str:
+    return (
+        "岗位名称：Smoke Test 产品经理实习生\n"
+        "岗位职责：\n"
+        "1. 协助整理岗位需求与候选人评估标准。\n"
+        "2. 支持基础数据整理、跨团队沟通和文档输出。\n"
+        "3. 参与候选人信息校验与工作台流转。\n"
+        "任职要求：\n"
+        "1. 本科及以上学历。\n"
+        "2. 具备基础数据分析、文档整理与沟通能力。\n"
+        "3. 熟悉 Python、SQL 或产品文档者优先。\n"
+    )
+
+
+def _build_smoke_candidate_payload(candidate_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    score_details = {
+        "教育背景匹配度": {"score": 4, "reason": "smoke", "evidence": ["学历信息完整"]},
+        "相关经历匹配度": {"score": 4, "reason": "smoke", "evidence": ["有基础项目经历"]},
+        "技能匹配度": {"score": 4, "reason": "smoke", "evidence": ["具备基础技能"]},
+        "表达完整度": {"score": 4, "reason": "smoke", "evidence": ["简历结构完整"]},
+        "综合推荐度": {"score": 4, "reason": "smoke", "evidence": ["用于 smoke 测试"]},
+    }
+    row = {
+        "candidate_id": candidate_id,
+        "姓名": "Smoke 候选人",
+        "文件名": "smoke_resume.txt",
+        "解析状态": "正常识别",
+        "初筛结论": "建议人工复核",
+        "风险等级": "low",
+        "候选池": "待复核候选人",
+        "人工最终结论": "",
+        "人工备注": "",
+        "处理优先级": "中",
+        "审核摘要": "Smoke 主流程测试候选人",
+    }
+    detail = {
+        "parsed_jd": {"job_title": "Smoke Test 产品经理实习生", "scoring_config": {}},
+        "parsed_resume": {"name": "Smoke 候选人"},
+        "score_details": score_details,
+        "score_values": {
+            "教育背景匹配度": 4,
+            "相关经历匹配度": 4,
+            "技能匹配度": 4,
+            "表达完整度": 4,
+            "综合推荐度": 4,
+        },
+        "risk_result": {"risk_level": "low", "risk_summary": "smoke", "risk_points": []},
+        "screening_result": {
+            "screening_result": "建议人工复核",
+            "screening_reasons": ["Smoke 测试批次"],
+            "gating_signals": {},
+        },
+        "interview_plan": {"interview_questions": [], "focus_points": [], "interview_summary": "smoke"},
+        "evidence_snippets": [],
+        "ai_review_suggestion": {},
+        "ai_review_status": "not_generated",
+        "extract_info": {
+            "file_name": "smoke_resume.txt",
+            "method": "text",
+            "quality": "ok",
+            "message": "smoke test",
+            "parse_status": "正常识别",
+            "can_evaluate": True,
+            "should_skip": False,
+        },
+        "manual_priority": "中",
+        "review_id": "",
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return row, detail
+
+
+def _run_app_flow_smoke(*, creator: dict[str, object] | None = None, cleanup: bool = True) -> dict[str, object]:
+    smoke_job_title = f"SMOKE_FLOW_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+    candidate_id = f"smoke_cand_{uuid4().hex[:8]}"
+    batch_id = ""
+    steps: list[dict[str, str]] = []
+    cleanup_notes: list[str] = []
+    operator = creator if isinstance(creator, dict) else {}
+    jd_text = _build_smoke_test_jd_text()
+
+    def _step(name: str, status: str, message: str) -> None:
+        steps.append({"name": name, "status": status, "message": message})
+
+    try:
+        save_jd(
+            smoke_job_title,
+            jd_text,
+            openings=1,
+            created_by_user_id=str(operator.get("user_id") or ""),
+            created_by_name=str(operator.get("name") or "Smoke Runner"),
+            created_by_email=str(operator.get("email") or "smoke@local.invalid"),
+            updated_by_user_id=str(operator.get("user_id") or ""),
+            updated_by_name=str(operator.get("name") or "Smoke Runner"),
+            updated_by_email=str(operator.get("email") or "smoke@local.invalid"),
+        )
+        if smoke_job_title not in list_jds():
+            raise RuntimeError("test JD not visible in jobs list")
+        _step("新建测试 JD", "pass", f"已创建测试岗位：{smoke_job_title}")
+
+        row, detail = _build_smoke_candidate_payload(candidate_id)
+        batch_id = save_candidate_batch(
+            jd_title=smoke_job_title,
+            rows=[row],
+            details={candidate_id: detail},
+            created_by_user_id=str(operator.get("user_id") or ""),
+            created_by_name=str(operator.get("name") or "Smoke Runner"),
+            created_by_email=str(operator.get("email") or "smoke@local.invalid"),
+        )
+        if not batch_id:
+            raise RuntimeError("save_candidate_batch returned empty batch id")
+        batches = list_candidate_batches_by_jd(smoke_job_title)
+        if not any(str(item.get("batch_id") or "") == batch_id for item in batches):
+            raise RuntimeError("test batch not visible in batch history")
+        _step("创建最小批次", "pass", f"已创建测试批次：{batch_id[:12]}…")
+
+        payload = load_candidate_batch(batch_id)
+        if not payload:
+            raise RuntimeError("workspace payload is empty")
+        rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        if len(rows) != 1 or candidate_id not in details:
+            raise RuntimeError("workspace payload missing expected candidate row/detail")
+        if smoke_job_title not in list_candidate_jd_titles():
+            raise RuntimeError("workspace JD title index missing test job")
+        _step("读取候选人工作台", "pass", "候选人工作台数据读取正常。")
+    except Exception as exc:  # noqa: BLE001
+        failed_step = next((item["name"] for item in reversed(steps) if item.get("status") == "fail"), "")
+        _step(failed_step or "主流程 smoke", "fail", str(exc))
+    finally:
+        if cleanup:
+            if batch_id:
+                if delete_candidate_batch(batch_id):
+                    cleanup_notes.append("已清理测试批次。")
+                else:
+                    cleanup_notes.append("测试批次清理失败或已不存在。")
+            try:
+                delete_jd(smoke_job_title)
+                cleanup_notes.append("已清理测试岗位。")
+            except Exception:  # noqa: BLE001
+                cleanup_notes.append("测试岗位清理失败或已不存在。")
+
+    success = all(step.get("status") == "pass" for step in steps) and bool(steps)
+    warning = any("失败" in note for note in cleanup_notes)
+    summary = {
+        "pass": sum(1 for step in steps if step.get("status") == "pass"),
+        "fail": sum(1 for step in steps if step.get("status") == "fail"),
+        "warning": 1 if warning else 0,
+    }
+    return {
+        "success": success,
+        "steps": steps,
+        "summary": summary,
+        "cleanup_notes": cleanup_notes,
+        "artifacts": {"job_title": smoke_job_title, "batch_id": batch_id},
+    }
+
+
+def _ai_source_label(source: str) -> str:
+    mapping = {
+        "api": "API",
+        "stub": "Stub Fallback",
+    }
+    return mapping.get(str(source or "").strip().lower(), str(source or "-").strip() or "-")
+
+
+def _current_ai_environment_rows() -> list[dict[str, object]]:
+    base_cfg = _normalize_scoring_config(
+        st.session_state.get("joblib_draft_scoring_config")
+        or build_default_scoring_config("AI产品经理 / 大模型产品经理")
+    )
+    feature_cfgs = [
+        ("AI 评分细则建议", {**_default_ai_rule_suggester_config(), **(base_cfg.get("ai_rule_suggester") or {})}),
+        ("AI reviewer", {**_default_ai_reviewer_config(), **(base_cfg.get("ai_reviewer") or {})}),
+    ]
+    rows: list[dict[str, object]] = []
+    for feature_label, cfg in feature_cfgs:
+        runtime_cfg = resolve_ai_runtime_config(cfg)
+        env_name = str(runtime_cfg.get("api_key_env_name") or "")
+        env_exists = bool(os.getenv(env_name, "").strip()) if env_name else False
+        rows.append(
+            {
+                "功能": feature_label,
+                "provider": str(runtime_cfg.get("provider") or "-"),
+                "model": str(runtime_cfg.get("model") or "-"),
+                "api_base": str(runtime_cfg.get("api_base") or "-") or "-",
+                "api_key_env_name": env_name or "-",
+                "env_exists": "已检测到" if env_exists else "未检测到",
+            }
+        )
+    return rows
+
+
+def _render_environment_health_panel() -> None:
+    if not _current_user_is_admin():
+        return
+
+    ocr_caps = check_ocr_capabilities()
+    dependency_status = ocr_caps.get("dependency_status") if isinstance(ocr_caps.get("dependency_status"), dict) else {}
+    runtime_status = ocr_caps.get("runtime_status") if isinstance(ocr_caps.get("runtime_status"), dict) else {}
+    latest_ai = get_latest_ai_call_status()
+    ai_rows = _current_ai_environment_rows()
+
+    with st.expander("AI + OCR 环境健康面板", expanded=False):
+        st.caption("仅管理员可见。用于部署后快速定位 OCR 为什么不工作、AI 为什么没有走真实接口。")
+
+        st.markdown("**OCR 环境**")
+        ocr_metric_cols = st.columns(2)
+        ocr_metric_cols[0].metric("Image OCR", "可用" if bool(ocr_caps.get("image_ocr_available")) else "不可用")
+        ocr_metric_cols[1].metric("PDF OCR fallback", "可用" if bool(ocr_caps.get("pdf_ocr_available")) else "不可用")
+        st.dataframe(
+            [
+                {
+                    "组件": "pillow",
+                    "状态": "已安装" if bool(dependency_status.get("pillow")) else "缺失",
+                    "影响": "图片 OCR 依赖",
+                },
+                {
+                    "组件": "pytesseract",
+                    "状态": "已安装" if bool(dependency_status.get("pytesseract")) else "缺失",
+                    "影响": "图片 OCR / PDF OCR fallback 调用入口",
+                },
+                {
+                    "组件": "pdf2image",
+                    "状态": "已安装" if bool(dependency_status.get("pdf2image")) else "缺失",
+                    "影响": "扫描版 PDF 转图片",
+                },
+                {
+                    "组件": "tesseract",
+                    "状态": "已检测到" if bool(runtime_status.get("tesseract")) else "未检测到",
+                    "影响": "图片 OCR / PDF OCR fallback 运行时",
+                },
+                {
+                    "组件": "poppler",
+                    "状态": "已检测到" if bool(runtime_status.get("poppler")) else "未检测到",
+                    "影响": "PDF 转图片运行时",
+                },
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        for hint in (ocr_caps.get("hints") if isinstance(ocr_caps.get("hints"), list) else []):
+            if "缺少" in str(hint) or "未检测到" in str(hint):
+                st.warning(str(hint))
+            else:
+                st.info(str(hint))
+
+        st.markdown("**AI 环境**")
+        st.dataframe(ai_rows, use_container_width=True, hide_index=True)
+        if latest_ai:
+            env_name = str(latest_ai.get("api_key_env_name") or "-")
+            env_present = bool(latest_ai.get("api_key_present"))
+            source = str(latest_ai.get("source") or "")
+            failure_reason = str(latest_ai.get("failure_reason") or "")
+            latest_cols = st.columns(6)
+            latest_cols[0].metric("最近调用功能", str(latest_ai.get("purpose") or "-"))
+            latest_cols[1].metric("最近调用来源", _ai_source_label(source))
+            latest_cols[2].metric("provider", str(latest_ai.get("provider") or "-"))
+            latest_cols[3].metric("model", str(latest_ai.get("model") or "-"))
+            latest_cols[4].metric("env", "已检测到" if env_present else "未检测到")
+            latest_cols[5].metric("api_base", str(latest_ai.get("api_base") or "-") or "-")
+            st.caption(
+                f"对应 env：{env_name} ｜ 最近一次失败原因：{failure_reason or '-'}"
+            )
+            if source == "stub":
+                st.warning(f"最近一次 AI 调用走了 stub fallback。原因：{failure_reason or latest_ai.get('reason') or '-'}")
+            elif failure_reason:
+                st.warning(f"最近一次 AI 调用失败：{failure_reason}")
+            else:
+                st.success("最近一次 AI 调用走了真实 API。")
+        else:
+            st.info("当前还没有 AI 调用记录。可先在 AI 评分细则建议或 AI reviewer 中触发一次调用。")
+
+
+def _render_system_health_panel() -> None:
+    if not _current_user_is_admin():
+        return
+
+    with st.expander("系统健康检查 / 主流程 smoke", expanded=False):
+        st.caption("仅管理员可见。用于快速检查数据库、OCR、AI 配置状态，以及岗位配置 → 批量初筛 → 候选人工作台的最小主流程。")
+        st.caption("命令行 smoke 脚本：`uv run python scripts/smoke_app_flow.py`")
+
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            if st.button("运行系统健康检查", key="admin_run_system_health_btn", use_container_width=True):
+                st.session_state.admin_system_health_result = _run_system_health_checks()
+        with action_cols[1]:
+            if st.button("运行主流程 smoke", key="admin_run_app_flow_smoke_btn", use_container_width=True):
+                st.session_state.admin_app_flow_smoke_result = _run_app_flow_smoke(creator=_current_operator(), cleanup=True)
+
+        health_result = st.session_state.get("admin_system_health_result")
+        if isinstance(health_result, dict):
+            summary = health_result.get("summary") if isinstance(health_result.get("summary"), dict) else {}
+            metric_cols = st.columns(3)
+            metric_cols[0].metric("通过", int(summary.get("pass", 0) or 0))
+            metric_cols[1].metric("告警", int(summary.get("warning", 0) or 0))
+            metric_cols[2].metric("失败", int(summary.get("fail", 0) or 0))
+
+            result_rows = health_result.get("results") if isinstance(health_result.get("results"), list) else []
+            st.dataframe(
+                [
+                    {
+                        "检查项": str(item.get("label") or ""),
+                        "状态": _health_status_label(str(item.get("status") or "")),
+                        "说明": str(item.get("message") or ""),
+                    }
+                    for item in result_rows
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            ai_rows = health_result.get("ai_rows") if isinstance(health_result.get("ai_rows"), list) else []
+            if ai_rows:
+                with st.expander("AI provider 配置详情", expanded=False):
+                    st.dataframe(ai_rows, use_container_width=True, hide_index=True)
+
+            ocr_caps = health_result.get("ocr") if isinstance(health_result.get("ocr"), dict) else {}
+            if ocr_caps:
+                with st.expander("OCR capability 原始信息", expanded=False):
+                    st.json(ocr_caps)
+
+        smoke_result = st.session_state.get("admin_app_flow_smoke_result")
+        if isinstance(smoke_result, dict):
+            if smoke_result.get("success"):
+                st.success("主流程 smoke 通过。")
+            else:
+                st.warning("主流程 smoke 未通过，请查看步骤详情。")
+
+            smoke_summary = smoke_result.get("summary") if isinstance(smoke_result.get("summary"), dict) else {}
+            smoke_metrics = st.columns(3)
+            smoke_metrics[0].metric("通过步骤", int(smoke_summary.get("pass", 0) or 0))
+            smoke_metrics[1].metric("失败步骤", int(smoke_summary.get("fail", 0) or 0))
+            smoke_metrics[2].metric("清理告警", int(smoke_summary.get("warning", 0) or 0))
+
+            st.dataframe(
+                [
+                    {
+                        "步骤": str(item.get("name") or ""),
+                        "状态": _health_status_label(str(item.get("status") or "")),
+                        "说明": str(item.get("message") or ""),
+                    }
+                    for item in (smoke_result.get("steps") if isinstance(smoke_result.get("steps"), list) else [])
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            cleanup_notes = smoke_result.get("cleanup_notes") if isinstance(smoke_result.get("cleanup_notes"), list) else []
+            if cleanup_notes:
+                for note in cleanup_notes:
+                    st.caption(note)
+
+
 def _render_login_page() -> None:
     st.markdown("## 登录 HireMate")
     st.caption("请先登录后再访问岗位配置、批量初筛与候选人工作台。")
@@ -2890,6 +3734,7 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
         scores_input=score_details,
         risk_level=risk_result.get("risk_level"),
         risks=risk_result.get("risk_points", []),
+        scoring_config=parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {},
     )
     interview_plan = build_interview_plan(
         parsed_jd=parsed_jd,
@@ -2972,18 +3817,54 @@ def _apply_jd_to_quick_review(title: str) -> None:
 
 
 def _apply_jd_to_workspace(title: str) -> None:
-    jd_text = load_jd(title) or ""
-    st.session_state.v2_selected_jd_prev = title
+    clean_title = (title or "").strip()
+    if not clean_title:
+        return
+    jd_text = load_jd(clean_title) or ""
+    st.session_state.v2_selected_jd_prev = clean_title
     st.session_state.v2_jd_text_area = jd_text
-    st.session_state.batch_selected_jd_prev = title
+    st.session_state.batch_selected_jd_prev = clean_title
     st.session_state.batch_jd_text_area = jd_text
-    st.session_state.workspace_selected_jd_title = title
+    st.session_state.workspace_selected_jd_title = clean_title
+
+
+def _sync_batch_screening_jd_context(jd_titles: list[str]) -> str:
+    available_titles = [str(title or "").strip() for title in (jd_titles or []) if str(title or "").strip()]
+    workspace_jd = str(st.session_state.get("workspace_selected_jd_title") or "").strip()
+    current_batch_jd = str(st.session_state.get("batch_selected_jd_prev") or "").strip()
+
+    if workspace_jd and workspace_jd in available_titles and workspace_jd != current_batch_jd:
+        _apply_jd_to_workspace(workspace_jd)
+        return workspace_jd
+
+    if current_batch_jd and current_batch_jd in available_titles:
+        if not workspace_jd:
+            st.session_state.workspace_selected_jd_title = current_batch_jd
+        if str(st.session_state.get("batch_saved_jd_select") or "").strip() != current_batch_jd:
+            st.session_state.batch_saved_jd_select = current_batch_jd
+        return current_batch_jd
+
+    if available_titles:
+        fallback_title = workspace_jd if workspace_jd in available_titles else available_titles[0]
+        _apply_jd_to_workspace(fallback_title)
+        return fallback_title
+
+    st.session_state.batch_selected_jd_prev = ""
+    st.session_state.batch_saved_jd_select = ""
+    if not workspace_jd:
+        st.session_state.workspace_selected_jd_title = ""
+    return ""
 
 
 def _apply_batch_to_workspace(jd_title: str, batch_id: str, preferred_pool: str | None = None) -> None:
     """将岗位和批次设为候选人工作台默认上下文。"""
-    st.session_state.workspace_selected_jd_title = (jd_title or "").strip()
-    st.session_state.workspace_preferred_batch_id = (batch_id or "").strip()
+    clean_title = (jd_title or "").strip()
+    clean_batch_id = (batch_id or "").strip()
+    if clean_title:
+        _apply_jd_to_workspace(clean_title)
+        st.session_state.workspace_selected_jd_title = clean_title
+    st.session_state.workspace_preferred_batch_id = clean_batch_id
+    st.session_state.v2_current_batch_id = clean_batch_id
     if preferred_pool in {"待复核候选人", "通过候选人", "淘汰候选人"}:
         st.session_state.workspace_pool_top_radio = preferred_pool
         st.session_state.workspace_default_entry_pool = preferred_pool
@@ -3020,6 +3901,9 @@ def _request_page_navigation(page: str) -> None:
         return
     st.session_state.active_page = target
     st.session_state.pending_navigation_page = target
+    st.session_state.pending_navigation_page_nav = target
+    if "active_page_nav" not in st.session_state:
+        st.session_state.active_page_nav = target
 
 
 def _sync_job_management_drafts(selected_job: str) -> None:
@@ -3038,7 +3922,100 @@ def _sync_job_management_drafts(selected_job: str) -> None:
     st.session_state.joblib_draft_text = load_jd(job)
     st.session_state.joblib_draft_openings = int(rec.get("openings", 0) or 0)
     st.session_state.joblib_draft_scoring_config = _normalize_scoring_config(load_jd_scoring_config(job))
+    _apply_scoring_widget_state(selected_job, st.session_state.joblib_draft_scoring_config)
     st.session_state.joblib_selected_title_prev = job
+
+
+def _jd_file_signature(file_obj) -> str:
+    if file_obj is None:
+        return ""
+    file_name = str(getattr(file_obj, "name", "") or "")
+    file_size = getattr(file_obj, "size", None)
+    if file_size is None:
+        try:
+            file_size = len(file_obj.getvalue())
+        except Exception:  # noqa: BLE001
+            file_size = 0
+    return f"{file_name}:{file_size}"
+
+
+def _suggest_jd_title_from_file(file_name: str) -> str:
+    stem = os.path.splitext(os.path.basename(file_name or ""))[0].strip()
+    return stem
+
+
+def _build_jd_upload_meta(file_obj, result: dict, *, error: str = "") -> dict:
+    return {
+        "file_name": str(getattr(file_obj, "name", "") or ""),
+        "method": str(result.get("method") or "") if result else "",
+        "quality": str(result.get("quality") or "") if result else "weak",
+        "message": error or str(result.get("message") or "") if result else error,
+        "success": not bool(error),
+    }
+
+
+def _render_jd_upload_feedback(meta: dict | None, *, context_label: str) -> None:
+    if not meta:
+        return
+    file_name = str(meta.get("file_name") or "JD 文件")
+    message = str(meta.get("message") or "")
+    quality = str(meta.get("quality") or "weak")
+    method = str(meta.get("method") or "text")
+
+    if meta.get("success"):
+        st.success(f"{context_label}已导入：{file_name}。文本已填充到当前 JD 草稿，可继续手工修改后再保存。")
+        st.caption(f"提取方式：{_extract_method_label(method)} ｜ 提取质量：{_extract_quality_label(quality)}")
+        if message:
+            st.caption(f"提取说明：{message}")
+        if quality.lower() == "weak":
+            st.warning("当前 JD 提取质量较弱，建议在保存前人工校对文本。")
+    else:
+        st.warning(f"{context_label}导入失败：{message or '未能读取 JD 文件。'}")
+
+
+def _handle_new_jd_upload(file_obj) -> None:
+    if file_obj is None:
+        return
+    signature = _jd_file_signature(file_obj)
+    if signature and signature == st.session_state.get("joblib_new_jd_upload_signature", ""):
+        return
+
+    try:
+        result = load_jd_file(file_obj)
+        st.session_state.joblib_new_text = str(result.get("text") or "")
+        if not str(st.session_state.get("joblib_new_title") or "").strip():
+            suggested_title = _suggest_jd_title_from_file(str(getattr(file_obj, "name", "") or ""))
+            if suggested_title:
+                st.session_state.joblib_new_title = suggested_title
+        st.session_state.joblib_new_jd_upload_meta = _build_jd_upload_meta(file_obj, result)
+    except Exception as err:  # noqa: BLE001
+        st.session_state.joblib_new_jd_upload_meta = _build_jd_upload_meta(file_obj, {}, error=str(err))
+    st.session_state.joblib_new_jd_upload_signature = signature
+
+
+def _handle_edit_jd_upload(selected_job: str, file_obj) -> None:
+    if not selected_job or file_obj is None:
+        return
+    signature = _jd_file_signature(file_obj)
+    sig_map = st.session_state.setdefault("joblib_edit_jd_upload_signature_by_job", {})
+    if signature and signature == sig_map.get(selected_job, ""):
+        return
+
+    text_key = f"joblib_edit_text_input_{selected_job}"
+    try:
+        result = load_jd_file(file_obj)
+        extracted_text = str(result.get("text") or "")
+        st.session_state.joblib_draft_text = extracted_text
+        st.session_state[text_key] = extracted_text
+        meta_map = st.session_state.setdefault("joblib_edit_jd_upload_meta_by_job", {})
+        meta_map[selected_job] = _build_jd_upload_meta(file_obj, result)
+        st.session_state.joblib_edit_jd_upload_meta_by_job = meta_map
+    except Exception as err:  # noqa: BLE001
+        meta_map = st.session_state.setdefault("joblib_edit_jd_upload_meta_by_job", {})
+        meta_map[selected_job] = _build_jd_upload_meta(file_obj, {}, error=str(err))
+        st.session_state.joblib_edit_jd_upload_meta_by_job = meta_map
+    sig_map[selected_job] = signature
+    st.session_state.joblib_edit_jd_upload_signature_by_job = sig_map
 
 
 def _profile_hard_flag_options(profile_name: str) -> list[tuple[str, str]]:
@@ -3094,6 +4071,205 @@ def _default_ai_reviewer_config() -> dict:
     }
 
 
+def _all_ai_preset_models() -> set[str]:
+    models: set[str] = set()
+    for provider in get_ai_provider_options():
+        for item in get_ai_model_presets(provider):
+            value = str(item.get("value") or "").strip()
+            if value:
+                models.add(value)
+    return models
+
+
+def _sync_ai_config_defaults(prefix: str, provider: str, *, model_fallback: str = "") -> None:
+    provider_key = f"{prefix}_provider_prev"
+    model_key = f"{prefix}_model"
+    model_preset_key = f"{prefix}_model_preset"
+    api_base_key = f"{prefix}_api_base"
+    env_key = f"{prefix}_api_key_env"
+    current_provider = str(provider or "openai").strip().lower() or "openai"
+    previous_provider = str(st.session_state.get(provider_key) or "").strip().lower()
+    if previous_provider == current_provider:
+        return
+
+    known_models = _all_ai_preset_models()
+    current_model = str(st.session_state.get(model_key) or "").strip()
+    current_api_base = str(st.session_state.get(api_base_key) or "").strip()
+    current_env = str(st.session_state.get(env_key) or "").strip()
+
+    if not current_model or current_model == get_default_ai_model(previous_provider or "openai") or current_model in known_models:
+        st.session_state[model_key] = model_fallback or get_default_ai_model(current_provider)
+        st.session_state[model_preset_key] = st.session_state[model_key]
+    if not current_api_base or current_api_base == get_default_ai_api_base(previous_provider or "openai"):
+        st.session_state[api_base_key] = get_default_ai_api_base(current_provider)
+    if not current_env or current_env == get_default_ai_api_key_env_name(previous_provider or "openai"):
+        st.session_state[env_key] = get_default_ai_api_key_env_name(current_provider)
+
+    st.session_state[provider_key] = current_provider
+
+
+def _render_ai_model_selector(prefix: str, provider: str, current_model: str, *, label: str = "model") -> str:
+    presets = get_ai_model_presets(provider)
+    preset_map = {str(item.get("value") or ""): str(item.get("label") or item.get("value") or "") for item in presets}
+    preset_options = ["__custom__"] + list(preset_map.keys())
+    current_model_clean = str(current_model or "").strip()
+    preset_default = current_model_clean if current_model_clean in preset_map else "__custom__"
+
+    preset_choice = st.selectbox(
+        f"{label} 预设",
+        options=preset_options,
+        index=preset_options.index(preset_default),
+        format_func=lambda value: "自定义输入" if value == "__custom__" else preset_map.get(value, value),
+        key=f"{prefix}_model_preset",
+    )
+    if preset_choice != "__custom__":
+        st.session_state[f"{prefix}_model"] = preset_choice
+
+    return st.text_input(
+        label,
+        value=st.session_state.get(f"{prefix}_model", current_model_clean or get_default_ai_model(provider)),
+        key=f"{prefix}_model",
+    ).strip()
+
+
+def _render_ai_runtime_hint(provider: str, api_base: str, api_key_env_name: str) -> None:
+    resolved_base = resolve_ai_api_base(provider, api_base)
+    resolved_env = resolve_ai_api_key_env_name(provider, api_key_env_name)
+    env_exists = bool(os.getenv(resolved_env or "", "").strip()) if resolved_env else False
+    base_required = provider_requires_explicit_api_base(provider)
+    base_missing = base_required and not str(api_base or "").strip()
+    st.caption(
+        f"当前 env 检测：{resolved_env or '-'} {'已检测到' if env_exists else '未检测到'} ｜ "
+        f"api_base：{resolved_base or '-'}{'（required）' if base_required else ''} ｜ "
+        f"api_base 状态：{'未填写' if base_missing else '已就绪'}"
+    )
+
+
+def _render_ai_runtime_warning(
+    provider: str,
+    api_base: str,
+    api_key_env_name: str,
+    *,
+    enabled: bool,
+    feature_label: str,
+) -> None:
+    if not enabled:
+        return
+
+    provider_norm = str(provider or "").strip().lower()
+    resolved_env = resolve_ai_api_key_env_name(provider_norm, api_key_env_name)
+    env_exists = bool(os.getenv(resolved_env or "", "").strip()) if resolved_env else False
+    base_missing = provider_requires_explicit_api_base(provider_norm) and not str(api_base or "").strip()
+
+    if provider_norm == "mock":
+        st.info(f"当前 {feature_label} 使用 mock provider，会直接返回结构化 stub，不发真实网络请求。")
+        return
+
+    if provider_norm not in {"openai", "openai_compatible", "deepseek"}:
+        st.info(
+            f"当前 {feature_label} provider={provider_norm or '-'} 暂未实现真实调用，运行时会 fallback 到 stub，并在 meta.reason 标明原因。"
+        )
+        return
+
+    if base_missing:
+        st.info(f"当前 {feature_label} 需要填写 api_base；留空时不会发起真实请求，会 fallback 到 stub。")
+
+    if not env_exists:
+        st.info(f"当前未检测到 {feature_label} 对应的 API key env，运行时会 fallback 到 stub。")
+
+
+def _render_ai_connection_result(result: dict | None) -> None:
+    if not result:
+        return
+    if result.get("success"):
+        st.success(f"测试 AI 连接成功：{result.get('reason') or '请求成功'}")
+    else:
+        st.warning(f"测试 AI 连接失败：{result.get('reason') or '请求失败'}")
+    st.json(
+        {
+            "provider": result.get("provider"),
+            "model": result.get("model"),
+            "api_base": result.get("api_base"),
+            "api_key_env_name": result.get("api_key_env_name"),
+            "api_key_env_detected": bool(result.get("api_key_present")),
+            "api_key_present": bool(result.get("api_key_present")),
+            "success": bool(result.get("success")),
+            "reason": result.get("reason") or "",
+            "request_id": result.get("request_id") or "",
+            "latency_ms": int(result.get("latency_ms") or 0),
+        }
+    )
+
+
+WEIGHT_SUM_TOLERANCE = 1e-6
+WEIGHT_FIELD_HELP = {
+    "教育背景匹配度": {
+        "summary": "看候选人的学历层级、专业相关性，以及教育背景是否能支撑岗位起点。",
+        "guidance": "适合校招、研究导向、专业门槛强的岗位。",
+        "bias": "拉得太高会放大学历优势，可能低估实践能力强但专业不完全对口的人。",
+    },
+    "相关经历匹配度": {
+        "summary": "看实习、项目、职责和产出，是否真正贴近岗位要解决的问题。",
+        "guidance": "适合强调项目落地、岗位上手速度、同类经验复用的岗位。",
+        "bias": "拉得太高会更偏爱有直接同类经历的人，转岗潜力型候选人会吃亏。",
+    },
+    "技能匹配度": {
+        "summary": "看岗位关键技能是否命中，比如 SQL、Python、PRD、研究方法或工具链。",
+        "guidance": "适合技能门槛明确、入岗就要用到核心工具的岗位。",
+        "bias": "拉得太高会更偏向工具命中，可能低估方法论或业务理解较强的人。",
+    },
+    "表达完整度": {
+        "summary": "看简历是否结构清楚、信息完整，能不能快速支持判断。",
+        "guidance": "适合作为辅助维度，帮助区分信息充分和信息缺失的简历。",
+        "bias": "拉得太高会放大简历写作差异，可能误伤经历不错但表达一般的人。",
+    },
+}
+
+
+def _weight_widget_key(selected_job: str, dimension: str) -> str:
+    return f"joblib_weight_{selected_job}_{dimension}"
+
+
+def _read_weight_widget_values(selected_job: str, default_weights: dict[str, float]) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for dim in BASE_WEIGHT_KEYS:
+        raw_value = st.session_state.get(_weight_widget_key(selected_job, dim), default_weights.get(dim, 0.25))
+        try:
+            values[dim] = max(0.0, min(1.0, float(raw_value or 0.0)))
+        except (TypeError, ValueError):
+            values[dim] = max(0.0, min(1.0, float(default_weights.get(dim, 0.25) or 0.25)))
+    return values
+
+
+def _apply_weight_widget_state(selected_job: str, weights: dict[str, float]) -> None:
+    for dim in BASE_WEIGHT_KEYS:
+        st.session_state[_weight_widget_key(selected_job, dim)] = round(float(weights.get(dim, 0.25) or 0.25), 2)
+
+
+def _apply_scoring_widget_state(selected_job: str, scoring_cfg: dict) -> None:
+    weights = scoring_cfg.get("weights") if isinstance(scoring_cfg.get("weights"), dict) else {}
+    thresholds = (
+        scoring_cfg.get("screening_thresholds")
+        if isinstance(scoring_cfg.get("screening_thresholds"), dict)
+        else scoring_cfg.get("thresholds")
+    ) or {}
+    hard_cfg = scoring_cfg.get("hard_thresholds") if isinstance(scoring_cfg.get("hard_thresholds"), dict) else {}
+
+    _apply_weight_widget_state(selected_job, weights)
+    st.session_state[f"joblib_thr_pass_{selected_job}"] = int(thresholds.get("pass_line", 4) or 4)
+    st.session_state[f"joblib_thr_review_{selected_job}"] = int(thresholds.get("review_line", 3) or 3)
+    st.session_state[f"joblib_thr_exp_{selected_job}"] = int(thresholds.get("min_experience", 2) or 2)
+    st.session_state[f"joblib_thr_skill_{selected_job}"] = int(thresholds.get("min_skill", 2) or 2)
+    st.session_state[f"joblib_thr_expr_{selected_job}"] = int(thresholds.get("min_expression", 2) or 2)
+
+    all_hard_keys: set[str] = set()
+    for profile_name in get_profile_options():
+        for hard_key, _ in _profile_hard_flag_options(profile_name):
+            all_hard_keys.add(hard_key)
+    for hard_key in all_hard_keys:
+        st.session_state[f"joblib_hard_{selected_job}_{hard_key}"] = bool(hard_cfg.get(hard_key, False))
+
+
 def _normalize_scoring_config(scoring_cfg: dict | None) -> dict:
     cfg = scoring_cfg if isinstance(scoring_cfg, dict) else {}
     profile_name = cfg.get("role_template") or cfg.get("profile_name") or "AI产品经理 / 大模型产品经理"
@@ -3103,7 +4279,10 @@ def _normalize_scoring_config(scoring_cfg: dict | None) -> dict:
     normalized = {
         "profile_name": profile_name,
         "role_template": profile_name,
-        "weights": {**(default_cfg.get("weights") or {}), **(cfg.get("weights") or {})},
+        "weights": {
+            dim: float((cfg.get("weights") or {}).get(dim, (default_cfg.get("weights") or {}).get(dim, 0.25)) or 0.0)
+            for dim in BASE_WEIGHT_KEYS
+        },
         "thresholds": {**(default_cfg.get("thresholds") or {}), **(thresholds or {})},
         "screening_thresholds": {**(default_cfg.get("screening_thresholds") or {}), **(thresholds or {})},
         "hard_flags": {**(default_cfg.get("hard_flags") or {}), **(hard_flags or {})},
@@ -3240,6 +4419,19 @@ def _render_job_library() -> None:
         if st.session_state.get("joblib_selected_title_prev", "") != selected_job:
             _sync_job_management_drafts(selected_job)
 
+        edit_upload = st.file_uploader(
+            "重新导入 JD 文档（txt / pdf / docx）",
+            type=["txt", "pdf", "docx"],
+            key=f"joblib_edit_jd_upload_{selected_job}",
+            help="上传后会覆盖当前编辑草稿，但不会自动保存到数据库。",
+        )
+        _handle_edit_jd_upload(selected_job, edit_upload)
+        edit_meta_map = st.session_state.get("joblib_edit_jd_upload_meta_by_job", {})
+        _render_jd_upload_feedback(
+            edit_meta_map.get(selected_job) if isinstance(edit_meta_map, dict) else None,
+            context_label="编辑区 JD ",
+        )
+
         edited_openings = st.number_input(
             "当前空缺人数",
             min_value=0,
@@ -3271,28 +4463,60 @@ def _render_job_library() -> None:
             key=f"joblib_scoring_profile_{selected_job}",
         )
 
-        if st.button("恢复模板默认值", key=f"joblib_restore_profile_defaults_{selected_job}", use_container_width=True):
-            scoring_cfg = _normalize_scoring_config(build_default_scoring_config(selected_profile))
-            st.session_state.joblib_draft_scoring_config = scoring_cfg
-            st.rerun()
-
         if selected_profile != current_profile:
             scoring_cfg = _normalize_scoring_config(build_default_scoring_config(selected_profile))
+            st.session_state.joblib_draft_scoring_config = scoring_cfg
+            _apply_scoring_widget_state(selected_job, scoring_cfg)
 
         st.caption("四项基础权重")
+        st.caption("权重越高，该维度对总分影响越大。当前总和必须为 1；如果不确定，建议先使用模板默认值。")
         weight_cfg = scoring_cfg.get("weights") or {}
-        wcols = st.columns(4)
-        weight_keys = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度"]
+        weight_action_cols = st.columns([1, 1, 2])
+        with weight_action_cols[0]:
+            if st.button("恢复模板默认值", key=f"joblib_restore_profile_defaults_{selected_job}", use_container_width=True):
+                scoring_cfg = _normalize_scoring_config(build_default_scoring_config(selected_profile))
+                st.session_state.joblib_draft_scoring_config = scoring_cfg
+                _apply_scoring_widget_state(selected_job, scoring_cfg)
+                st.rerun()
+        with weight_action_cols[1]:
+            if st.button("自动归一化", key=f"joblib_normalize_weights_{selected_job}", use_container_width=True):
+                normalized_weights = normalize_weights(
+                    _read_weight_widget_values(selected_job, weight_cfg),
+                    fallback=weight_cfg,
+                )
+                _apply_weight_widget_state(selected_job, normalized_weights)
+                st.rerun()
+        with weight_action_cols[2]:
+            with st.expander("权重说明", expanded=False):
+                for wk in BASE_WEIGHT_KEYS:
+                    field_help = WEIGHT_FIELD_HELP.get(wk, {})
+                    st.markdown(
+                        f"**{wk}**\n\n"
+                        f"代表什么：{field_help.get('summary', '-')}\n\n"
+                        f"建议如何调：{field_help.get('guidance', '-')}\n\n"
+                        f"极端设置的偏差：{field_help.get('bias', '-')}"
+                    )
+
+        wcols = st.columns(2)
         weight_values = {}
-        for idx, wk in enumerate(weight_keys):
-            weight_values[wk] = wcols[idx].number_input(
+        for idx, wk in enumerate(BASE_WEIGHT_KEYS):
+            weight_values[wk] = wcols[idx % 2].slider(
                 wk,
                 min_value=0.0,
                 max_value=1.0,
                 step=0.01,
                 value=float(weight_cfg.get(wk, 0.25) or 0.25),
-                key=f"joblib_weight_{selected_job}_{wk}",
+                key=_weight_widget_key(selected_job, wk),
+                help=WEIGHT_FIELD_HELP.get(wk, {}).get("summary"),
             )
+
+        current_weight_total = weight_total(weight_values)
+        weights_valid = is_weight_total_valid(weight_values, tolerance=WEIGHT_SUM_TOLERANCE)
+        st.caption(f"当前总和：{current_weight_total:.2f} / 1.00")
+        if weights_valid:
+            st.success("当前权重总和正确，可保存修改。")
+        else:
+            st.warning("四项权重总和必须等于 1.00。请手动调整，或点击“自动归一化”；未修正前无法保存。")
 
         st.caption("筛选门槛")
         thr_cfg = scoring_cfg.get("screening_thresholds") or scoring_cfg.get("thresholds") or {}
@@ -3319,33 +4543,97 @@ def _render_job_library() -> None:
         ai_rule_cfg = {**_default_ai_rule_suggester_config(), **(scoring_cfg.get("ai_rule_suggester") or {})}
 
         st.markdown("**AI 优化评分细则（预留接口）**")
-        st.caption("用于预留未来上云后的模型优化能力；本地未配置密钥时默认走 mock 建议。")
+        st.caption("用于基于岗位 JD 生成评分细则建议；规则评分器仍为主，AI 只给建议。")
         ai_cols = st.columns(2)
         enable_ai_rule_suggester = ai_cols[0].toggle(
             "启用 AI 评分细则建议",
             value=bool(ai_rule_cfg.get("enable_ai_rule_suggester", False)),
             key=f"joblib_ai_enable_{selected_job}",
         )
+        provider_options = get_ai_provider_options()
+        current_rule_provider = str(ai_rule_cfg.get("provider", "openai") or "openai")
         provider = ai_cols[1].selectbox(
             "provider",
-            options=["openai", "azure_openai", "anthropic", "mock"],
-            index=["openai", "azure_openai", "anthropic", "mock"].index(ai_rule_cfg.get("provider", "openai")) if ai_rule_cfg.get("provider", "openai") in ["openai", "azure_openai", "anthropic", "mock"] else 0,
-            key=f"joblib_ai_provider_{selected_job}",
+            options=provider_options,
+            index=provider_options.index(current_rule_provider) if current_rule_provider in provider_options else 0,
+            key=f"joblib_ai_rule_provider_{selected_job}",
+        )
+        rule_runtime_prefix = f"joblib_ai_rule_runtime_{selected_job}"
+        _sync_ai_config_defaults(
+            rule_runtime_prefix,
+            provider,
+            model_fallback=str(ai_rule_cfg.get("model") or get_default_ai_model(provider)),
         )
         ai_cols2 = st.columns(3)
-        model_name = ai_cols2[0].text_input("model", value=str(ai_rule_cfg.get("model", "gpt-4o-mini") or "gpt-4o-mini"), key=f"joblib_ai_model_{selected_job}")
-        api_base = ai_cols2[1].text_input("api_base（可选）", value=str(ai_rule_cfg.get("api_base", "") or ""), key=f"joblib_ai_api_base_{selected_job}")
-        api_key_env_name = ai_cols2[2].text_input("api_key_env_name", value=str(ai_rule_cfg.get("api_key_env_name", "OPENAI_API_KEY") or "OPENAI_API_KEY"), key=f"joblib_ai_env_name_{selected_job}")
+        with ai_cols2[0]:
+            model_name = _render_ai_model_selector(
+                rule_runtime_prefix,
+                provider,
+                str(ai_rule_cfg.get("model") or get_default_ai_model(provider)),
+                label="model",
+            )
+        with ai_cols2[1]:
+            api_base = st.text_input(
+                "api_base（可选）",
+                value=st.session_state.get(
+                    f"{rule_runtime_prefix}_api_base",
+                    str(ai_rule_cfg.get("api_base") or get_default_ai_api_base(provider)),
+                ),
+                key=f"{rule_runtime_prefix}_api_base",
+            ).strip()
+        with ai_cols2[2]:
+            api_key_env_name = st.text_input(
+                "api_key_env_name",
+                value=st.session_state.get(
+                    f"{rule_runtime_prefix}_api_key_env",
+                    str(ai_rule_cfg.get("api_key_env_name") or get_default_ai_api_key_env_name(provider)),
+                ),
+                key=f"{rule_runtime_prefix}_api_key_env",
+            ).strip()
 
-        if st.button("AI 生成评分细则建议", key=f"joblib_ai_suggest_btn_{selected_job}", use_container_width=True):
-            api_key_value = os.getenv(api_key_env_name or "")
-            if not enable_ai_rule_suggester or not api_key_value:
-                st.info("当前本地未启用 AI 评分细则优化，建议部署到云服务器后启用。")
-            suggestion = _build_ai_scoring_stub_suggestion(selected_profile, scoring_cfg, edited_text)
-            st.session_state[f"joblib_ai_suggestion_{selected_job}"] = suggestion
+        _render_ai_runtime_hint(provider, api_base, api_key_env_name)
+        _render_ai_runtime_warning(
+            provider,
+            api_base,
+            api_key_env_name,
+            enabled=bool(enable_ai_rule_suggester),
+            feature_label="AI 评分细则建议",
+        )
+        rule_runtime_cfg = {
+            "enable_ai_rule_suggester": bool(enable_ai_rule_suggester),
+            "provider": provider,
+            "model": model_name,
+            "api_base": api_base,
+            "api_key_env_name": api_key_env_name,
+        }
+        rule_connection_key = f"joblib_ai_rule_connection_test_{selected_job}"
+        rule_action_cols = st.columns(2)
+        with rule_action_cols[0]:
+            if st.button("测试 AI 连接", key=f"joblib_ai_rule_test_btn_{selected_job}", use_container_width=True):
+                st.session_state[rule_connection_key] = test_ai_connection(rule_runtime_cfg, purpose="ai_rule_suggester")
+        with rule_action_cols[1]:
+            if st.button("AI 生成评分细则建议", key=f"joblib_ai_suggest_btn_{selected_job}", use_container_width=True):
+                suggestion = run_ai_rule_suggester(selected_profile, scoring_cfg, edited_text, rule_runtime_cfg)
+                st.session_state[f"joblib_ai_suggestion_{selected_job}"] = suggestion
+                st.session_state[f"joblib_ai_suggestion_text_{selected_job}"] = json.dumps(suggestion, ensure_ascii=False, indent=2)
+                suggestion_meta = suggestion.get("meta") if isinstance(suggestion.get("meta"), dict) else {}
+                if str(suggestion_meta.get("source") or "") == "stub":
+                    st.warning(f"当前返回为 stub fallback：{suggestion_meta.get('reason') or '未获取到真实模型结果'}")
+                else:
+                    st.success("AI 评分细则建议生成成功。")
+
+        _render_ai_connection_result(st.session_state.get(rule_connection_key))
 
         ai_suggestion = st.session_state.get(f"joblib_ai_suggestion_{selected_job}")
         if ai_suggestion:
+            ai_suggestion_meta = ai_suggestion.get("meta") if isinstance(ai_suggestion.get("meta"), dict) else {}
+            st.caption(
+                f"source：{ai_suggestion_meta.get('source') or '-'} ｜ "
+                f"provider：{ai_suggestion_meta.get('provider') or '-'} ｜ "
+                f"model：{ai_suggestion_meta.get('model') or '-'}"
+            )
+            if ai_suggestion_meta.get("reason"):
+                st.caption(f"说明：{ai_suggestion_meta.get('reason')}")
             st.caption("AI 建议结果（JSON）")
             suggestion_text_default = json.dumps(ai_suggestion, ensure_ascii=False, indent=2)
             suggestion_text = st.text_area(
@@ -3401,27 +4689,66 @@ def _render_job_library() -> None:
         )
 
         reviewer_model_cols = st.columns(4)
+        reviewer_provider_options = get_ai_provider_options()
+        current_reviewer_provider = str(reviewer_cfg.get("provider", "openai") or "openai")
         reviewer_provider = reviewer_model_cols[0].selectbox(
             "provider（审核员）",
-            options=["openai", "azure_openai", "anthropic", "mock"],
-            index=["openai", "azure_openai", "anthropic", "mock"].index(reviewer_cfg.get("provider", "openai")) if reviewer_cfg.get("provider", "openai") in ["openai", "azure_openai", "anthropic", "mock"] else 0,
+            options=reviewer_provider_options,
+            index=reviewer_provider_options.index(current_reviewer_provider) if current_reviewer_provider in reviewer_provider_options else 0,
             key=f"joblib_ai_reviewer_provider_{selected_job}",
         )
-        reviewer_model = reviewer_model_cols[1].text_input(
-            "model（审核员）",
-            value=str(reviewer_cfg.get("model", "gpt-4o-mini") or "gpt-4o-mini"),
-            key=f"joblib_ai_reviewer_model_{selected_job}",
+        reviewer_runtime_prefix = f"joblib_ai_reviewer_runtime_{selected_job}"
+        _sync_ai_config_defaults(
+            reviewer_runtime_prefix,
+            reviewer_provider,
+            model_fallback=str(reviewer_cfg.get("model") or get_default_ai_model(reviewer_provider)),
         )
-        reviewer_api_base = reviewer_model_cols[2].text_input(
-            "api_base（可选）",
-            value=str(reviewer_cfg.get("api_base", "") or ""),
-            key=f"joblib_ai_reviewer_api_base_{selected_job}",
+        with reviewer_model_cols[1]:
+            reviewer_model = _render_ai_model_selector(
+                reviewer_runtime_prefix,
+                reviewer_provider,
+                str(reviewer_cfg.get("model") or get_default_ai_model(reviewer_provider)),
+                label="model（审核员）",
+            )
+        with reviewer_model_cols[2]:
+            reviewer_api_base = st.text_input(
+                "api_base（可选）",
+                value=st.session_state.get(
+                    f"{reviewer_runtime_prefix}_api_base",
+                    str(reviewer_cfg.get("api_base") or get_default_ai_api_base(reviewer_provider)),
+                ),
+                key=f"{reviewer_runtime_prefix}_api_base",
+            ).strip()
+        with reviewer_model_cols[3]:
+            reviewer_api_key_env_name = st.text_input(
+                "api_key_env_name（审核员）",
+                value=st.session_state.get(
+                    f"{reviewer_runtime_prefix}_api_key_env",
+                    str(reviewer_cfg.get("api_key_env_name") or get_default_ai_api_key_env_name(reviewer_provider)),
+                ),
+                key=f"{reviewer_runtime_prefix}_api_key_env",
+            ).strip()
+
+        _render_ai_runtime_hint(reviewer_provider, reviewer_api_base, reviewer_api_key_env_name)
+        _render_ai_runtime_warning(
+            reviewer_provider,
+            reviewer_api_base,
+            reviewer_api_key_env_name,
+            enabled=bool(enable_ai_reviewer),
+            feature_label="AI reviewer",
         )
-        reviewer_api_key_env_name = reviewer_model_cols[3].text_input(
-            "api_key_env_name（审核员）",
-            value=str(reviewer_cfg.get("api_key_env_name", "OPENAI_API_KEY") or "OPENAI_API_KEY"),
-            key=f"joblib_ai_reviewer_api_key_env_{selected_job}",
-        )
+        reviewer_test_key = f"joblib_ai_reviewer_connection_test_{selected_job}"
+        reviewer_runtime_cfg = {
+            "enable_ai_reviewer": bool(enable_ai_reviewer),
+            "ai_reviewer_mode": ai_reviewer_mode,
+            "provider": reviewer_provider,
+            "model": reviewer_model,
+            "api_base": reviewer_api_base,
+            "api_key_env_name": reviewer_api_key_env_name,
+        }
+        if st.button("测试 AI 连接（审核员）", key=f"joblib_ai_reviewer_test_btn_{selected_job}", use_container_width=True):
+            st.session_state[reviewer_test_key] = test_ai_connection(reviewer_runtime_cfg, purpose="ai_reviewer")
+        _render_ai_connection_result(st.session_state.get(reviewer_test_key))
 
         st.caption("AI 可操作范围")
         cap_cfg = reviewer_cfg.get("capabilities") or {}
@@ -3475,9 +4802,7 @@ def _render_job_library() -> None:
             key=f"joblib_ai_reviewer_allow_change_decision_{selected_job}",
         )
 
-        if enable_ai_reviewer and not os.getenv(reviewer_api_key_env_name or ""):
-            st.info("当前本地未启用 AI 审核员真实调用，建议部署到云服务器后配置 API 再启用。")
-
+        weights_valid = is_weight_total_valid(weight_values, tolerance=WEIGHT_SUM_TOLERANCE)
         st.session_state.joblib_draft_scoring_config = {
             "profile_name": selected_profile,
             "role_template": selected_profile,
@@ -3534,7 +4859,7 @@ def _render_job_library() -> None:
 
         action_cols = st.columns(5)
         with action_cols[0]:
-            if st.button("保存修改", use_container_width=True, key="joblib_update_btn"):
+            if st.button("保存修改", use_container_width=True, key="joblib_update_btn", disabled=not weights_valid):
                 try:
                     operator = _current_operator()
                     update_jd(
@@ -3556,7 +4881,7 @@ def _render_job_library() -> None:
                 except ValueError as err:
                     st.warning(str(err))
         with action_cols[1]:
-            if st.button("仅更新空缺人数", use_container_width=True, key="joblib_update_openings_btn"):
+            if st.button("仅更新空缺人数", use_container_width=True, key="joblib_update_openings_btn", disabled=not weights_valid):
                 try:
                     operator = _current_operator()
                     upsert_jd_openings(
@@ -3593,11 +4918,13 @@ def _render_job_library() -> None:
         with action_cols[3]:
             if st.button("进入批量初筛", use_container_width=True, key="joblib_use_v1_btn"):
                 _apply_jd_to_workspace(selected_job)
-                st.success("已定位到该岗位，可前往“批量初筛”继续操作。")
+                _request_page_navigation("批量初筛")
+                st.rerun()
         with action_cols[4]:
             if st.button("进入候选人工作台", use_container_width=True, key="joblib_use_v2_btn"):
                 _apply_jd_to_workspace(selected_job)
-                st.success("已定位到该岗位，可前往“候选人工作台”继续操作。")
+                _request_page_navigation("候选人工作台")
+                st.rerun()
 
         st.markdown("**历史批次（岗位级候选池）**")
         batch_history = list_candidate_batches_by_jd(selected_job)
@@ -3627,7 +4954,8 @@ def _render_job_library() -> None:
             )
             if st.button("打开该批次到候选人工作台", key="joblib_open_batch_btn", use_container_width=True):
                 _apply_batch_to_workspace(selected_job, batch_choice)
-                st.success("已设置工作台默认批次，请切换到“候选人工作台”查看。")
+                _request_page_navigation("候选人工作台")
+                st.rerun()
 
             batch_delete_cols = st.columns(2)
             with batch_delete_cols[0]:
@@ -3664,6 +4992,14 @@ def _render_job_library() -> None:
     st.markdown("**新建岗位**")
     new_title = st.text_input("岗位名称", placeholder="例如：AI 产品经理实习生（2026 春招）", key="joblib_new_title")
     new_openings = st.number_input("初始空缺人数", min_value=0, step=1, value=1, key="joblib_new_openings")
+    new_upload = st.file_uploader(
+        "上传 JD 文档（txt / pdf / docx）",
+        type=["txt", "pdf", "docx"],
+        key="joblib_new_jd_upload",
+        help="上传后会自动提取文本并填充到下方 JD 内容草稿。",
+    )
+    _handle_new_jd_upload(new_upload)
+    _render_jd_upload_feedback(st.session_state.get("joblib_new_jd_upload_meta"), context_label="新建岗位 JD ")
     new_text = st.text_area("JD 内容", height=180, key="joblib_new_text")
     if st.button("新建岗位", type="primary", key="joblib_create_btn"):
         try:
@@ -3686,6 +5022,9 @@ def _render_job_library() -> None:
         except ValueError as err:
             st.warning(str(err))
 
+    _render_admin_account_management()
+    _render_environment_health_panel()
+    _render_system_health_panel()
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -3892,72 +5231,121 @@ def _render_v1() -> None:
 
 
 def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> None:
-    """批量初筛执行器：仅负责批量解析与自动分流。"""
+    """批量初筛执行器：逐文件提取、评估并输出清晰反馈。"""
     operator = _current_operator()
     rows: list[dict] = []
     details: dict[str, dict] = {}
-    progress = st.progress(0)
     total = len(uploaded_files)
+
+    st.session_state.v2_rows = []
+    st.session_state.v2_details = {}
+    st.session_state.v2_current_batch_id = ""
+
+    progress = st.progress(0.0)
+    status_box = st.empty()
 
     failed_files: list[str] = []
     failed_reasons: list[str] = []
     weak_files: list[str] = []
-    ocr_files: list[str] = []
+    ocr_missing_files: list[str] = []
+    skipped_files: list[str] = []
+    skipped_reasons: list[str] = []
     parse_stat_counts = {"正常识别": 0, "弱质量识别": 0, "OCR能力缺失": 0, "读取失败": 0}
+    success_count = 0
 
-    for idx, file_obj in enumerate(uploaded_files):
+    for idx, file_obj in enumerate(uploaded_files, start=1):
+        file_name = str(getattr(file_obj, "name", "") or f"文件{idx}")
+        status_box.info(f"正在处理 {idx}/{total}：{file_name}")
+
         try:
             extract_result = load_resume_file(file_obj)
-            resume_text = extract_result.get("text", "")
-            method = extract_result.get("method", "text")
-            quality = extract_result.get("quality", "weak")
-            message = extract_result.get("message", "")
-            if method == "ocr":
-                ocr_files.append(file_obj.name)
-            if quality == "weak":
-                weak_files.append(file_obj.name)
-            parse_status = _resolve_parse_status(quality, message)
+            resume_text = str(extract_result.get("text") or "")
+            method = str(extract_result.get("method") or "text")
+            quality = str(extract_result.get("quality") or "weak")
+            message = str(extract_result.get("message") or "")
+            parse_status = _extract_parse_status(extract_result)
+            can_evaluate = _can_enter_batch_screening(extract_result)
+
+            if quality.lower() == "weak":
+                weak_files.append(file_name)
+            if parse_status == "OCR能力缺失":
+                ocr_missing_files.append(file_name)
             parse_stat_counts[parse_status] = parse_stat_counts.get(parse_status, 0) + 1
+
+            if not can_evaluate:
+                skipped_files.append(file_name)
+                skipped_reasons.append(f"{file_name}：{message or '该文件未进入稳定评估，建议跳过或人工处理。'}")
+                continue
+
+            result = _run_pipeline(jd_text, resume_text, jd_title=jd_title)
+            row = build_candidate_row(result, source_name=file_name, index=idx - 1)
+            row["提取方式"] = method
+            row["提取质量"] = quality
+            row["提取提示"] = "⚠ 建议人工检查提取文本" if quality.lower() == "weak" else ""
+            row["提取说明"] = message
+            row["解析状态"] = parse_status
+            row["解析标签"] = "⚠ OCR缺失" if parse_status == "OCR能力缺失" else ""
+            row["处理优先级"] = "普通"
+            row["审核摘要"] = _review_summary(
+                decision=row.get("初筛结论", ""),
+                risk_level=row.get("风险等级", "unknown"),
+                risk_summary=row.get("风险摘要", ""),
+            )
+            row["候选池"] = _candidate_pool_label(row.get("初筛结论", ""))
+
+            detail_payload = dict(result)
+            detail_payload["extract_info"] = {
+                "file_name": file_name,
+                "method": method,
+                "quality": quality,
+                "message": message,
+                "parse_status": parse_status,
+                "can_evaluate": bool(extract_result.get("can_evaluate", True)),
+                "should_skip": bool(extract_result.get("should_skip", False)),
+            }
+            detail_payload["raw_resume_text"] = resume_text
+            detail_payload["manual_priority"] = row.get("处理优先级", "普通")
+
+            review_record = _build_review_record(result, jd_title=jd_title or "批量初筛岗位", resume_file=file_name)
+            append_review(review_record)
+            detail_payload["review_id"] = review_record.get("review_id", "")
+
+            rows.append(row)
+            details[row["candidate_id"]] = detail_payload
+            success_count += 1
         except Exception as err:  # noqa: BLE001
-            failed_files.append(file_obj.name)
-            failed_reasons.append(f"{file_obj.name}：{_friendly_upload_error(err)}")
+            failed_files.append(file_name)
+            failed_reasons.append(f"{file_name}：{_friendly_upload_error(err)}")
             parse_stat_counts["读取失败"] += 1
-            progress.progress((idx + 1) / total)
-            continue
+        finally:
+            progress.progress(idx / total)
 
-        result = _run_pipeline(jd_text, resume_text, jd_title=jd_title)
-        row = build_candidate_row(result, source_name=file_obj.name, index=idx)
-        row["提取方式"] = method
-        row["提取质量"] = quality
-        row["提取提示"] = "⚠ 建议人工检查提取文本" if quality == "weak" else ""
-        row["提取说明"] = message
-        row["解析状态"] = parse_status
-        row["解析标签"] = "⚠ OCR缺失" if parse_status == "OCR能力缺失" else ""
-        row["处理优先级"] = "普通"
-        row["审核摘要"] = _review_summary(
-            decision=row.get("初筛结论", ""),
-            risk_level=row.get("风险等级", "unknown"),
-            risk_summary=row.get("风险摘要", ""),
-        )
-        row["候选池"] = _candidate_pool_label(row.get("初筛结论", ""))
-        rows.append(row)
+    summary_cols = st.columns(5)
+    summary_cols[0].metric("成功数", success_count)
+    summary_cols[1].metric("弱质量数", len(set(weak_files)))
+    summary_cols[2].metric("OCR 缺失数", len(set(ocr_missing_files)))
+    summary_cols[3].metric("读取失败数", len(failed_files))
+    summary_cols[4].metric("跳过数", len(skipped_files))
 
-        detail_payload = dict(result)
-        detail_payload["extract_info"] = {
-            "file_name": file_obj.name,
-            "method": method,
-            "quality": quality,
-            "message": message,
-            "parse_status": parse_status,
-        }
-        detail_payload["raw_resume_text"] = resume_text
-        detail_payload["manual_priority"] = row.get("处理优先级", "普通")
-        details[row["candidate_id"]] = detail_payload
+    st.caption(
+        f"执行汇总：正常识别 {parse_stat_counts.get('正常识别', 0)} ｜"
+        f"弱质量识别 {parse_stat_counts.get('弱质量识别', 0)} ｜"
+        f"OCR能力缺失 {parse_stat_counts.get('OCR能力缺失', 0)} ｜"
+        f"读取失败 {parse_stat_counts.get('读取失败', 0)}"
+    )
 
-        review_record = _build_review_record(result, jd_title=jd_title or "批量初筛岗位", resume_file=file_obj.name)
-        append_review(review_record)
-        details[row["candidate_id"]]["review_id"] = review_record.get("review_id", "")
-        progress.progress((idx + 1) / total)
+    if not rows:
+        status_box.warning("批量初筛已结束，但当前没有可进入稳定评估的文件。")
+        st.warning("当前批次没有可进入稳定评估的文件。txt/docx 和可提文本的 PDF 可继续；纯图片或扫描版 PDF 若 OCR 缺失，建议先补齐 OCR 环境或人工处理。")
+        if skipped_reasons:
+            st.markdown("**未进入稳定评估的文件**")
+            for reason in skipped_reasons:
+                st.caption(reason)
+        if failed_reasons:
+            st.markdown("**读取失败原因**")
+            for reason in failed_reasons:
+                st.caption(reason)
+        return
 
     st.session_state.v2_rows = rows
     st.session_state.v2_details = details
@@ -3973,23 +5361,21 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
     st.session_state.v2_current_batch_id = batch_id
     st.session_state.workspace_selected_jd_title = (jd_title or "").strip() or "未命名岗位"
 
-    st.success(f"批量初筛完成：已生成批次 {batch_id[:12]}…")
-    st.caption(
-        f"结果统计：正常识别 {parse_stat_counts.get('正常识别', 0)} ｜"
-        f"弱质量识别 {parse_stat_counts.get('弱质量识别', 0)} ｜"
-        f"OCR能力缺失 {parse_stat_counts.get('OCR能力缺失', 0)} ｜"
-        f"读取失败 {parse_stat_counts.get('读取失败', 0)}"
-    )
-    if ocr_files:
-        st.info(f"以下简历触发 OCR：{', '.join(ocr_files)}")
-    if parse_stat_counts.get('OCR能力缺失', 0) > 0:
-        st.warning("检测到 OCR 能力缺失导致的弱质量识别，建议补充文本或在部署环境安装 OCR 依赖后重新初筛。")
+    st.success(f"批量初筛完成：已生成批次 {batch_id[:12]}...")
+    if ocr_missing_files:
+        st.warning("检测到 OCR 能力缺失文件：这些文件里只有可提文本的部分被继续评估；纯扫描件/图片已明确跳过。")
+        st.caption("OCR 缺失文件：" + ", ".join(sorted(set(ocr_missing_files))))
     if weak_files:
-        st.warning(f"以下简历提取质量较弱，建议人工复核文本：{', '.join(weak_files)}")
+        st.warning(f"以下文件提取质量较弱，建议人工复核：{', '.join(sorted(set(weak_files)))}")
+    if skipped_files:
+        st.info(f"以下文件未进入稳定评估：{', '.join(skipped_files)}")
+        for reason in skipped_reasons:
+            st.caption(reason)
     if failed_files:
         st.warning(f"以下文件读取失败：{', '.join(failed_files)}")
         for reason in failed_reasons:
             st.caption(reason)
+    status_box.success("批量初筛执行完成。")
 
 
 def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]) -> None:
@@ -5109,13 +6495,7 @@ def _render_batch_screening() -> None:
     if "batch_jd_text_area" not in st.session_state:
         st.session_state.batch_jd_text_area = st.session_state.get("v2_jd_text_area") or st.session_state.get("jd_text", "")
 
-    current_jd = (st.session_state.get("batch_selected_jd_prev") or "").strip()
-    if not current_jd and jd_titles:
-        current_jd = jd_titles[0]
-        st.session_state.batch_selected_jd_prev = current_jd
-        st.session_state.batch_jd_text_area = load_jd(current_jd)
-        st.session_state.v2_jd_text_area = st.session_state.batch_jd_text_area
-        st.session_state.v2_selected_jd_prev = current_jd
+    current_jd = _sync_batch_screening_jd_context(jd_titles)
 
     if current_jd:
         latest = _latest_batch_snapshot(current_jd)
@@ -5136,12 +6516,11 @@ def _render_batch_screening() -> None:
             key="batch_saved_jd_select",
         )
         if selected_jd and selected_jd != st.session_state.batch_selected_jd_prev:
-            st.session_state.batch_selected_jd_prev = selected_jd
-            jd_text = load_jd(selected_jd)
-            st.session_state.batch_jd_text_area = jd_text
-            st.session_state.v2_jd_text_area = jd_text
-            st.session_state.v2_selected_jd_prev = selected_jd
+            _apply_jd_to_workspace(selected_jd)
             st.rerun()
+
+    ocr_caps = check_ocr_capabilities()
+    _render_batch_ocr_health_panel(ocr_caps)
 
     batch_jd_text = st.text_area("岗位 JD", height=180, key="batch_jd_text_area")
     uploaded_files = st.file_uploader(
@@ -5151,18 +6530,17 @@ def _render_batch_screening() -> None:
         key="batch_uploader",
     )
 
-    ocr_caps = check_ocr_capabilities()
     if uploaded_files:
         has_image = any(str(getattr(f, "name", "")).lower().endswith((".png", ".jpg", ".jpeg")) for f in uploaded_files)
         has_pdf = any(str(getattr(f, "name", "")).lower().endswith(".pdf") for f in uploaded_files)
         if has_image and not ocr_caps.get("image_ocr_available", False):
             missing = ", ".join((ocr_caps.get("missing_deps") or []) + (ocr_caps.get("missing_runtime") or []))
             suffix = f"（缺失：{missing}）" if missing else ""
-            st.warning(f"当前环境未启用图片 OCR{suffix}，图片简历可能无法稳定识别，建议改用 txt/docx 或在部署环境补齐 OCR。")
+            st.warning(f"当前环境未启用图片 OCR{suffix}，图片简历可能不可稳定识别。txt/docx 可继续，建议对图片文件先补齐 OCR 或人工处理。")
         if has_pdf and not ocr_caps.get("pdf_ocr_available", False):
             missing = ", ".join((ocr_caps.get("missing_deps") or []) + (ocr_caps.get("missing_runtime") or []))
             suffix = f"（缺失：{missing}）" if missing else ""
-            st.warning(f"当前环境未启用 PDF OCR fallback{suffix}，扫描版 PDF 可能无法稳定识别。")
+            st.warning(f"当前环境未启用 PDF OCR fallback{suffix}，可提文本的 PDF 仍可继续；扫描版 PDF 可能不可稳定识别。")
 
     st.markdown("**提取质量预检查**")
     st.caption("先检查每份简历的提取方式与提取质量，再执行初筛。")
@@ -5171,35 +6549,37 @@ def _render_batch_screening() -> None:
             st.warning("请先上传简历文件。")
         else:
             preview_rows: list[dict] = []
-            for file_obj in uploaded_files:
-                try:
-                    extract_result = load_resume_file(file_obj)
-                    preview_rows.append(
-                        {
-                            "文件名": file_obj.name,
-                            "提取方式": _extract_method_label(extract_result.get("method", "text")),
-                            "提取质量": _extract_quality_label(extract_result.get("quality", "weak")),
-                            "提取说明": extract_result.get("message", ""),
-                            "解析状态": _resolve_parse_status(
-                                extract_result.get("quality", "weak"),
-                                extract_result.get("message", ""),
-                            ),
-                        }
-                    )
-                except Exception as err:  # noqa: BLE001
-                    preview_rows.append(
-                        {
-                            "文件名": file_obj.name,
-                            "提取方式": "-",
-                            "提取质量": "较弱",
-                            "提取说明": _friendly_upload_error(err),
-                            "解析状态": "读取失败",
-                        }
-                    )
+            with st.spinner(f"正在检查 {len(uploaded_files)} 份简历的提取方式与提取质量..."):
+                for file_obj in uploaded_files:
+                    try:
+                        extract_result = load_resume_file(file_obj)
+                        preview_rows.append(_build_batch_preview_row(file_obj, extract_result))
+                    except Exception as err:  # noqa: BLE001
+                        preview_rows.append(
+                            {
+                                "文件名": file_obj.name,
+                                "提取方式": "-",
+                                "提取质量": "较弱",
+                                "提取说明": _friendly_upload_error(err),
+                                "解析状态": "读取失败",
+                                "是否可进入批量初筛": "否（读取失败）",
+                            }
+                        )
             st.session_state.batch_extract_preview = preview_rows
 
     preview_rows = st.session_state.get("batch_extract_preview", [])
     if preview_rows:
+        preview_success = sum(1 for row in preview_rows if str(row.get("是否可进入批量初筛") or "").startswith("是"))
+        preview_blocked = sum(1 for row in preview_rows if str(row.get("是否可进入批量初筛") or "").startswith("否"))
+        preview_weak = sum(1 for row in preview_rows if row.get("提取质量") == "较弱")
+        preview_ocr_missing = sum(1 for row in preview_rows if row.get("解析状态") == "OCR能力缺失")
+        preview_cols = st.columns(4)
+        preview_cols[0].metric("可进入初筛", preview_success)
+        preview_cols[1].metric("不建议进入", preview_blocked)
+        preview_cols[2].metric("弱质量识别", preview_weak)
+        preview_cols[3].metric("OCR 能力缺失", preview_ocr_missing)
+        if preview_blocked == len(preview_rows):
+            st.warning("当前上传文件均未通过稳定评估预检查。请优先改用 txt/docx、补齐 OCR 环境，或人工处理后再重试。")
         st.dataframe(preview_rows, use_container_width=True, hide_index=True)
 
     if st.button("开始批量初筛", type="primary", key="batch_run_btn"):
@@ -5209,7 +6589,8 @@ def _render_batch_screening() -> None:
             st.warning("请至少上传一份简历文件。")
         else:
             effective_jd_title = (st.session_state.get("batch_selected_jd_prev") or "").strip() or "未命名岗位"
-            _run_batch_screening(jd_title=effective_jd_title, jd_text=batch_jd_text, uploaded_files=uploaded_files)
+            with st.spinner(f"正在执行批量初筛，共 {len(uploaded_files)} 份文件..."):
+                _run_batch_screening(jd_title=effective_jd_title, jd_text=batch_jd_text, uploaded_files=uploaded_files)
 
     rows = st.session_state.get("v2_rows", [])
     if rows:
@@ -5330,14 +6711,17 @@ def _render_candidate_workspace() -> None:
 
     selected_batch_label = batch_labels[default_batch_index]
     selected_batch_id = batch_options.get(selected_batch_label, "")
-    st.session_state.workspace_preferred_batch_id = selected_batch_id
 
-    payload = load_candidate_batch(selected_batch_id)
+    payload = load_candidate_batch(selected_batch_id) if selected_batch_id else None
     if payload is None:
         payload = load_latest_batch_by_jd(selected_jd)
     if payload is None:
         st.info("未读取到可用候选池批次，请先在“批量初筛”生成结果。")
         return
+
+    selected_batch_id = str(payload.get("batch_id") or selected_batch_id or "").strip()
+    st.session_state.workspace_preferred_batch_id = selected_batch_id
+    st.session_state.v2_current_batch_id = selected_batch_id
 
     rows = payload.get("rows", [])
     details = payload.get("details", {})
@@ -5361,6 +6745,10 @@ def _render_candidate_workspace() -> None:
     if rows:
         _render_workspace_batch_overview(rows, details)
         _render_workspace_admin_lock_panel(selected_batch_id)
+
+    st.session_state.workspace_jd_switch = selected_jd
+    if selected_batch_label in batch_labels:
+        st.session_state.workspace_batch_switch = selected_batch_label
 
     with st.expander("切换岗位/批次", expanded=False):
         chosen_jd = st.selectbox("选择岗位候选池", options=jd_titles, index=default_jd_index, key="workspace_jd_switch")
@@ -5449,6 +6837,8 @@ if "v2_manual_review_status" not in st.session_state:
     st.session_state.v2_manual_review_status = {}
 if "active_page" not in st.session_state:
     st.session_state.active_page = "岗位配置页"
+if "active_page_nav" not in st.session_state:
+    st.session_state.active_page_nav = st.session_state.active_page
 if "joblib_selected_job" not in st.session_state:
     st.session_state.joblib_selected_job = ""
 if "joblib_draft_text" not in st.session_state:
@@ -5462,9 +6852,18 @@ pages = ["岗位配置页", "批量初筛", "候选人工作台"]
 pending_page = (st.session_state.get("pending_navigation_page") or "").strip()
 if pending_page in pages:
     st.session_state.active_page = pending_page
+pending_page_nav = (st.session_state.get("pending_navigation_page_nav") or "").strip()
+if pending_page_nav in pages:
+    st.session_state.active_page_nav = pending_page_nav
 st.session_state.pending_navigation_page = ""
+st.session_state.pending_navigation_page_nav = ""
 
-default_idx = pages.index(st.session_state.active_page) if st.session_state.active_page in pages else 0
+if st.session_state.active_page not in pages:
+    st.session_state.active_page = pages[0]
+if st.session_state.active_page_nav not in pages:
+    st.session_state.active_page_nav = st.session_state.active_page
+
+default_idx = pages.index(st.session_state.active_page_nav) if st.session_state.active_page_nav in pages else 0
 active_page_nav = st.sidebar.radio("页面导航", options=pages, index=default_idx, key="active_page_nav")
 st.session_state.active_page = active_page_nav
 

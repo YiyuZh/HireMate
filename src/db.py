@@ -736,13 +736,18 @@ def list_mysql_tables() -> list[str]:
     try:
         rows = conn.execute(
             """
-            SELECT table_name
+            SELECT table_name AS table_name
             FROM information_schema.tables
             WHERE table_schema = DATABASE()
             ORDER BY table_name ASC
             """
         ).fetchall()
-        return [str(row["table_name"]) for row in rows]
+        table_names: list[str] = []
+        for row in rows:
+            table_name = str(row.get("table_name") or row.get("TABLE_NAME") or "").strip()
+            if table_name:
+                table_names.append(table_name)
+        return table_names
     finally:
         conn.close()
 
