@@ -1,12 +1,16 @@
 .git
+.git/
 .gitignore
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.venv
 .venv/
 .streamlit/
 .env
+mysql-data
+mysql-data/
 data/hiremate.db
 data/hiremate.db-shm
 data/hiremate.db-wal

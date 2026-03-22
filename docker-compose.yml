@@ -1,4 +1,27 @@
 services:
+  mysql:
+    image: mysql:8.4
+    container_name: hiremate-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${HIREMATE_MYSQL_DATABASE:-hiremate}
+      MYSQL_USER: ${HIREMATE_MYSQL_USER:-hiremate}
+      MYSQL_PASSWORD: ${HIREMATE_MYSQL_PASSWORD:-hiremate_pwd}
+      MYSQL_ROOT_PASSWORD: ${HIREMATE_MYSQL_ROOT_PASSWORD:-hiremate_root_pwd}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - hiremate_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${HIREMATE_MYSQL_ROOT_PASSWORD:-hiremate_root_pwd}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   hiremate:
     build: .
     container_name: hiremate
@@ -6,10 +29,19 @@ services:
     volumes:
       - hiremate_data:/app/data
     environment:
-      HIREMATE_DB_PATH: /app/data/hiremate.db
+      HIREMATE_DB_BACKEND: mysql
+      HIREMATE_MYSQL_HOST: mysql
+      HIREMATE_MYSQL_PORT: 3306
+      HIREMATE_MYSQL_USER: ${HIREMATE_MYSQL_USER:-hiremate}
+      HIREMATE_MYSQL_PASSWORD: ${HIREMATE_MYSQL_PASSWORD:-hiremate_pwd}
+      HIREMATE_MYSQL_DATABASE: ${HIREMATE_MYSQL_DATABASE:-hiremate}
+      HIREMATE_MYSQL_CHARSET: utf8mb4
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       MODEL_NAME: ${MODEL_NAME:-gpt-4o-mini}
+    depends_on:
+      mysql:
+        condition: service_healthy
 
   caddy:
     image: caddy:2
@@ -17,6 +49,8 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+      - "443:443"
+      - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
@@ -26,5 +60,6 @@ services:
 
 volumes:
   hiremate_data:
+  hiremate_mysql_data:
   caddy_data:
   caddy_config:
