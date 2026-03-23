@@ -41,12 +41,83 @@ SKILL_KEYWORDS = [
 
 AWARD_KEYWORDS = ["奖学金", "一等奖", "二等奖", "三等奖", "竞赛", "获奖", "优秀毕业生"]
 LANGUAGE_KEYWORDS = ["英语", "CET-4", "CET-6", "雅思", "托福", "英文文档", "日语"]
+SECTION_TITLES = [
+    "教育背景",
+    "教育经历",
+    "实习经历",
+    "工作经历",
+    "项目经历",
+    "项目经验",
+    "专业技能",
+    "技能清单",
+    "技术栈",
+    "技能",
+    "校园经历",
+    "自我评价",
+    "个人简介",
+    "联系方式",
+    "Education",
+    "Experience",
+    "Internship",
+    "Project",
+    "Skills",
+]
+SPACED_TITLE_FIXUPS = [
+    (re.compile(r"教\s*育\s*背\s*景"), "教育背景"),
+    (re.compile(r"教\s*育\s*经\s*历"), "教育经历"),
+    (re.compile(r"实\s*习\s*经\s*历"), "实习经历"),
+    (re.compile(r"工\s*作\s*经\s*历"), "工作经历"),
+    (re.compile(r"项\s*目\s*经\s*历"), "项目经历"),
+    (re.compile(r"项\s*目\s*经\s*验"), "项目经验"),
+    (re.compile(r"专\s*业\s*技\s*能"), "专业技能"),
+    (re.compile(r"技\s*能\s*清\s*单"), "技能清单"),
+    (re.compile(r"技\s*术\s*栈"), "技术栈"),
+    (re.compile(r"校\s*园\s*经\s*历"), "校园经历"),
+    (re.compile(r"自\s*我\s*评\s*价"), "自我评价"),
+    (re.compile(r"个\s*人\s*简\s*介"), "个人简介"),
+    (re.compile(r"联\s*系\s*方\s*式"), "联系方式"),
+]
 
 
 def _clean_text(text: str) -> str:
     """统一换行与空白格式。"""
     normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     return re.sub(r"[\t ]+", " ", normalized).strip()
+
+
+def normalize_resume_ocr_text(text: str) -> str:
+    normalized = _clean_text(text)
+    normalized = normalized.replace("—", "-").replace("–", "-")
+    normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", normalized)
+    normalized = re.sub(r"((?:19|20)\d{2})\s*[./]\s*(\d{1,2})", r"\1.\2", normalized)
+    normalized = re.sub(r"((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月", r"\1年\2月", normalized)
+    normalized = re.sub(
+        r"((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月))\s*(?:-|~|—|–|至|到)\s*((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月)|至今)",
+        r"\1-\2",
+        normalized,
+    )
+    normalized = re.sub(r"\s*([，。；：！？])\s*", r"\1", normalized)
+    normalized = re.sub(r"\s*([,;:])\s*", r"\1 ", normalized)
+
+    for pattern, replacement in SPACED_TITLE_FIXUPS:
+        normalized = pattern.sub(replacement, normalized)
+
+    for title in SECTION_TITLES:
+        normalized = re.sub(
+            rf"\s*{re.escape(title)}\s*[:：]?\s*",
+            f"\n{title}\n",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+    normalized = re.sub(
+        r"(?<!\n)((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月)\s*(?:-|~|至|到)\s*(?:至今|(?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月)))",
+        r"\n\1\n",
+        normalized,
+    )
+    normalized = re.sub(r"([。；;])\s*", r"\1\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
 
 
 def _extract_first(text: str, patterns: list[str]) -> str:
@@ -255,7 +326,7 @@ def _fallback_extract_fragments(text: str, kind: str) -> list[dict[str, Any]]:
 
 def parse_resume(resume_text: str) -> dict[str, Any]:
     """解析简历文本，输出稳定结构。"""
-    text = _clean_text(resume_text)
+    text = normalize_resume_ocr_text(resume_text)
 
     # ===== 基础字段 =====
     name = _extract_first(

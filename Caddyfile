@@ -1,5 +1,57 @@
-# Public-IP HTTP reverse proxy for initial cloud deployment.
-:80 {
-    encode gzip
+{
+    email <CADDY_ACME_EMAIL>
+    servers {
+        protocols h1 h2 h3
+    }
+}
+
+(common_site) {
+    encode zstd gzip
+
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        X-Frame-Options SAMEORIGIN
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}
+
+(ai_backend_routes) {
+    @backend path /api/* /uploads/* /client/* /backoffice/*
+    handle @backend {
+        reverse_proxy ai-interview-app:8001
+    }
+}
+
+<PRIMARY_DOMAIN> {
+    import common_site
+    reverse_proxy portal-nginx:80
+}
+
+<HIREMATE_DOMAIN> {
+    import common_site
     reverse_proxy hiremate:8501
+}
+
+<INTERVIEW_DOMAIN> {
+    import common_site
+    import ai_backend_routes
+
+    handle {
+        reverse_proxy ai-interview-frontend:80
+    }
+}
+
+<ADMIN_DOMAIN> {
+    import common_site
+    import ai_backend_routes
+
+    handle {
+        reverse_proxy ai-interview-admin:80
+    }
+}
+
+<API_DOMAIN> {
+    import common_site
+    reverse_proxy ai-interview-app:8001
 }

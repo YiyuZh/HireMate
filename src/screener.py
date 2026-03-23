@@ -198,16 +198,21 @@ def build_evidence_bridge(score_details: dict[str, Any], evidence_snippets: list
             continue
 
         representative = detail.get("representative_evidence") if isinstance(detail.get("representative_evidence"), dict) else {}
-        rep_text = str(representative.get("text") or "").strip()
-        if not rep_text:
+        rep_display_text = str(representative.get("display_text") or representative.get("text") or "").strip()
+        rep_raw_text = str(representative.get("raw_text") or representative.get("raw") or rep_display_text).strip()
+        if not rep_display_text:
             continue
 
         entry = {
             "dimension": dimension,
             "score": int(detail.get("score", 1) or 1),
             "label": str(representative.get("label") or "代表证据"),
-            "text": rep_text,
-            "raw": str(representative.get("raw") or rep_text),
+            "display_text": rep_display_text,
+            "raw_text": rep_raw_text,
+            "text": rep_display_text,
+            "raw": rep_raw_text,
+            "tags": list(representative.get("tags") or []) if isinstance(representative.get("tags"), list) else [],
+            "is_low_readability": bool(representative.get("is_low_readability")),
             "linked_snippet_id": "",
             "linked_snippet_tag": "",
         }
@@ -215,7 +220,7 @@ def build_evidence_bridge(score_details: dict[str, Any], evidence_snippets: list
         best_match: dict[str, Any] | None = None
         best_score = 0
         for snippet in prepared_snippets:
-            candidate_score = _evidence_link_score(entry["text"], str(snippet.get("text") or ""))
+            candidate_score = _evidence_link_score(entry["display_text"], str(snippet.get("text") or ""))
             if candidate_score > best_score:
                 best_score = candidate_score
                 best_match = snippet

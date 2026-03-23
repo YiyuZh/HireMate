@@ -11,8 +11,6 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-    ports:
-      - "3306:3306"
     volumes:
       - hiremate_mysql_data:/var/lib/mysql
     healthcheck:
@@ -27,6 +25,8 @@ services:
     restart: unless-stopped
     volumes:
       - hiremate_data:/app/data
+    expose:
+      - "8501"
     environment:
       HIREMATE_DB_BACKEND: mysql
       HIREMATE_MYSQL_HOST: mysql
@@ -56,9 +56,21 @@ services:
       - caddy_config:/config
     depends_on:
       - hiremate
+    networks:
+      - default
+      - shared_gateway
 
 volumes:
   hiremate_data:
+    name: ${HIREMATE_DATA_VOLUME_NAME:-hiremate_hiremate_data}
   hiremate_mysql_data:
+    name: ${HIREMATE_MYSQL_VOLUME_NAME:-hiremate_hiremate_mysql_data}
   caddy_data:
+    name: ${HIREMATE_CADDY_DATA_VOLUME_NAME:-hiremate_caddy_data}
   caddy_config:
+    name: ${HIREMATE_CADDY_CONFIG_VOLUME_NAME:-hiremate_caddy_config}
+
+networks:
+  shared_gateway:
+    external: true
+    name: ${SHARED_CADDY_NETWORK:-shared_gateway}

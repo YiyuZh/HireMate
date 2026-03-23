@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 from hashlib import sha256
+import html
 import json
 import os
 import re
@@ -63,7 +64,7 @@ from src.role_profiles import (
     weight_total,
 )
 from src.resume_loader import check_ocr_capabilities, load_resume_file
-from src.resume_parser import parse_resume
+from src.resume_parser import normalize_resume_ocr_text, parse_resume
 from src.review_store import append_review, list_reviews, upsert_manual_review
 from src.risk_analyzer import analyze_risk
 from src.ai_reviewer import (
@@ -184,15 +185,47 @@ def _sync_detail_evidence_bridge(detail: dict) -> dict:
     return detail.get("evidence_bridge") if isinstance(detail.get("evidence_bridge"), dict) else {}
 
 
+def _normalize_representative_evidence(item: dict | None) -> dict:
+    payload = item if isinstance(item, dict) else {}
+    display_text = str(payload.get("display_text") or payload.get("text") or "").strip()
+    raw_text = str(payload.get("raw_text") or payload.get("raw") or display_text).strip()
+    label = str(payload.get("label") or "代表证据").strip() or "代表证据"
+    raw_tags = payload.get("tags")
+    tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()] if isinstance(raw_tags, list) else []
+    return {
+        "dimension": str(payload.get("dimension") or "").strip(),
+        "score": payload.get("score"),
+        "label": label,
+        "display_text": display_text,
+        "raw_text": raw_text,
+        "text": display_text,
+        "raw": raw_text,
+        "tags": tags,
+        "is_low_readability": bool(payload.get("is_low_readability")),
+        "linked_snippet_id": str(payload.get("linked_snippet_id") or "").strip(),
+    }
+
+
 def _remaining_dimension_evidence(detail: dict) -> list[str]:
     evidence = detail.get("evidence")
     if not isinstance(evidence, list):
         evidence = [str(evidence)] if evidence else []
-    representative = detail.get("representative_evidence") if isinstance(detail.get("representative_evidence"), dict) else {}
-    representative_raw = str(representative.get("raw") or "").strip()
+    representative = _normalize_representative_evidence(
+        detail.get("representative_evidence") if isinstance(detail.get("representative_evidence"), dict) else {}
+    )
+    representative_raw = str(representative.get("raw_text") or representative.get("display_text") or "").strip()
     if not representative_raw:
         return evidence
-    return [item for item in evidence if str(item or "").strip() != representative_raw]
+    representative_display = str(representative.get("display_text") or "").strip()
+    filtered: list[str] = []
+    for item in evidence:
+        candidate = str(item or "").strip()
+        if not candidate:
+            continue
+        if candidate == representative_raw or candidate == representative_display:
+            continue
+        filtered.append(candidate)
+    return filtered
 
 
 def _render_dimension_evidence_summary(score_details: dict, evidence_bridge: dict | None = None) -> None:
@@ -212,21 +245,32 @@ def _render_dimension_evidence_summary(score_details: dict, evidence_bridge: dic
         return
 
     for item in rows:
-        dim_name = str(item.get("dimension") or "其他")
-        score_value = str(item.get("score") or "-")
-        label = str(item.get("label") or "代表证据").strip()
-        text = str(item.get("text") or "").strip()
-        if not text:
+        representative = _normalize_representative_evidence(item if isinstance(item, dict) else {})
+        dim_name = str(representative.get("dimension") or "其他")
+        score_value = str(representative.get("score") or "-")
+        label = str(representative.get("label") or "代表证据").strip()
+        display_text = str(representative.get("display_text") or "").strip()
+        raw_text = str(representative.get("raw_text") or display_text).strip()
+        if not display_text:
             continue
-        chips = f"<span class='chip'>{_dimension_chip_label(dim_name)} {score_value}/5</span>"
+        chips = [f"<span class='chip'>{html.escape(_dimension_chip_label(dim_name))} {html.escape(score_value)}/5</span>"]
         if label:
-            chips += f"<span class='chip'>{label}</span>"
-        if str(item.get('linked_snippet_id') or '').strip():
-            chips += "<span class='chip'>摘要层已展示</span>"
+            chips.append(f"<span class='chip'>{html.escape(label)}</span>")
+        for tag in representative.get("tags", []):
+            chips.append(f"<span class='chip'>{html.escape(str(tag))}</span>")
+        if str(representative.get("linked_snippet_id") or "").strip():
+            chips.append("<span class='chip'>摘要层已展示</span>")
+        chip_row = "".join(chips)
+        safe_display_text = html.escape(display_text).replace("\n", "<br>")
         st.markdown(
-            f"<div class='module-box'>{chips}{text}</div>",
+            f"<div class='module-box'>{chip_row}<div>{safe_display_text}</div></div>",
             unsafe_allow_html=True,
         )
+        if bool(representative.get("is_low_readability")):
+            st.caption("原文识别质量较弱，建议结合原始提取信息复核。")
+        if raw_text and raw_text != display_text:
+            with st.expander(f"查看原文片段：{label}", expanded=False):
+                st.caption(raw_text)
 
 
 def _decision_summary(result_text: str) -> str:
@@ -287,6 +331,8 @@ def _extract_quality_label(quality: str) -> str:
 def _extract_notice(quality: str, message: str = "") -> str:
     if _is_ocr_missing_message(message):
         return "⚠️ 当前环境 OCR 能力缺失，建议改用 txt/docx，或在云上补齐 tesseract / poppler 后再试。"
+    if (quality or "").lower() == "weak" and "ocr" in str(message or "").lower():
+        return "⚠️ 当前 OCR 识别仍偏弱，清洗稿已尽量修复标题、时间与段落结构，但关键字段仍建议人工复核。"
     return "⚠️ 建议人工检查后再评估" if (quality or "").lower() == "weak" else ""
 
 
@@ -585,10 +631,14 @@ def _render_score_cards(score_details: dict) -> None:
                 st.markdown(f"**{dim}**")
                 st.metric("分数", f"{detail.get('score', '-')}/5")
                 st.caption(_business_reason(dim, detail))
-                representative = detail.get("representative_evidence") if isinstance(detail.get("representative_evidence"), dict) else {}
-                representative_text = str(representative.get("text") or "").strip()
+                representative = _normalize_representative_evidence(
+                    detail.get("representative_evidence") if isinstance(detail.get("representative_evidence"), dict) else {}
+                )
+                representative_text = str(representative.get("display_text") or "").strip()
                 if representative_text:
                     st.markdown(f"**代表证据：** {representative_text}")
+                if bool(representative.get("is_low_readability")):
+                    st.caption("原文识别质量较弱，建议结合原始提取信息复核。")
 
                 evidence = detail.get("evidence")
                 if evidence:
@@ -1509,6 +1559,95 @@ def _build_ai_review_metadata(detail: dict) -> dict:
     }
 
 
+def _generate_ai_review_for_batch_detail(
+    detail: dict,
+    *,
+    runtime_cfg: dict,
+    operator: dict[str, object] | None = None,
+) -> tuple[bool, str]:
+    payload = detail if isinstance(detail, dict) else {}
+    _apply_batch_ai_reviewer_runtime_to_detail(payload, runtime_cfg, jd_title=str((payload.get("parsed_jd") or {}).get("job_title") or ""))
+    _normalize_ai_review_state(payload)
+
+    parsed_jd = payload.get("parsed_jd") if isinstance(payload.get("parsed_jd"), dict) else {}
+    scoring_cfg = parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {}
+    effective_scoring_cfg = _build_runtime_ai_reviewer_scoring_config(
+        scoring_cfg,
+        runtime_cfg,
+        jd_title=str(parsed_jd.get("job_title") or ""),
+    )
+    ai_cfg = (
+        effective_scoring_cfg.get("ai_reviewer")
+        if isinstance(effective_scoring_cfg.get("ai_reviewer"), dict)
+        else {}
+    )
+    ai_mode = str(ai_cfg.get("ai_reviewer_mode") or "suggest_only")
+    ai_enabled = bool(ai_cfg.get("enable_ai_reviewer", False)) and ai_mode != "off"
+    if not ai_enabled:
+        payload["ai_review_suggestion"] = {}
+        payload["ai_review_status"] = "not_generated"
+        payload["ai_review_error"] = ""
+        payload["ai_generation_reason"] = ""
+        payload["ai_refresh_reason"] = ""
+        return False, ""
+
+    template_name = scoring_cfg.get("role_template") or scoring_cfg.get("profile_name")
+    role_profile = get_profile_by_name(template_name) if template_name else detect_role_profile(parsed_jd)
+    actor = operator if isinstance(operator, dict) else {}
+    actor_name = str(actor.get("name") or "Batch Auto")
+    actor_email = str(actor.get("email") or "")
+    generation_reason = "batch_auto_generate"
+    current_input_hash = _current_ai_input_hash(payload)
+    started_at = perf_counter()
+
+    try:
+        ai_suggestion = run_ai_reviewer(
+            parsed_jd=parsed_jd,
+            parsed_resume=payload.get("parsed_resume") if isinstance(payload.get("parsed_resume"), dict) else {},
+            role_profile=role_profile,
+            scoring_config=effective_scoring_cfg,
+            score_details=payload.get("score_details") if isinstance(payload.get("score_details"), dict) else {},
+            risk_result=payload.get("risk_result") if isinstance(payload.get("risk_result"), dict) else {},
+            screening_result=payload.get("screening_result") if isinstance(payload.get("screening_result"), dict) else {},
+            evidence_snippets=payload.get("evidence_snippets") if isinstance(payload.get("evidence_snippets"), list) else [],
+        )
+        elapsed_ms = max(0, int((perf_counter() - started_at) * 1000))
+        ai_suggestion = ai_suggestion if isinstance(ai_suggestion, dict) else {}
+        ai_meta = ai_suggestion.get("meta") if isinstance(ai_suggestion.get("meta"), dict) else {}
+        payload["ai_review_suggestion"] = ai_suggestion
+        payload["ai_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload["ai_generated_by_name"] = actor_name
+        payload["ai_generated_by_email"] = actor_email
+        payload["ai_review_error"] = ""
+        payload["ai_source"] = str(ai_meta.get("source") or "")
+        payload["ai_model"] = str(ai_meta.get("model") or ai_cfg.get("model") or "")
+        payload["ai_mode"] = str(ai_suggestion.get("mode") or ai_mode or "")
+        payload["ai_input_hash"] = current_input_hash
+        payload["ai_prompt_version"] = str(ai_meta.get("prompt_version") or get_ai_reviewer_prompt_version())
+        payload["ai_generated_latency_ms"] = int(ai_meta.get("generated_latency_ms") or elapsed_ms)
+        payload["ai_generation_reason"] = generation_reason
+        payload["ai_refresh_reason"] = ""
+        payload["ai_review_status"] = "ready"
+        _refresh_ai_review_freshness(payload)
+        return True, str(payload.get("ai_source") or "")
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = max(0, int((perf_counter() - started_at) * 1000))
+        payload["ai_review_suggestion"] = {}
+        payload["ai_review_status"] = "failed"
+        payload["ai_review_error"] = str(exc)
+        payload["ai_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload["ai_generated_by_name"] = actor_name
+        payload["ai_generated_by_email"] = actor_email
+        payload["ai_input_hash"] = current_input_hash
+        payload["ai_prompt_version"] = get_ai_reviewer_prompt_version()
+        payload["ai_generated_latency_ms"] = elapsed_ms
+        payload["ai_generation_reason"] = generation_reason
+        payload["ai_refresh_reason"] = ""
+        payload["ai_mode"] = ai_mode
+        payload["ai_model"] = str(payload.get("ai_model") or ai_cfg.get("model") or "")
+        return False, str(exc)
+
+
 def _generate_ai_review_for_candidate(
     rows: list[dict],
     details: dict[str, dict],
@@ -1525,13 +1664,24 @@ def _generate_ai_review_for_candidate(
     current_input_hash = _current_ai_input_hash(detail)
     parsed_jd = detail.get("parsed_jd") if isinstance(detail.get("parsed_jd"), dict) else {}
     scoring_cfg = parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {}
-    ai_cfg = scoring_cfg.get("ai_reviewer") if isinstance(scoring_cfg.get("ai_reviewer"), dict) else {}
+    runtime_cfg = _extract_batch_ai_reviewer_runtime_from_detail(detail)
+    effective_scoring_cfg = _build_runtime_ai_reviewer_scoring_config(
+        scoring_cfg,
+        runtime_cfg,
+        jd_title=str(parsed_jd.get("job_title") or ""),
+        batch_id=batch_id,
+    )
+    ai_cfg = (
+        effective_scoring_cfg.get("ai_reviewer")
+        if isinstance(effective_scoring_cfg.get("ai_reviewer"), dict)
+        else {}
+    )
     ai_mode = str(ai_cfg.get("ai_reviewer_mode") or "off")
     ai_enabled = bool(ai_cfg.get("enable_ai_reviewer", False)) and ai_mode != "off"
     if not ai_enabled:
         detail["ai_review_status"] = "not_generated"
         detail["ai_review_error"] = ""
-        return False, "当前岗位未启用 AI reviewer，无法生成 AI 审核建议。", "warning"
+        return False, "当前批次未启用 AI reviewer，无法生成 AI 审核建议。", "warning"
 
     ai_suggestion = detail.get("ai_review_suggestion") if isinstance(detail.get("ai_review_suggestion"), dict) else {}
     if (
@@ -1570,7 +1720,7 @@ def _generate_ai_review_for_candidate(
             parsed_jd=parsed_jd,
             parsed_resume=detail.get("parsed_resume") if isinstance(detail.get("parsed_resume"), dict) else {},
             role_profile=role_profile,
-            scoring_config=scoring_cfg,
+            scoring_config=effective_scoring_cfg,
             score_details=detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {},
             risk_result=detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {},
             screening_result=detail.get("screening_result") if isinstance(detail.get("screening_result"), dict) else {},
@@ -3598,14 +3748,19 @@ def _current_ai_environment_rows() -> list[dict[str, object]]:
         runtime_cfg = resolve_ai_runtime_config(cfg)
         env_name = str(runtime_cfg.get("api_key_env_name") or "")
         env_exists = bool(os.getenv(env_name, "").strip()) if env_name else False
+        api_key_mode = str(runtime_cfg.get("api_key_mode") or "env_name")
+        api_key_config = (
+            "当前使用直接输入 key 模式"
+            if api_key_mode == "direct_input"
+            else f"{env_name or '-'}（{'已检测到' if env_exists else '未检测到'}）"
+        )
         rows.append(
             {
                 "功能": feature_label,
                 "provider": str(runtime_cfg.get("provider") or "-"),
                 "model": str(runtime_cfg.get("model") or "-"),
                 "api_base": str(runtime_cfg.get("api_base") or "-") or "-",
-                "api_key_env_name": env_name or "-",
-                "env_exists": "已检测到" if env_exists else "未检测到",
+                "API Key 配置": api_key_config,
             }
         )
     return rows
@@ -3668,8 +3823,10 @@ def _render_environment_health_panel() -> None:
         st.markdown("**AI 环境**")
         st.dataframe(ai_rows, use_container_width=True, hide_index=True)
         if latest_ai:
+            api_key_mode = str(latest_ai.get("api_key_mode") or "env_name")
             env_name = str(latest_ai.get("api_key_env_name") or "-")
-            env_present = bool(latest_ai.get("api_key_present"))
+            env_present = bool(latest_ai.get("api_key_env_detected"))
+            key_present = bool(latest_ai.get("api_key_present"))
             source = str(latest_ai.get("source") or "")
             failure_reason = str(latest_ai.get("failure_reason") or "")
             latest_cols = st.columns(6)
@@ -3677,7 +3834,12 @@ def _render_environment_health_panel() -> None:
             latest_cols[1].metric("最近调用来源", _ai_source_label(source))
             latest_cols[2].metric("provider", str(latest_ai.get("provider") or "-"))
             latest_cols[3].metric("model", str(latest_ai.get("model") or "-"))
-            latest_cols[4].metric("env", "已检测到" if env_present else "未检测到")
+            latest_cols[4].metric(
+                "API Key",
+                "直接输入已填写" if api_key_mode == "direct_input" and key_present else
+                "直接输入未填写" if api_key_mode == "direct_input" else
+                f"{env_name}（{'已检测到' if env_present else '未检测到'}）",
+            )
             latest_cols[5].metric("api_base", str(latest_ai.get("api_base") or "-") or "-")
             st.caption(
                 f"对应 env：{env_name} ｜ 最近一次失败原因：{failure_reason or '-'}"
@@ -3836,14 +3998,15 @@ def _current_operator() -> dict[str, str | bool]:
 
 
 def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
+    normalized_resume_text = normalize_resume_ocr_text(resume_text)
     parsed_jd = parse_jd(jd_text)
     if jd_title:
         parsed_jd["scoring_config"] = load_jd_scoring_config(jd_title)
-    parsed_resume = parse_resume(resume_text)
+    parsed_resume = parse_resume(normalized_resume_text)
     score_details = score_candidate(parsed_jd, parsed_resume)
     score_values = to_score_values(score_details)
 
-    risk_result = analyze_risk(resume_data=parsed_resume, scores_input=score_details, resume_text=resume_text)
+    risk_result = analyze_risk(resume_data=parsed_resume, scores_input=score_details, resume_text=normalized_resume_text)
     screening_result = build_screening_decision(
         scores_input=score_details,
         risk_level=risk_result.get("risk_level"),
@@ -4180,7 +4343,7 @@ def _default_ai_rule_suggester_config() -> dict:
 def _default_ai_reviewer_config() -> dict:
     return {
         "enable_ai_reviewer": False,
-        "ai_reviewer_mode": "off",
+        "ai_reviewer_mode": "suggest_only",
         "provider": "openai",
         "model": "gpt-4o-mini",
         "api_base": "",
@@ -4198,6 +4361,297 @@ def _default_ai_reviewer_config() -> dict:
             "allow_direct_recommendation_change": False,
         },
     }
+
+
+def _default_batch_ai_reviewer_runtime_config() -> dict:
+    return {
+        "enable_ai_reviewer": False,
+        "ai_reviewer_mode": "suggest_only",
+        "provider": "openai",
+        "model": get_default_ai_model("openai"),
+        "api_base": get_default_ai_api_base("openai"),
+        "api_key_env_name": get_default_ai_api_key_env_name("openai"),
+        "auto_generate_for_new_batch": False,
+    }
+
+
+def _looks_like_api_key_input(value: str) -> bool:
+    clean = str(value or "").strip().lower()
+    if not clean:
+        return False
+    if clean.startswith(("sk-", "sk_proj_", "sk-proj-", "dsk_", "dsk-", "bearer ")):
+        return True
+    return len(clean) >= 24 and "-" in clean and "_" not in clean[:8]
+
+
+def _default_ai_key_mode_for_ui(provider: str, current_cfg: dict | None) -> str:
+    cfg = current_cfg if isinstance(current_cfg, dict) else {}
+    explicit_mode = str(cfg.get("api_key_mode") or "").strip().lower()
+    if explicit_mode in {"direct_input", "env_name"}:
+        return explicit_mode
+
+    if str(cfg.get("api_key_value") or "").strip():
+        return "direct_input"
+
+    configured_env = str(cfg.get("api_key_env_name") or "").strip()
+    default_env = get_default_ai_api_key_env_name(provider)
+    if configured_env and configured_env != default_env:
+        return "env_name"
+    return "direct_input"
+
+
+def _sanitize_ai_runtime_cfg_for_storage(ai_cfg: dict | None) -> dict:
+    payload = dict(ai_cfg or {})
+    payload.pop("api_key_value", None)
+    return payload
+
+
+def _remember_batch_ai_direct_key(batch_id: str, runtime_cfg: dict | None) -> None:
+    clean_batch_id = str(batch_id or "").strip()
+    cfg = dict(runtime_cfg or {})
+    direct_key = str(cfg.get("api_key_value") or "").strip()
+    mode = str(cfg.get("api_key_mode") or "").strip().lower()
+    secret_map = st.session_state.setdefault("batch_ai_reviewer_direct_key_by_batch_id", {})
+    if not clean_batch_id:
+        return
+    if mode == "direct_input" and direct_key:
+        secret_map[clean_batch_id] = direct_key
+    elif clean_batch_id in secret_map:
+        secret_map.pop(clean_batch_id, None)
+    st.session_state.batch_ai_reviewer_direct_key_by_batch_id = secret_map
+
+
+def _resolve_batch_ai_direct_key(batch_id: str) -> str:
+    clean_batch_id = str(batch_id or "").strip()
+    secret_map = st.session_state.get("batch_ai_reviewer_direct_key_by_batch_id", {})
+    if not isinstance(secret_map, dict) or not clean_batch_id:
+        return ""
+    return str(secret_map.get(clean_batch_id) or "").strip()
+
+
+def _jd_ai_reviewer_defaults_for_title(jd_title: str = "") -> dict:
+    clean_title = str(jd_title or "").strip()
+    if clean_title:
+        scoring_cfg = _normalize_scoring_config(load_jd_scoring_config(clean_title))
+        reviewer_cfg = scoring_cfg.get("ai_reviewer") if isinstance(scoring_cfg.get("ai_reviewer"), dict) else {}
+    else:
+        reviewer_cfg = {}
+
+    defaults = {
+        **_default_ai_reviewer_config(),
+        **(reviewer_cfg or {}),
+        "capabilities": {
+            **_default_ai_reviewer_config().get("capabilities", {}),
+            **((reviewer_cfg or {}).get("capabilities") or {}),
+        },
+        "score_adjustment_limit": {
+            **_default_ai_reviewer_config().get("score_adjustment_limit", {}),
+            **((reviewer_cfg or {}).get("score_adjustment_limit") or {}),
+        },
+    }
+    provider = str(defaults.get("provider") or "openai").strip().lower() or "openai"
+    return {
+        **defaults,
+        "enable_ai_reviewer": bool(defaults.get("enable_ai_reviewer", False)),
+        "ai_reviewer_mode": "suggest_only",
+        "provider": provider,
+        "model": str(defaults.get("model") or get_default_ai_model(provider)).strip() or get_default_ai_model(provider),
+        "api_base": str(defaults.get("api_base") or get_default_ai_api_base(provider)).strip(),
+        "api_key_mode": str(defaults.get("api_key_mode") or "env_name").strip().lower() or "env_name",
+        "api_key_env_name": str(
+            defaults.get("api_key_env_name") or get_default_ai_api_key_env_name(provider)
+        ).strip()
+        or get_default_ai_api_key_env_name(provider),
+    }
+
+
+def _normalize_batch_ai_reviewer_runtime_config(runtime_cfg: dict | None, *, jd_title: str = "") -> dict:
+    defaults = _default_batch_ai_reviewer_runtime_config()
+    jd_defaults = _jd_ai_reviewer_defaults_for_title(jd_title)
+    incoming = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    provider = (
+        str(incoming.get("provider") or jd_defaults.get("provider") or defaults.get("provider") or "openai")
+        .strip()
+        .lower()
+        or "openai"
+    )
+    return {
+        "enable_ai_reviewer": bool(
+            incoming.get("enable_ai_reviewer", jd_defaults.get("enable_ai_reviewer", defaults["enable_ai_reviewer"]))
+        ),
+        "ai_reviewer_mode": "suggest_only",
+        "provider": provider,
+        "model": str(incoming.get("model") or jd_defaults.get("model") or get_default_ai_model(provider)).strip()
+        or get_default_ai_model(provider),
+        "api_base": str(incoming.get("api_base") or jd_defaults.get("api_base") or get_default_ai_api_base(provider)).strip(),
+        "api_key_mode": str(incoming.get("api_key_mode") or jd_defaults.get("api_key_mode") or "env_name").strip().lower()
+        or "env_name",
+        "api_key_env_name": str(
+            incoming.get("api_key_env_name")
+            or jd_defaults.get("api_key_env_name")
+            or get_default_ai_api_key_env_name(provider)
+        ).strip()
+        or get_default_ai_api_key_env_name(provider),
+        "api_key_value": str(incoming.get("api_key_value") or ""),
+        "auto_generate_for_new_batch": bool(incoming.get("auto_generate_for_new_batch", False)),
+    }
+
+
+def _extract_batch_ai_reviewer_runtime_from_detail(detail: dict | None) -> dict:
+    payload = detail if isinstance(detail, dict) else {}
+    direct = payload.get("batch_ai_reviewer_runtime")
+    if isinstance(direct, dict):
+        return direct
+    metadata = payload.get("batch_metadata")
+    if isinstance(metadata, dict):
+        nested = metadata.get("ai_reviewer_runtime")
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _apply_batch_ai_reviewer_runtime_to_detail(detail: dict, runtime_cfg: dict | None, *, jd_title: str = "") -> dict:
+    payload = detail if isinstance(detail, dict) else {}
+    runtime = _normalize_batch_ai_reviewer_runtime_config(runtime_cfg, jd_title=jd_title)
+    safe_runtime = _sanitize_ai_runtime_cfg_for_storage(runtime)
+    parsed_jd = payload.get("parsed_jd") if isinstance(payload.get("parsed_jd"), dict) else {}
+    base_scoring_cfg = parsed_jd.get("scoring_config") if isinstance(parsed_jd.get("scoring_config"), dict) else {}
+    effective_scoring_cfg = _normalize_scoring_config(base_scoring_cfg)
+    reviewer_defaults = (
+        effective_scoring_cfg.get("ai_reviewer") if isinstance(effective_scoring_cfg.get("ai_reviewer"), dict) else {}
+    )
+    effective_scoring_cfg["ai_reviewer"] = {
+        **_default_ai_reviewer_config(),
+        **reviewer_defaults,
+        "enable_ai_reviewer": bool(runtime.get("enable_ai_reviewer", False)),
+        "ai_reviewer_mode": "suggest_only",
+        "provider": str(safe_runtime.get("provider") or reviewer_defaults.get("provider") or "openai"),
+        "model": str(safe_runtime.get("model") or reviewer_defaults.get("model") or ""),
+        "api_base": str(safe_runtime.get("api_base") or reviewer_defaults.get("api_base") or ""),
+        "api_key_mode": str(safe_runtime.get("api_key_mode") or reviewer_defaults.get("api_key_mode") or "env_name"),
+        "api_key_env_name": str(
+            safe_runtime.get("api_key_env_name") or reviewer_defaults.get("api_key_env_name") or ""
+        ),
+        "capabilities": {
+            **_default_ai_reviewer_config().get("capabilities", {}),
+            **(reviewer_defaults.get("capabilities") or {}),
+        },
+        "score_adjustment_limit": {
+            **_default_ai_reviewer_config().get("score_adjustment_limit", {}),
+            **(reviewer_defaults.get("score_adjustment_limit") or {}),
+        },
+    }
+    parsed_jd["scoring_config"] = effective_scoring_cfg
+    payload["parsed_jd"] = parsed_jd
+    metadata = payload.get("batch_metadata") if isinstance(payload.get("batch_metadata"), dict) else {}
+    metadata["ai_reviewer_runtime"] = dict(safe_runtime)
+    payload["batch_metadata"] = metadata
+    payload["batch_ai_reviewer_runtime"] = dict(safe_runtime)
+    _normalize_ai_review_state(payload)
+    return runtime
+
+
+def _build_runtime_ai_reviewer_scoring_config(
+    scoring_cfg: dict | None,
+    runtime_cfg: dict | None,
+    *,
+    jd_title: str = "",
+    batch_id: str = "",
+) -> dict:
+    effective_scoring_cfg = deepcopy(_normalize_scoring_config(scoring_cfg or {}))
+    reviewer_defaults = (
+        effective_scoring_cfg.get("ai_reviewer") if isinstance(effective_scoring_cfg.get("ai_reviewer"), dict) else {}
+    )
+    runtime = _normalize_batch_ai_reviewer_runtime_config(runtime_cfg, jd_title=jd_title)
+    direct_key = str(runtime.get("api_key_value") or "").strip()
+    if not direct_key and str(runtime.get("api_key_mode") or "").strip().lower() == "direct_input":
+        direct_key = _resolve_batch_ai_direct_key(batch_id)
+
+    effective_ai_cfg = {
+        **_default_ai_reviewer_config(),
+        **(reviewer_defaults or {}),
+        "enable_ai_reviewer": bool(runtime.get("enable_ai_reviewer", False)),
+        "ai_reviewer_mode": "suggest_only",
+        "provider": str(runtime.get("provider") or reviewer_defaults.get("provider") or "openai"),
+        "model": str(runtime.get("model") or reviewer_defaults.get("model") or ""),
+        "api_base": str(runtime.get("api_base") or reviewer_defaults.get("api_base") or ""),
+        "api_key_mode": str(runtime.get("api_key_mode") or reviewer_defaults.get("api_key_mode") or "env_name"),
+        "api_key_env_name": str(runtime.get("api_key_env_name") or reviewer_defaults.get("api_key_env_name") or ""),
+        "capabilities": {
+            **_default_ai_reviewer_config().get("capabilities", {}),
+            **((reviewer_defaults or {}).get("capabilities") or {}),
+        },
+        "score_adjustment_limit": {
+            **_default_ai_reviewer_config().get("score_adjustment_limit", {}),
+            **((reviewer_defaults or {}).get("score_adjustment_limit") or {}),
+        },
+    }
+    if direct_key:
+        effective_ai_cfg["api_key_value"] = direct_key
+    else:
+        effective_ai_cfg.pop("api_key_value", None)
+
+    effective_scoring_cfg["ai_reviewer"] = effective_ai_cfg
+    return effective_scoring_cfg
+
+
+def _sync_batch_ai_reviewer_widget_state(jd_title: str) -> None:
+    clean_title = str(jd_title or "").strip()
+    prev_title = str(st.session_state.get("batch_ai_reviewer_runtime_jd_prev") or "").strip()
+    if prev_title == clean_title:
+        return
+
+    runtime = _normalize_batch_ai_reviewer_runtime_config({}, jd_title=clean_title)
+    st.session_state.batch_ai_reviewer_enable = bool(runtime.get("enable_ai_reviewer", False))
+    st.session_state.batch_ai_reviewer_provider = str(runtime.get("provider") or "openai")
+    st.session_state.batch_ai_reviewer_auto_generate = bool(runtime.get("auto_generate_for_new_batch", False))
+    st.session_state.batch_ai_reviewer_runtime_api_key_mode = _default_ai_key_mode_for_ui(
+        str(runtime.get("provider") or "openai"),
+        runtime,
+    )
+    st.session_state.batch_ai_reviewer_runtime_model = str(runtime.get("model") or "")
+    st.session_state.batch_ai_reviewer_runtime_model_preset = str(runtime.get("model") or "")
+    st.session_state.batch_ai_reviewer_runtime_api_base = str(runtime.get("api_base") or "")
+    st.session_state.batch_ai_reviewer_runtime_api_key_env = str(runtime.get("api_key_env_name") or "")
+    st.session_state.batch_ai_reviewer_runtime_provider_prev = str(runtime.get("provider") or "openai")
+    st.session_state.batch_ai_reviewer_runtime_jd_prev = clean_title
+
+
+def _current_batch_ai_reviewer_runtime(jd_title: str) -> dict:
+    runtime_cfg = {
+        "enable_ai_reviewer": bool(st.session_state.get("batch_ai_reviewer_enable", False)),
+        "provider": str(st.session_state.get("batch_ai_reviewer_provider") or "openai"),
+        "model": str(st.session_state.get("batch_ai_reviewer_runtime_model") or ""),
+        "api_base": str(st.session_state.get("batch_ai_reviewer_runtime_api_base") or ""),
+        "api_key_mode": str(st.session_state.get("batch_ai_reviewer_runtime_api_key_mode") or "direct_input"),
+        "api_key_env_name": str(st.session_state.get("batch_ai_reviewer_runtime_api_key_env") or ""),
+        "api_key_value": str(st.session_state.get("batch_ai_reviewer_runtime_api_key_value") or ""),
+        "auto_generate_for_new_batch": bool(st.session_state.get("batch_ai_reviewer_auto_generate", False)),
+    }
+    return _normalize_batch_ai_reviewer_runtime_config(runtime_cfg, jd_title=jd_title)
+
+
+def _hydrate_batch_ai_reviewer_runtime(payload: dict | None, jd_title: str) -> dict:
+    batch_payload = payload if isinstance(payload, dict) else {}
+    details = batch_payload.get("details") if isinstance(batch_payload.get("details"), dict) else {}
+    stored_runtime = batch_payload.get("batch_ai_reviewer_runtime")
+    if not isinstance(stored_runtime, dict):
+        stored_runtime = {}
+    if not stored_runtime:
+        for detail in details.values():
+            stored_runtime = _extract_batch_ai_reviewer_runtime_from_detail(detail)
+            if stored_runtime:
+                break
+
+    runtime = _normalize_batch_ai_reviewer_runtime_config(stored_runtime, jd_title=jd_title)
+    batch_id = str(batch_payload.get("batch_id") or "").strip()
+    if str(runtime.get("api_key_mode") or "").strip().lower() == "direct_input":
+        runtime["api_key_value"] = _resolve_batch_ai_direct_key(batch_id)
+    batch_payload["batch_ai_reviewer_runtime"] = dict(runtime)
+    for detail in details.values():
+        if isinstance(detail, dict):
+            _apply_batch_ai_reviewer_runtime_to_detail(detail, runtime, jd_title=jd_title)
+    return runtime
 
 
 def _all_ai_preset_models() -> set[str]:
@@ -4261,15 +4715,94 @@ def _render_ai_model_selector(prefix: str, provider: str, current_model: str, *,
     ).strip()
 
 
-def _render_ai_runtime_hint(provider: str, api_base: str, api_key_env_name: str) -> None:
-    resolved_base = resolve_ai_api_base(provider, api_base)
-    resolved_env = resolve_ai_api_key_env_name(provider, api_key_env_name)
+def _render_ai_api_key_config_inputs(prefix: str, provider: str, current_cfg: dict | None) -> dict:
+    cfg = current_cfg if isinstance(current_cfg, dict) else {}
+    mode_key = f"{prefix}_api_key_mode"
+    direct_key_key = f"{prefix}_api_key_value"
+    env_key = f"{prefix}_api_key_env"
+
+    current_mode = str(st.session_state.get(mode_key) or "").strip().lower()
+    if current_mode not in {"direct_input", "env_name"}:
+        st.session_state[mode_key] = _default_ai_key_mode_for_ui(provider, cfg)
+
+    st.radio(
+        "API Key 配置方式",
+        options=["direct_input", "env_name"],
+        index=0 if str(st.session_state.get(mode_key) or "direct_input") == "direct_input" else 1,
+        format_func=lambda value: "直接输入 API Key（推荐）" if value == "direct_input" else "使用环境变量名（高级）",
+        horizontal=True,
+        key=mode_key,
+    )
+    st.caption("环境变量名示例：DEEPSEEK_API_KEY。不要在环境变量名输入框填写 sk-xxxx 这类真实 API key。")
+
+    mode = str(st.session_state.get(mode_key) or "direct_input").strip().lower()
+    direct_value = str(st.session_state.get(direct_key_key) or "")
+    env_default = str(
+        st.session_state.get(env_key)
+        or cfg.get("api_key_env_name")
+        or get_default_ai_api_key_env_name(provider)
+    ).strip() or get_default_ai_api_key_env_name(provider)
+
+    if mode == "direct_input":
+        direct_value = st.text_input(
+            "API Key（当前会话）",
+            value=direct_value,
+            key=direct_key_key,
+            type="password",
+            help="适合联调 / 测试；不会在页面明文显示。刷新后仍保留在当前会话内，但不会建议写成环境变量名。",
+        ).strip()
+        st.caption("当前使用直接输入 key 模式。适合联调 / 测试；离开当前会话后如需继续使用，请重新输入。")
+        env_name = env_default
+    else:
+        with st.expander("高级：环境变量名", expanded=True):
+            env_name = st.text_input(
+                "环境变量名",
+                value=env_default,
+                key=env_key,
+                help="例如 DEEPSEEK_API_KEY。不要在这里填写 sk-xxxx 这类真实 API key。",
+            ).strip()
+            st.caption("这里填写的是环境变量名，不是 API Key 本身。")
+            if _looks_like_api_key_input(env_name):
+                st.warning("这里应填写环境变量名，例如 DEEPSEEK_API_KEY，不要填写 sk-xxxx。")
+        direct_value = str(st.session_state.get(direct_key_key) or "").strip()
+
+    return {
+        "api_key_mode": mode,
+        "api_key_env_name": str(st.session_state.get(env_key) or env_default).strip() or get_default_ai_api_key_env_name(provider),
+        "api_key_value": direct_value,
+    }
+
+
+def _render_ai_runtime_hint(
+    provider: str,
+    api_base: str,
+    api_key_env_name: str,
+    *,
+    api_key_mode: str = "env_name",
+    api_key_value: str = "",
+) -> None:
+    runtime_cfg = resolve_ai_runtime_config(
+        {
+            "provider": provider,
+            "api_base": api_base,
+            "api_key_env_name": api_key_env_name,
+            "api_key_mode": api_key_mode,
+            "api_key_value": api_key_value,
+        }
+    )
+    resolved_base = str(runtime_cfg.get("api_base") or "")
+    resolved_env = str(runtime_cfg.get("api_key_env_name") or "")
     env_exists = bool(os.getenv(resolved_env or "", "").strip()) if resolved_env else False
+    direct_present = bool(str(runtime_cfg.get("api_key_value") or "").strip())
     base_required = provider_requires_explicit_api_base(provider)
     base_missing = base_required and not str(api_base or "").strip()
+    if str(runtime_cfg.get("api_key_mode") or "env_name") == "direct_input":
+        api_key_hint = f"API Key：当前使用直接输入 key 模式（{'已填写' if direct_present else '未填写'}）"
+    else:
+        api_key_hint = f"环境变量：{resolved_env or '-'} {'已检测到' if env_exists else '未检测到'}"
+
     st.caption(
-        f"当前 env 检测：{resolved_env or '-'} {'已检测到' if env_exists else '未检测到'} ｜ "
-        f"api_base：{resolved_base or '-'}{'（required）' if base_required else ''} ｜ "
+        f"{api_key_hint} ｜ api_base：{resolved_base or '-'}{'（required）' if base_required else ''} ｜ "
         f"api_base 状态：{'未填写' if base_missing else '已就绪'}"
     )
 
@@ -4279,15 +4812,27 @@ def _render_ai_runtime_warning(
     api_base: str,
     api_key_env_name: str,
     *,
+    api_key_mode: str = "env_name",
+    api_key_value: str = "",
     enabled: bool,
     feature_label: str,
 ) -> None:
     if not enabled:
         return
 
-    provider_norm = str(provider or "").strip().lower()
-    resolved_env = resolve_ai_api_key_env_name(provider_norm, api_key_env_name)
+    runtime_cfg = resolve_ai_runtime_config(
+        {
+            "provider": provider,
+            "api_base": api_base,
+            "api_key_env_name": api_key_env_name,
+            "api_key_mode": api_key_mode,
+            "api_key_value": api_key_value,
+        }
+    )
+    provider_norm = str(runtime_cfg.get("provider") or "").strip().lower()
+    resolved_env = str(runtime_cfg.get("api_key_env_name") or "")
     env_exists = bool(os.getenv(resolved_env or "", "").strip()) if resolved_env else False
+    direct_present = bool(str(runtime_cfg.get("api_key_value") or "").strip())
     base_missing = provider_requires_explicit_api_base(provider_norm) and not str(api_base or "").strip()
 
     if provider_norm == "mock":
@@ -4303,8 +4848,14 @@ def _render_ai_runtime_warning(
     if base_missing:
         st.info(f"当前 {feature_label} 需要填写 api_base；留空时不会发起真实请求，会 fallback 到 stub。")
 
-    if not env_exists:
-        st.info(f"当前未检测到 {feature_label} 对应的 API key env，运行时会 fallback 到 stub。")
+    if str(runtime_cfg.get("api_key_mode") or "env_name") == "direct_input":
+        if not direct_present:
+            st.info(f"当前 {feature_label} 使用直接输入 key 模式，但尚未输入 API Key；测试连接或真实调用会失败。")
+    else:
+        if _looks_like_api_key_input(resolved_env):
+            st.warning("环境变量名输入框里看起来填入了真实 API key。请改填例如 DEEPSEEK_API_KEY，或切换到“直接输入 API Key”模式。")
+        elif not env_exists:
+            st.info(f"当前未检测到 {feature_label} 对应的环境变量 {resolved_env or '-'}，运行时会 fallback 到 stub。")
 
 
 def _render_ai_connection_result(result: dict | None) -> None:
@@ -4314,14 +4865,18 @@ def _render_ai_connection_result(result: dict | None) -> None:
         st.success(f"测试 AI 连接成功：{result.get('reason') or '请求成功'}")
     else:
         st.warning(f"测试 AI 连接失败：{result.get('reason') or '请求失败'}")
+    api_key_mode = str(result.get("api_key_mode") or "env_name")
+    api_key_desc = (
+        f"直接输入 API Key（{'已填写' if bool(result.get('api_key_present')) else '未填写'}）"
+        if api_key_mode == "direct_input"
+        else f"环境变量名：{result.get('api_key_env_name') or '-'}（{'已检测到' if bool(result.get('api_key_env_detected')) else '未检测到'}）"
+    )
     st.json(
         {
             "provider": result.get("provider"),
             "model": result.get("model"),
             "api_base": result.get("api_base"),
-            "api_key_env_name": result.get("api_key_env_name"),
-            "api_key_env_detected": bool(result.get("api_key_present")),
-            "api_key_present": bool(result.get("api_key_present")),
+            "api_key_config": api_key_desc,
             "success": bool(result.get("success")),
             "reason": result.get("reason") or "",
             "request_id": result.get("request_id") or "",
@@ -4693,7 +5248,7 @@ def _render_job_library() -> None:
             provider,
             model_fallback=str(ai_rule_cfg.get("model") or get_default_ai_model(provider)),
         )
-        ai_cols2 = st.columns(3)
+        ai_cols2 = st.columns(2)
         with ai_cols2[0]:
             model_name = _render_ai_model_selector(
                 rule_runtime_prefix,
@@ -4710,21 +5265,21 @@ def _render_job_library() -> None:
                 ),
                 key=f"{rule_runtime_prefix}_api_base",
             ).strip()
-        with ai_cols2[2]:
-            api_key_env_name = st.text_input(
-                "api_key_env_name",
-                value=st.session_state.get(
-                    f"{rule_runtime_prefix}_api_key_env",
-                    str(ai_rule_cfg.get("api_key_env_name") or get_default_ai_api_key_env_name(provider)),
-                ),
-                key=f"{rule_runtime_prefix}_api_key_env",
-            ).strip()
+        key_cfg = _render_ai_api_key_config_inputs(rule_runtime_prefix, provider, ai_rule_cfg)
 
-        _render_ai_runtime_hint(provider, api_base, api_key_env_name)
+        _render_ai_runtime_hint(
+            provider,
+            api_base,
+            str(key_cfg.get("api_key_env_name") or ""),
+            api_key_mode=str(key_cfg.get("api_key_mode") or "direct_input"),
+            api_key_value=str(key_cfg.get("api_key_value") or ""),
+        )
         _render_ai_runtime_warning(
             provider,
             api_base,
-            api_key_env_name,
+            str(key_cfg.get("api_key_env_name") or ""),
+            api_key_mode=str(key_cfg.get("api_key_mode") or "direct_input"),
+            api_key_value=str(key_cfg.get("api_key_value") or ""),
             enabled=bool(enable_ai_rule_suggester),
             feature_label="AI 评分细则建议",
         )
@@ -4733,7 +5288,7 @@ def _render_job_library() -> None:
             "provider": provider,
             "model": model_name,
             "api_base": api_base,
-            "api_key_env_name": api_key_env_name,
+            **key_cfg,
         }
         rule_connection_key = f"joblib_ai_rule_connection_test_{selected_job}"
         rule_action_cols = st.columns(2)
@@ -4788,8 +5343,8 @@ def _render_job_library() -> None:
                 except (json.JSONDecodeError, TypeError, ValueError):
                     st.warning("AI 建议 JSON 解析失败，请检查格式后重试。")
 
-        st.markdown("**AI 审核员设置区（预留接口）**")
-        st.caption("用于候选人评分后的二次审阅；本地阶段优先做配置预留，不强制调用真实 API。")
+        st.markdown("**AI reviewer 默认配置**")
+        st.caption("JD 页面只保留 reviewer 的默认 provider / model / 能力开关；批次运行期开关和 API 配置请到“批量初筛”页面设置。")
         reviewer_cfg = {
             **_default_ai_reviewer_config(),
             **(scoring_cfg.get("ai_reviewer") or {}),
@@ -4803,83 +5358,31 @@ def _render_job_library() -> None:
             },
         }
 
-        reviewer_top_cols = st.columns(2)
-        enable_ai_reviewer = reviewer_top_cols[0].toggle(
-            "启用 AI 审核员",
-            value=bool(reviewer_cfg.get("enable_ai_reviewer", False)),
-            key=f"joblib_ai_reviewer_enable_{selected_job}",
-        )
-        ai_reviewer_mode = reviewer_top_cols[1].selectbox(
-            "ai_reviewer_mode",
-            options=["off", "suggest_only", "bounded_override", "human_approve"],
-            index=["off", "suggest_only", "bounded_override", "human_approve"].index(reviewer_cfg.get("ai_reviewer_mode", "off")) if reviewer_cfg.get("ai_reviewer_mode", "off") in ["off", "suggest_only", "bounded_override", "human_approve"] else 0,
-            key=f"joblib_ai_reviewer_mode_{selected_job}",
-            help="off=关闭；suggest_only=仅建议；bounded_override=受限自动修正；human_approve=需人工确认后生效",
-        )
-
-        reviewer_model_cols = st.columns(4)
+        st.info("AI reviewer 的运行期开关、API 配置和“新批次自动生成 AI 建议”已移到“批量初筛”页面。候选人工作台会继承批次设置。")
+        reviewer_default_cols = st.columns(2)
         reviewer_provider_options = get_ai_provider_options()
         current_reviewer_provider = str(reviewer_cfg.get("provider", "openai") or "openai")
-        reviewer_provider = reviewer_model_cols[0].selectbox(
-            "provider（审核员）",
+        reviewer_provider = reviewer_default_cols[0].selectbox(
+            "默认 provider（审核员）",
             options=reviewer_provider_options,
             index=reviewer_provider_options.index(current_reviewer_provider) if current_reviewer_provider in reviewer_provider_options else 0,
             key=f"joblib_ai_reviewer_provider_{selected_job}",
         )
-        reviewer_runtime_prefix = f"joblib_ai_reviewer_runtime_{selected_job}"
+        reviewer_default_prefix = f"joblib_ai_reviewer_default_{selected_job}"
         _sync_ai_config_defaults(
-            reviewer_runtime_prefix,
+            reviewer_default_prefix,
             reviewer_provider,
             model_fallback=str(reviewer_cfg.get("model") or get_default_ai_model(reviewer_provider)),
         )
-        with reviewer_model_cols[1]:
+        with reviewer_default_cols[1]:
             reviewer_model = _render_ai_model_selector(
-                reviewer_runtime_prefix,
+                reviewer_default_prefix,
                 reviewer_provider,
                 str(reviewer_cfg.get("model") or get_default_ai_model(reviewer_provider)),
-                label="model（审核员）",
+                label="默认 model（审核员）",
             )
-        with reviewer_model_cols[2]:
-            reviewer_api_base = st.text_input(
-                "api_base（可选）",
-                value=st.session_state.get(
-                    f"{reviewer_runtime_prefix}_api_base",
-                    str(reviewer_cfg.get("api_base") or get_default_ai_api_base(reviewer_provider)),
-                ),
-                key=f"{reviewer_runtime_prefix}_api_base",
-            ).strip()
-        with reviewer_model_cols[3]:
-            reviewer_api_key_env_name = st.text_input(
-                "api_key_env_name（审核员）",
-                value=st.session_state.get(
-                    f"{reviewer_runtime_prefix}_api_key_env",
-                    str(reviewer_cfg.get("api_key_env_name") or get_default_ai_api_key_env_name(reviewer_provider)),
-                ),
-                key=f"{reviewer_runtime_prefix}_api_key_env",
-            ).strip()
 
-        _render_ai_runtime_hint(reviewer_provider, reviewer_api_base, reviewer_api_key_env_name)
-        _render_ai_runtime_warning(
-            reviewer_provider,
-            reviewer_api_base,
-            reviewer_api_key_env_name,
-            enabled=bool(enable_ai_reviewer),
-            feature_label="AI reviewer",
-        )
-        reviewer_test_key = f"joblib_ai_reviewer_connection_test_{selected_job}"
-        reviewer_runtime_cfg = {
-            "enable_ai_reviewer": bool(enable_ai_reviewer),
-            "ai_reviewer_mode": ai_reviewer_mode,
-            "provider": reviewer_provider,
-            "model": reviewer_model,
-            "api_base": reviewer_api_base,
-            "api_key_env_name": reviewer_api_key_env_name,
-        }
-        if st.button("测试 AI 连接（审核员）", key=f"joblib_ai_reviewer_test_btn_{selected_job}", use_container_width=True):
-            st.session_state[reviewer_test_key] = test_ai_connection(reviewer_runtime_cfg, purpose="ai_reviewer")
-        _render_ai_connection_result(st.session_state.get(reviewer_test_key))
-
-        st.caption("AI 可操作范围")
+        st.caption("AI 可操作范围（默认建议层）")
         cap_cfg = reviewer_cfg.get("capabilities") or {}
         cap_cols = st.columns(3)
         add_evidence_snippets = cap_cols[0].checkbox(
@@ -4931,6 +5434,13 @@ def _render_job_library() -> None:
             key=f"joblib_ai_reviewer_allow_change_decision_{selected_job}",
         )
 
+        reviewer_api_base = str(reviewer_cfg.get("api_base") or get_default_ai_api_base(reviewer_provider)).strip()
+        reviewer_api_key_env_name = str(
+            reviewer_cfg.get("api_key_env_name") or get_default_ai_api_key_env_name(reviewer_provider)
+        ).strip() or get_default_ai_api_key_env_name(reviewer_provider)
+        enable_ai_reviewer = bool(reviewer_cfg.get("enable_ai_reviewer", False))
+        ai_reviewer_mode = "suggest_only"
+
         weights_valid = is_weight_total_valid(weight_values, tolerance=WEIGHT_SUM_TOLERANCE)
         st.session_state.joblib_draft_scoring_config = {
             "profile_name": selected_profile,
@@ -4954,11 +5464,8 @@ def _render_job_library() -> None:
             "hard_thresholds": hard_cfg,
             "risk_focus": scoring_cfg.get("risk_focus") if isinstance(scoring_cfg.get("risk_focus"), list) else [],
             "ai_rule_suggester": {
-                "enable_ai_rule_suggester": bool(enable_ai_rule_suggester),
-                "provider": provider,
-                "model": model_name,
-                "api_base": api_base,
-                "api_key_env_name": api_key_env_name,
+                **_default_ai_rule_suggester_config(),
+                **_sanitize_ai_runtime_cfg_for_storage(rule_runtime_cfg),
             },
             "ai_reviewer": {
                 "enable_ai_reviewer": bool(enable_ai_reviewer),
@@ -5369,12 +5876,19 @@ def _render_v1() -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> None:
+def _run_batch_screening(
+    jd_title: str,
+    jd_text: str,
+    uploaded_files: list,
+    *,
+    batch_ai_runtime_cfg: dict | None = None,
+) -> None:
     """批量初筛执行器：逐文件提取、评估并输出清晰反馈。"""
     operator = _current_operator()
     rows: list[dict] = []
     details: dict[str, dict] = {}
     total = len(uploaded_files)
+    batch_ai_runtime = _normalize_batch_ai_reviewer_runtime_config(batch_ai_runtime_cfg, jd_title=jd_title)
 
     st.session_state.v2_rows = []
     st.session_state.v2_details = {}
@@ -5389,6 +5903,8 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
     ocr_missing_files: list[str] = []
     skipped_files: list[str] = []
     skipped_reasons: list[str] = []
+    ai_auto_generated_files: list[str] = []
+    ai_auto_failed_files: list[str] = []
     parse_stat_counts = {"正常识别": 0, "弱质量识别": 0, "OCR能力缺失": 0, "读取失败": 0}
     success_count = 0
 
@@ -5399,6 +5915,10 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
         try:
             extract_result = load_resume_file(file_obj)
             resume_text = str(extract_result.get("text") or "")
+            raw_resume_text = str(extract_result.get("raw_ocr_text") or resume_text)
+            normalized_resume_text = str(
+                extract_result.get("normalized_ocr_text") or normalize_resume_ocr_text(resume_text)
+            )
             method = str(extract_result.get("method") or "text")
             quality = str(extract_result.get("quality") or "weak")
             message = str(extract_result.get("message") or "")
@@ -5416,11 +5936,15 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
                 skipped_reasons.append(f"{file_name}：{message or '该文件未进入稳定评估，建议跳过或人工处理。'}")
                 continue
 
-            result = _run_pipeline(jd_text, resume_text, jd_title=jd_title)
+            result = _run_pipeline(jd_text, normalized_resume_text, jd_title=jd_title)
             row = build_candidate_row(result, source_name=file_name, index=idx - 1)
             row["提取方式"] = method
             row["提取质量"] = quality
-            row["提取提示"] = "⚠ 建议人工检查提取文本" if quality.lower() == "weak" else ""
+            row["提取提示"] = (
+                "⚠ 当前 OCR 识别仍偏弱，建议人工复核"
+                if quality.lower() == "weak" and method.lower() == "ocr"
+                else "⚠ 建议人工检查提取文本" if quality.lower() == "weak" else ""
+            )
             row["提取说明"] = message
             row["解析状态"] = parse_status
             row["解析标签"] = "⚠ OCR缺失" if parse_status == "OCR能力缺失" else ""
@@ -5433,6 +5957,7 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
             row["候选池"] = _candidate_pool_label(row.get("初筛结论", ""))
 
             detail_payload = dict(result)
+            _apply_batch_ai_reviewer_runtime_to_detail(detail_payload, batch_ai_runtime, jd_title=jd_title)
             detail_payload["extract_info"] = {
                 "file_name": file_name,
                 "method": method,
@@ -5442,12 +5967,24 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
                 "can_evaluate": bool(extract_result.get("can_evaluate", True)),
                 "should_skip": bool(extract_result.get("should_skip", False)),
             }
-            detail_payload["raw_resume_text"] = resume_text
+            detail_payload["raw_resume_text"] = raw_resume_text
+            detail_payload["normalized_resume_text"] = normalized_resume_text
             detail_payload["manual_priority"] = row.get("处理优先级", "普通")
 
             review_record = _build_review_record(result, jd_title=jd_title or "批量初筛岗位", resume_file=file_name)
             append_review(review_record)
             detail_payload["review_id"] = review_record.get("review_id", "")
+
+            if batch_ai_runtime.get("enable_ai_reviewer") and batch_ai_runtime.get("auto_generate_for_new_batch"):
+                generated, ai_note = _generate_ai_review_for_batch_detail(
+                    detail_payload,
+                    runtime_cfg=batch_ai_runtime,
+                    operator=operator,
+                )
+                if generated:
+                    ai_auto_generated_files.append(file_name)
+                elif ai_note:
+                    ai_auto_failed_files.append(f"{file_name}：{ai_note}")
 
             rows.append(row)
             details[row["candidate_id"]] = detail_payload
@@ -5488,6 +6025,7 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
 
     st.session_state.v2_rows = rows
     st.session_state.v2_details = details
+    st.session_state.v2_batch_ai_reviewer_runtime = dict(batch_ai_runtime)
 
     batch_id = save_candidate_batch(
         jd_title=jd_title,
@@ -5497,6 +6035,7 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
         created_by_name=operator["name"],
         created_by_email=operator["email"],
     )
+    _remember_batch_ai_direct_key(batch_id, batch_ai_runtime)
     st.session_state.v2_current_batch_id = batch_id
     st.session_state.workspace_selected_jd_title = (jd_title or "").strip() or "未命名岗位"
 
@@ -5514,6 +6053,13 @@ def _run_batch_screening(jd_title: str, jd_text: str, uploaded_files: list) -> N
         st.warning(f"以下文件读取失败：{', '.join(failed_files)}")
         for reason in failed_reasons:
             st.caption(reason)
+    if batch_ai_runtime.get("enable_ai_reviewer") and batch_ai_runtime.get("auto_generate_for_new_batch"):
+        if ai_auto_generated_files:
+            st.info(f"已对 {len(ai_auto_generated_files)} 份简历自动生成 AI reviewer 建议。")
+        if ai_auto_failed_files:
+            st.warning("部分简历的 AI reviewer 自动生成失败，可在候选人工作台内手动刷新。")
+            for reason in ai_auto_failed_files:
+                st.caption(reason)
     status_box.success("批量初筛执行完成。")
 
 
@@ -6035,14 +6581,16 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
                 reason = dim_detail.get("reason") or ""
                 if reason:
                     st.caption(f"说明：{reason}")
-                representative = (
+                representative = _normalize_representative_evidence(
                     dim_detail.get("representative_evidence")
                     if isinstance(dim_detail.get("representative_evidence"), dict)
                     else {}
                 )
-                representative_text = str(representative.get("text") or "").strip()
+                representative_text = str(representative.get("display_text") or "").strip()
                 if representative_text:
                     st.caption(f"代表证据：{representative_text}")
+                if bool(representative.get("is_low_readability")):
+                    st.caption("原文识别质量较弱，建议结合原始提取信息复核。")
                 evidences = _remaining_dimension_evidence(dim_detail)
                 if evidences:
                     st.markdown("证据说明：")
@@ -6057,18 +6605,33 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             st.caption(f"提取质量：{_extract_quality_label(quality_raw)}")
             st.caption(f"提取说明：{extract_info.get('message') or '无'}")
             if (quality_raw or "").lower() == "weak":
-                st.warning("⚠ 提取质量较弱，建议核对原文")
-            raw_text = (detail.get("raw_resume_text") or "").strip()
-            if raw_text:
+                if str(method_raw or "").lower() == "ocr":
+                    st.warning("⚠ 当前 OCR 识别仍偏弱，清洗稿已尽量修复标题、时间与段落结构，但关键字段仍建议人工复核。")
+                else:
+                    st.warning("⚠ 提取质量较弱，建议结合原文人工复核。")
+            normalized_text = str(detail.get("normalized_resume_text") or detail.get("raw_resume_text") or "").strip()
+            raw_text = str(detail.get("raw_resume_text") or "").strip()
+            if normalized_text:
                 st.text_area(
-                    "提取文本",
-                    value=raw_text,
+                    "解析前清洗稿",
+                    value=normalized_text,
                     height=220,
                     disabled=True,
-                    key=f"raw_text_preview_{cand_id}",
+                    key=f"normalized_text_preview_{cand_id}",
                 )
             else:
-                st.caption("当前批次未保存原始提取文本。")
+                st.caption("当前批次未保存解析前清洗稿。")
+            if raw_text:
+                with st.expander("查看提取原文", expanded=False):
+                    st.text_area(
+                        "提取原文",
+                        value=raw_text,
+                        height=220,
+                        disabled=True,
+                        key=f"raw_text_preview_{cand_id}",
+                    )
+            else:
+                st.caption("当前批次未保存提取原文。")
 
         review_id = detail.get("review_id", "")
         review_notes = st.session_state.get("v2_manual_review_notes", {})
@@ -6299,7 +6862,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         )
 
         if not ai_enabled:
-            st.caption("当前岗位未启用 AI reviewer。")
+            st.caption("当前批次未启用 AI reviewer。")
             return
 
         st.caption("AI 建议默认不生效，需人工点击应用。")
@@ -6673,6 +7236,96 @@ def _render_batch_screening() -> None:
 
     _apply_pending_batch_jd_text_area()
 
+    _sync_batch_ai_reviewer_widget_state(current_jd)
+    st.markdown("<div class='module-box'>", unsafe_allow_html=True)
+    st.markdown("**本批次 AI reviewer 设置**")
+    st.caption("AI reviewer 仍然只作为建议层，不会直接替代人工“通过 / 待复核 / 淘汰”操作。当前批次创建后，候选人工作台会继承这里的运行配置。")
+
+    batch_ai_enable_cols = st.columns(2)
+    batch_ai_enable = batch_ai_enable_cols[0].toggle(
+        "启用 AI reviewer",
+        value=bool(st.session_state.get("batch_ai_reviewer_enable", False)),
+        key="batch_ai_reviewer_enable",
+    )
+    batch_ai_auto_generate = batch_ai_enable_cols[1].checkbox(
+        "对新批次自动生成 AI 建议",
+        value=bool(st.session_state.get("batch_ai_reviewer_auto_generate", False)),
+        key="batch_ai_reviewer_auto_generate",
+    )
+    st.session_state.batch_ai_reviewer_enable = bool(batch_ai_enable)
+    st.session_state.batch_ai_reviewer_auto_generate = bool(batch_ai_auto_generate)
+
+    batch_ai_provider_options = get_ai_provider_options()
+    current_batch_ai_provider = str(st.session_state.get("batch_ai_reviewer_provider") or "openai")
+    batch_ai_cols = st.columns(4)
+    batch_ai_provider = batch_ai_cols[0].selectbox(
+        "provider（本批次）",
+        options=batch_ai_provider_options,
+        index=batch_ai_provider_options.index(current_batch_ai_provider) if current_batch_ai_provider in batch_ai_provider_options else 0,
+        key="batch_ai_reviewer_provider",
+    )
+    batch_ai_runtime_prefix = "batch_ai_reviewer_runtime"
+    _sync_ai_config_defaults(
+        batch_ai_runtime_prefix,
+        batch_ai_provider,
+        model_fallback=str(st.session_state.get(f"{batch_ai_runtime_prefix}_model") or get_default_ai_model(batch_ai_provider)),
+    )
+    with batch_ai_cols[1]:
+        _render_ai_model_selector(
+            batch_ai_runtime_prefix,
+            batch_ai_provider,
+            str(st.session_state.get(f"{batch_ai_runtime_prefix}_model") or get_default_ai_model(batch_ai_provider)),
+            label="model（本批次）",
+        )
+    with batch_ai_cols[2]:
+        st.text_input(
+            "api_base（可选）",
+            value=st.session_state.get(
+                f"{batch_ai_runtime_prefix}_api_base",
+                get_default_ai_api_base(batch_ai_provider),
+            ),
+            key=f"{batch_ai_runtime_prefix}_api_base",
+        )
+    with batch_ai_cols[3]:
+        st.caption(
+            "DeepSeek 默认 `deepseek-chat` + `https://api.deepseek.com/v1`。"
+            if batch_ai_provider == "deepseek"
+            else "优先直接输入 API Key 联调；如已在容器里配置环境变量，可切到高级模式。"
+        )
+
+    _render_ai_api_key_config_inputs(
+        batch_ai_runtime_prefix,
+        batch_ai_provider,
+        _current_batch_ai_reviewer_runtime(current_jd),
+    )
+    batch_ai_runtime_cfg = _current_batch_ai_reviewer_runtime(current_jd)
+    _render_ai_runtime_hint(
+        str(batch_ai_runtime_cfg.get("provider") or ""),
+        str(batch_ai_runtime_cfg.get("api_base") or ""),
+        str(batch_ai_runtime_cfg.get("api_key_env_name") or ""),
+        api_key_mode=str(batch_ai_runtime_cfg.get("api_key_mode") or "direct_input"),
+        api_key_value=str(batch_ai_runtime_cfg.get("api_key_value") or ""),
+    )
+    _render_ai_runtime_warning(
+        str(batch_ai_runtime_cfg.get("provider") or ""),
+        str(batch_ai_runtime_cfg.get("api_base") or ""),
+        str(batch_ai_runtime_cfg.get("api_key_env_name") or ""),
+        api_key_mode=str(batch_ai_runtime_cfg.get("api_key_mode") or "direct_input"),
+        api_key_value=str(batch_ai_runtime_cfg.get("api_key_value") or ""),
+        enabled=bool(batch_ai_runtime_cfg.get("enable_ai_reviewer", False)),
+        feature_label="本批次 AI reviewer",
+    )
+    batch_connection_key = "batch_ai_reviewer_connection_test_result"
+    batch_action_cols = st.columns(2)
+    with batch_action_cols[0]:
+        if st.button("测试 AI 连接", key="batch_ai_reviewer_test_btn", use_container_width=True):
+            st.session_state[batch_connection_key] = test_ai_connection(batch_ai_runtime_cfg, purpose="ai_reviewer")
+    with batch_action_cols[1]:
+        if batch_ai_provider == "deepseek":
+            st.info("当前 provider=deepseek 时，优先直接输入 API Key 联调；也可切换到环境变量名模式。")
+    _render_ai_connection_result(st.session_state.get(batch_connection_key))
+    st.markdown("</div>", unsafe_allow_html=True)
+
     ocr_caps = check_ocr_capabilities()
     _render_batch_ocr_health_panel(ocr_caps)
 
@@ -6744,7 +7397,12 @@ def _render_batch_screening() -> None:
         else:
             effective_jd_title = (st.session_state.get("batch_selected_jd_prev") or "").strip() or "未命名岗位"
             with st.spinner(f"正在执行批量初筛，共 {len(uploaded_files)} 份文件..."):
-                _run_batch_screening(jd_title=effective_jd_title, jd_text=batch_jd_text, uploaded_files=uploaded_files)
+                _run_batch_screening(
+                    jd_title=effective_jd_title,
+                    jd_text=batch_jd_text,
+                    uploaded_files=uploaded_files,
+                    batch_ai_runtime_cfg=batch_ai_runtime_cfg,
+                )
 
     rows = st.session_state.get("v2_rows", [])
     if rows:
@@ -6876,11 +7534,13 @@ def _render_candidate_workspace() -> None:
     selected_batch_id = str(payload.get("batch_id") or selected_batch_id or "").strip()
     st.session_state.workspace_preferred_batch_id = selected_batch_id
     st.session_state.v2_current_batch_id = selected_batch_id
+    batch_ai_runtime = _hydrate_batch_ai_reviewer_runtime(payload, selected_jd)
 
     rows = payload.get("rows", [])
     details = payload.get("details", {})
     st.session_state.v2_rows = rows
     st.session_state.v2_details = details
+    st.session_state.v2_batch_ai_reviewer_runtime = dict(batch_ai_runtime)
     current_pool = st.session_state.get("workspace_pool_top_radio", "")
     if current_pool not in {"待复核候选人", "通过候选人", "淘汰候选人"}:
         current_pool = "待复核候选人" if int(payload.get("review_count", 0) or 0) > 0 else "通过候选人"
@@ -6894,6 +7554,14 @@ def _render_candidate_workspace() -> None:
     st.caption(
         f"当前批次总人数：{payload.get('total_resumes', len(rows))} ｜ "
         f"通过：{payload.get('pass_count', 0)} ｜ 待复核：{payload.get('review_count', 0)} ｜ 淘汰：{payload.get('reject_count', 0)}"
+    )
+    st.caption(
+        "AI reviewer："
+        + (
+            f"已启用｜{batch_ai_runtime.get('provider') or '-'}｜{batch_ai_runtime.get('model') or '-'}"
+            if batch_ai_runtime.get("enable_ai_reviewer")
+            else "当前批次未启用"
+        )
     )
 
     if rows:

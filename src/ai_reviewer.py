@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from time import perf_counter
 from typing import Any
 from urllib import error as urlerror
@@ -22,6 +23,8 @@ OPENAI_JSON_SCHEMA_PROVIDERS = {"openai"}
 OPENAI_JSON_OBJECT_PROVIDERS = {"deepseek"}
 API_BASE_REQUIRED_PROVIDERS = {"openai_compatible"}
 MOCK_PROVIDERS = {"mock"}
+AI_API_KEY_MODES = {"direct_input", "env_name"}
+ENV_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _LATEST_AI_CALL_STATUS: dict[str, Any] = {}
 AI_PROVIDER_DEFAULTS = {
     "openai": {
@@ -67,8 +70,8 @@ def _record_latest_ai_call_status(
     request_id: str = "",
 ) -> None:
     global _LATEST_AI_CALL_STATUS
-    api_key_env_name = str(runtime_cfg.get("api_key_env_name") or "")
-    api_key_present = bool(os.getenv(api_key_env_name, "").strip()) if api_key_env_name else False
+    key_details = _resolve_api_key_details(runtime_cfg)
+    api_key_env_name = str(key_details.get("env_name") or "")
     _LATEST_AI_CALL_STATUS = {
         "timestamp": int(round(perf_counter() * 1000)),
         "purpose": str(purpose or "generic"),
@@ -76,7 +79,10 @@ def _record_latest_ai_call_status(
         "model": str(runtime_cfg.get("model") or ""),
         "api_base": str(runtime_cfg.get("api_base") or ""),
         "api_key_env_name": api_key_env_name,
-        "api_key_present": api_key_present,
+        "api_key_mode": str(key_details.get("mode") or "env_name"),
+        "api_key_mode_label": str(key_details.get("mode_label") or ""),
+        "api_key_present": bool(key_details.get("key_value_present")),
+        "api_key_env_detected": bool(key_details.get("env_value_present")),
         "source": str(source or ""),
         "success": bool(success),
         "reason": str(reason or ""),
@@ -168,18 +174,120 @@ def resolve_ai_api_key_env_name(provider: str, configured_env_name: str = "") ->
     return clean or get_default_ai_api_key_env_name(provider)
 
 
+def _is_valid_env_name(value: str) -> bool:
+    clean = str(value or "").strip()
+    return bool(clean) and bool(ENV_NAME_PATTERN.fullmatch(clean))
+
+
+def _looks_like_api_key(value: str) -> bool:
+    clean = str(value or "").strip()
+    lower = clean.lower()
+    if not clean:
+        return False
+    if lower.startswith(("sk-", "sk_proj_", "sk-proj-", "dsk_", "dsk-", "bearer ")):
+        return True
+    if _is_valid_env_name(clean):
+        return False
+    return len(clean) >= 24 and any(ch.isalpha() for ch in clean) and any(ch.isdigit() for ch in clean)
+
+
+def _resolve_api_key_details(runtime_cfg: dict[str, Any]) -> dict[str, Any]:
+    provider = str(runtime_cfg.get("provider") or "openai").strip().lower() or "openai"
+    direct_value = str(runtime_cfg.get("api_key_value") or "").strip()
+    raw_mode = str(runtime_cfg.get("api_key_mode") or "").strip().lower()
+    mode = raw_mode if raw_mode in AI_API_KEY_MODES else ("direct_input" if direct_value else "env_name")
+    api_key_env_name = resolve_ai_api_key_env_name(provider, str(runtime_cfg.get("api_key_env_name") or ""))
+    env_value = os.getenv(api_key_env_name, "").strip() if api_key_env_name else ""
+    using_direct = mode == "direct_input"
+    key_value = direct_value if using_direct else env_value
+    return {
+        "mode": mode,
+        "mode_label": "直接输入 API Key" if using_direct else "环境变量名",
+        "direct_value_present": bool(direct_value),
+        "env_name": api_key_env_name,
+        "env_value_present": bool(env_value),
+        "env_name_looks_like_key": _looks_like_api_key(api_key_env_name),
+        "key_value": key_value,
+        "key_value_present": bool(key_value),
+    }
+
+
+def _missing_api_key_reason(runtime_cfg: dict[str, Any], key_details: dict[str, Any]) -> str:
+    provider = str(runtime_cfg.get("provider") or "openai").strip().lower() or "openai"
+    if key_details.get("mode") == "direct_input":
+        return "API key 缺失：当前使用“直接输入 API Key”模式，请粘贴真实 key。"
+
+    env_name = str(key_details.get("env_name") or "").strip()
+    if key_details.get("env_name_looks_like_key"):
+        return (
+            "环境变量名看起来填成了真实 API key。请切换到“直接输入 API Key”模式，"
+            f"或在这里填写例如 {get_default_ai_api_key_env_name(provider) or 'DEEPSEEK_API_KEY'}。"
+        )
+    if not env_name:
+        return f"API key 缺失：请填写环境变量名，例如 {get_default_ai_api_key_env_name(provider)}。"
+    return f"未检测到环境变量 {env_name}。"
+
+
+def _friendly_connection_error(exc: Exception, runtime_cfg: dict[str, Any], key_details: dict[str, Any] | None = None) -> str:
+    message = str(exc or "").strip()
+    lower = message.lower()
+    provider = str(runtime_cfg.get("provider") or "openai").strip().lower() or "openai"
+    api_base = str(runtime_cfg.get("api_base") or "").strip()
+    details = key_details if isinstance(key_details, dict) else _resolve_api_key_details(runtime_cfg)
+
+    if "missing api key" in lower or "未检测到环境变量" in message or "环境变量名看起来填成了真实" in message:
+        return _missing_api_key_reason(runtime_cfg, details)
+    if "missing api_base" in lower:
+        example_base = get_default_ai_api_base(provider) or "https://api.deepseek.com/v1"
+        return f"api_base 缺失或未填写。请检查地址，常见示例：{example_base}"
+    if "timeout" in lower or "timed out" in lower:
+        return "网络超时，请检查网络、代理或稍后重试。"
+    if lower.startswith("http 400"):
+        if "model" in lower and any(token in lower for token in ["not found", "does not exist", "unknown"]):
+            return "model 不存在或当前账号无权访问，请检查 model 名称。"
+        return "请求被上游拒绝，常见原因：api_base 错误、model 名称不正确，或当前 provider 不支持该请求格式。"
+    if lower.startswith("http 401"):
+        return "API key 无效或未授权，请检查 key 是否正确。"
+    if lower.startswith("http 403"):
+        return "API key 没有访问当前 provider / model 的权限。"
+    if lower.startswith("http 404"):
+        return f"api_base 可能错误，未找到对应接口：{api_base or '-'}"
+    if lower.startswith("http 429"):
+        return "请求过于频繁，或当前 API key / 账户额度不足。"
+    if lower.startswith("http 5"):
+        return "上游 AI 服务暂时不可用，请稍后重试。"
+    if any(token in lower for token in ["getaddrinfo failed", "name or service not known", "nodename nor servname", "no address associated"]):
+        return f"无法连接到 api_base，请检查地址是否正确：{api_base or '-'}"
+    if "connection refused" in lower:
+        return f"无法连接到 api_base，对端拒绝连接：{api_base or '-'}"
+    if lower.startswith("network error:"):
+        return f"网络连接失败，请检查 api_base、网络或代理配置：{api_base or '-'}"
+    if "certificate" in lower or "ssl" in lower:
+        return "TLS / SSL 握手失败，请检查 api_base、证书或代理设置。"
+    if any(token in lower for token in ["invalid api key", "incorrect api key", "authentication", "unauthorized"]):
+        return "API key 无效或未授权，请检查 key 是否正确。"
+    if any(token in lower for token in ["model_not_found", "unknown model", "does not exist"]):
+        return "model 不存在或当前账号无权访问，请检查 model 名称。"
+    return message or "请求失败，请检查 provider、api_base 和 API key 配置。"
+
+
 def resolve_ai_runtime_config(ai_cfg: dict[str, Any] | None) -> dict[str, Any]:
     cfg = dict(ai_cfg or {})
     provider = str(cfg.get("provider") or "openai").strip().lower() or "openai"
     model = str(cfg.get("model") or "").strip() or get_default_ai_model(provider)
     api_base = resolve_ai_api_base(provider, str(cfg.get("api_base") or ""))
     api_key_env_name = resolve_ai_api_key_env_name(provider, str(cfg.get("api_key_env_name") or ""))
+    api_key_value = str(cfg.get("api_key_value") or "")
+    raw_mode = str(cfg.get("api_key_mode") or "").strip().lower()
+    api_key_mode = raw_mode if raw_mode in AI_API_KEY_MODES else ("direct_input" if api_key_value.strip() else "env_name")
     return {
         **cfg,
         "provider": provider,
         "model": model,
         "api_base": api_base,
         "api_key_env_name": api_key_env_name,
+        "api_key_mode": api_key_mode,
+        "api_key_value": api_key_value,
     }
 
 
@@ -771,10 +879,10 @@ def _call_openai_compatible_json_api(
         raise RuntimeError(f"provider {provider} not implemented")
 
     endpoint = _resolve_openai_compatible_endpoint(runtime_cfg)
-    api_key_env_name = str(runtime_cfg.get("api_key_env_name") or "").strip()
-    api_key = os.getenv(api_key_env_name, "").strip()
+    key_details = _resolve_api_key_details(runtime_cfg)
+    api_key = str(key_details.get("key_value") or "").strip()
     if not api_key:
-        raise RuntimeError(f"missing api key env: {api_key_env_name}")
+        raise RuntimeError(_missing_api_key_reason(runtime_cfg, key_details))
 
     body: dict[str, Any] = {
         "model": runtime_cfg.get("model") or get_default_ai_model(provider),
@@ -1081,14 +1189,17 @@ def _build_stub_ai_review_output(
 def test_ai_connection(ai_cfg: dict[str, Any], *, purpose: str = "generic") -> dict[str, Any]:
     runtime_cfg = resolve_ai_runtime_config(ai_cfg)
     provider = str(runtime_cfg.get("provider") or "openai")
-    api_key_env_name = str(runtime_cfg.get("api_key_env_name") or "")
-    api_key_present = bool(os.getenv(api_key_env_name, "").strip()) if api_key_env_name else False
+    key_details = _resolve_api_key_details(runtime_cfg)
+    api_key_env_name = str(key_details.get("env_name") or "")
     result = {
         "provider": provider,
         "model": str(runtime_cfg.get("model") or ""),
         "api_base": str(runtime_cfg.get("api_base") or ""),
         "api_key_env_name": api_key_env_name or "-",
-        "api_key_present": api_key_present,
+        "api_key_mode": str(key_details.get("mode") or "env_name"),
+        "api_key_mode_label": str(key_details.get("mode_label") or ""),
+        "api_key_present": bool(key_details.get("key_value_present")),
+        "api_key_env_detected": bool(key_details.get("env_value_present")),
         "success": False,
         "reason": "",
         "request_id": "",
@@ -1106,11 +1217,11 @@ def test_ai_connection(ai_cfg: dict[str, Any], *, purpose: str = "generic") -> d
         return result
 
     if provider_requires_explicit_api_base(provider) and not str(runtime_cfg.get("api_base") or "").strip():
-        result["reason"] = f"missing api_base for provider {provider}"
+        result["reason"] = _friendly_connection_error(RuntimeError(f"missing api_base for provider {provider}"), runtime_cfg, key_details)
         return result
 
-    if not api_key_present:
-        result["reason"] = f"missing api key env: {api_key_env_name}"
+    if not key_details.get("key_value_present"):
+        result["reason"] = _missing_api_key_reason(runtime_cfg, key_details)
         return result
 
     started_at = perf_counter()
@@ -1139,7 +1250,7 @@ def test_ai_connection(ai_cfg: dict[str, Any], *, purpose: str = "generic") -> d
         result["reason"] = str(output.get("message") or "connection ok")
         result["request_id"] = request_id
     except Exception as exc:  # noqa: BLE001
-        result["reason"] = str(exc)
+        result["reason"] = _friendly_connection_error(exc, runtime_cfg, key_details)
 
     result["latency_ms"] = int(round((perf_counter() - started_at) * 1000))
     return result

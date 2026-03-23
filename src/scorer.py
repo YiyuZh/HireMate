@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any
 
@@ -32,6 +33,11 @@ SCORE_DIMENSION_ORDER = [
     "表达完整度",
     "综合推荐度",
 ]
+_REP_SUSPICIOUS_CHARS_RE = re.compile(r"[�□]")
+_REP_REPEAT_NOISE_RE = re.compile(r"([?？!！~～=+_*#|/\\-])\1{2,}")
+_REP_MEANINGFUL_TOKEN_RE = re.compile(
+    r"(?:[\u4e00-\u9fff]{2,})|(?:[A-Za-z][A-Za-z0-9+/.#-]{1,})|(?:\d{4}[./-]\d{1,2})"
+)
 
 
 def _clip_score(v: int) -> int:
@@ -78,6 +84,134 @@ def _normalize_evidence_text(text: str) -> str:
     return re.sub(r"[\W_]+", "", str(text or "").strip().lower())
 
 
+def _short_dimension_label(dimension: str) -> str:
+    mapping = {
+        "教育背景匹配度": "教育",
+        "相关经历匹配度": "经历",
+        "技能匹配度": "技能",
+        "表达完整度": "表达",
+        "综合推荐度": "综合",
+    }
+    return mapping.get(str(dimension or "").strip(), str(dimension or "").strip())
+
+
+def _meaningful_char_count(text: str) -> int:
+    clean = str(text or "")
+    return sum(1 for char in clean if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+
+
+def _format_evidence_literal_payload(text: str, dimension: str) -> str:
+    stripped = str(text or "").strip()
+    if not stripped or stripped[0] not in "[{(":
+        return stripped
+
+    try:
+        payload = ast.literal_eval(stripped)
+    except (SyntaxError, ValueError):
+        return stripped
+
+    if isinstance(payload, (list, tuple, set)):
+        parts = [str(item).strip() for item in payload if str(item).strip()]
+        return " / ".join(parts) if parts else stripped
+
+    if isinstance(payload, dict):
+        parts: list[str] = []
+        for key, value in payload.items():
+            key_text = _short_dimension_label(str(key))
+            value_text = str(value).strip()
+            if not value_text:
+                continue
+            parts.append(f"{key_text} {value_text}")
+        return "，".join(parts) if parts else stripped
+
+    return stripped
+
+
+def _clean_representative_display_text(text: str, dimension: str) -> str:
+    clean = _format_evidence_literal_payload(text, dimension)
+    clean = clean.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    clean = re.sub(r"[|｜]{2,}", " | ", clean)
+    clean = re.sub(r"[·•]{2,}", "·", clean)
+    clean = re.sub(r"([，。；：,;])\1{1,}", r"\1", clean)
+    clean = re.sub(r"\s*([，。；：,;])\s*", r"\1", clean)
+    clean = re.sub(r"\s*([/|])\s*", r" \1 ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" ，。；：,;")
+    if len(clean) > 96:
+        clean = clean[:95].rstrip() + "…"
+    return clean
+
+
+def _looks_like_low_readability_evidence(text: str, raw_text: str = "") -> bool:
+    clean = str(text or "").strip()
+    raw = str(raw_text or clean)
+    if not clean:
+        return True
+
+    non_space_chars = [char for char in clean if not char.isspace()]
+    if not non_space_chars:
+        return True
+
+    meaningful = _meaningful_char_count(clean)
+    meaningful_ratio = meaningful / len(non_space_chars)
+    suspicious_hits = len(_REP_SUSPICIOUS_CHARS_RE.findall(clean))
+    if re.search(r"[?？]{3,}", raw):
+        suspicious_hits += 2
+    if _REP_REPEAT_NOISE_RE.search(raw):
+        suspicious_hits += 1
+
+    token_hits = _REP_MEANINGFUL_TOKEN_RE.findall(clean)
+    has_readable_phrase = bool(token_hits)
+
+    if suspicious_hits >= 2:
+        return True
+    if meaningful < 4:
+        return True
+    if meaningful_ratio < 0.35:
+        return True
+    if len(clean) < 8 and len(token_hits) < 2:
+        return True
+    if len(clean) < 14 and not has_readable_phrase:
+        return True
+    return False
+
+
+def _extract_representative_tags(dimension: str, label: str, raw_text: str, display_text: str) -> list[str]:
+    blob = " ".join(
+        [
+            str(dimension or ""),
+            str(label or ""),
+            str(raw_text or ""),
+            str(display_text or ""),
+        ]
+    ).lower()
+    tags: list[str] = []
+
+    def _add(tag: str, *keywords: str) -> None:
+        if any(keyword.lower() in blob for keyword in keywords) and tag not in tags:
+            tags.append(tag)
+
+    _add("方法", "方法", "需求分析", "prd", "原型", "访谈", "问卷", "可用性", "指标", "a/b", "实验")
+    _add("产出", "产出", "交付", "原型", "文档", "报告", "方案", "策略", "看板", "报表")
+    _add("结果", "结果", "提升", "增长", "优化", "降低", "转化", "效率", "结论", "洞察", "复盘")
+    _add("JD命中", "jd", "模板命中", "核心任务", "岗位")
+    _add("技能命中", "技能", "命中必备技能", "命中加分技能", "sql 证据")
+    _add("教育", "学历", "专业", "教育")
+    _add("门槛/风险", "硬门槛", "最低分门槛", "风险", "待核验")
+
+    if dimension == "技能匹配度" and "技能命中" not in tags:
+        tags.append("技能命中")
+    if dimension == "教育背景匹配度" and "教育" not in tags:
+        tags.append("教育")
+    if dimension == "表达完整度" and not tags:
+        tags.append("完整度")
+    if dimension == "综合推荐度":
+        tags = [tag for tag in tags if tag == "门槛/风险"]
+        if not tags:
+            tags.append("综合")
+    return tags[:4]
+
+
 def _parse_representative_evidence(raw_text: str, default_label: str = "证据摘要") -> dict[str, str]:
     clean = str(raw_text or "").strip()
     if not clean:
@@ -100,6 +234,28 @@ def _parse_representative_evidence(raw_text: str, default_label: str = "证据�
         }
 
     return {"label": default_label, "text": clean, "raw": clean}
+
+
+def _build_representative_candidate(dimension: str, raw_text: str, default_label: str) -> dict[str, Any]:
+    parsed = _parse_representative_evidence(raw_text, default_label=default_label)
+    if not parsed:
+        return {}
+
+    label = str(parsed.get("label") or default_label).strip() or default_label
+    raw_value = str(parsed.get("raw") or raw_text or "").strip()
+    display_text = _clean_representative_display_text(parsed.get("text") or raw_value, dimension)
+    is_low_readability = _looks_like_low_readability_evidence(display_text, raw_value)
+    tags = _extract_representative_tags(dimension, label, raw_value, display_text)
+
+    return {
+        "label": label,
+        "display_text": display_text,
+        "raw_text": raw_value or display_text,
+        "text": display_text,
+        "raw": raw_value or display_text,
+        "tags": tags,
+        "is_low_readability": is_low_readability,
+    }
 
 
 def _representative_evidence_priority(dimension: str, raw_text: str) -> tuple[int, int]:
@@ -145,11 +301,28 @@ def _select_representative_evidence(dimension: str, detail: ScoreDetail) -> dict
         key=lambda item: _representative_evidence_priority(dimension, item),
         reverse=True,
     )
-    if ranked_items:
-        return _parse_representative_evidence(ranked_items[0], default_label="代表证据")
+    ranked_candidates = [
+        _build_representative_candidate(dimension, item, default_label="代表证据")
+        for item in ranked_items
+    ]
+    ranked_candidates = [candidate for candidate in ranked_candidates if candidate]
+
+    for candidate in ranked_candidates:
+        if not bool(candidate.get("is_low_readability")):
+            return candidate
 
     reason = str(detail.get("reason") or "").strip()
-    return _parse_representative_evidence(reason, default_label="评分说明") if reason else {}
+    reason_candidate = (
+        _build_representative_candidate(dimension, reason, default_label="评分说明")
+        if reason
+        else {}
+    )
+    if reason_candidate and not bool(reason_candidate.get("is_low_readability")):
+        return reason_candidate
+
+    if ranked_candidates:
+        return ranked_candidates[0]
+    return reason_candidate if reason_candidate else {}
 
 
 def hydrate_representative_evidence(details: DetailedScores) -> DetailedScores:
@@ -165,13 +338,18 @@ def hydrate_representative_evidence(details: DetailedScores) -> DetailedScores:
 
         existing_meta = detail.get("meta")
         meta = existing_meta if isinstance(existing_meta, dict) else {}
-        meta["representative_evidence_text"] = representative.get("text", "")
+        meta["representative_evidence_text"] = representative.get("display_text", representative.get("text", ""))
+        meta["representative_evidence_low_readability"] = bool(representative.get("is_low_readability"))
         detail["meta"] = meta
         detail["representative_evidence"] = {
             "dimension": dimension,
             "label": representative.get("label", "代表证据"),
-            "text": representative.get("text", ""),
-            "raw": representative.get("raw", representative.get("text", "")),
+            "display_text": representative.get("display_text", representative.get("text", "")),
+            "raw_text": representative.get("raw_text", representative.get("raw", representative.get("text", ""))),
+            "text": representative.get("display_text", representative.get("text", "")),
+            "raw": representative.get("raw_text", representative.get("raw", representative.get("text", ""))),
+            "tags": representative.get("tags", []),
+            "is_low_readability": bool(representative.get("is_low_readability")),
         }
     return details
 

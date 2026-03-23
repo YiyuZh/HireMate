@@ -95,6 +95,21 @@ _SKILL_SIGNAL_KEYWORDS = (
     "sql",
     "excel",
 )
+_OCR_TITLE_FIXUPS = [
+    (re.compile(r"教\s*育\s*背\s*景"), "教育背景"),
+    (re.compile(r"教\s*育\s*经\s*历"), "教育经历"),
+    (re.compile(r"实\s*习\s*经\s*历"), "实习经历"),
+    (re.compile(r"工\s*作\s*经\s*历"), "工作经历"),
+    (re.compile(r"项\s*目\s*经\s*历"), "项目经历"),
+    (re.compile(r"项\s*目\s*经\s*验"), "项目经验"),
+    (re.compile(r"专\s*业\s*技\s*能"), "专业技能"),
+    (re.compile(r"技\s*能\s*清\s*单"), "技能清单"),
+    (re.compile(r"技\s*术\s*栈"), "技术栈"),
+    (re.compile(r"校\s*园\s*经\s*历"), "校园经历"),
+    (re.compile(r"自\s*我\s*评\s*价"), "自我评价"),
+    (re.compile(r"个\s*人\s*简\s*介"), "个人简介"),
+    (re.compile(r"联\s*系\s*方\s*式"), "联系方式"),
+]
 
 
 def _tesseract_available() -> bool:
@@ -198,6 +213,73 @@ def _clean_extracted_text(text: str) -> str:
 
     cleaned = "\n".join(cleaned_lines).strip()
     return _MULTI_BLANK_RE.sub("\n\n", cleaned)
+
+
+def _join_spaced_acronyms(text: str) -> str:
+    normalized = str(text or "")
+    acronym_pattern = re.compile(r"\b(?:[A-Za-z]\s+){1,}[A-Za-z]\b")
+    while True:
+        updated = acronym_pattern.sub(lambda match: re.sub(r"\s+", "", match.group(0)), normalized)
+        if updated == normalized:
+            return updated
+        normalized = updated
+
+
+def _repair_ocr_time_format(text: str) -> str:
+    normalized = str(text or "")
+    normalized = re.sub(r"((?:19|20)\d{2})\s*[./]\s*(\d{1,2})", r"\1.\2", normalized)
+    normalized = re.sub(r"((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月", r"\1年\2月", normalized)
+    normalized = re.sub(
+        r"((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月))\s*(?:-|~|—|–|至|到)\s*((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月)|至今)",
+        r"\1-\2",
+        normalized,
+    )
+    return normalized
+
+
+def _repair_ocr_punctuation(text: str) -> str:
+    normalized = str(text or "")
+    normalized = normalized.replace("，.", "，").replace("。. ", "。").replace("：:", "：")
+    normalized = re.sub(r"\s*([，。；：！？])\s*", r"\1", normalized)
+    normalized = re.sub(r"\s*([,;:])\s*", r"\1 ", normalized)
+    normalized = re.sub(r"\s+([)\]】）》])", r"\1", normalized)
+    normalized = re.sub(r"([(\[【《“])\s+", r"\1", normalized)
+    normalized = re.sub(r"([，。；：！？,;:]){2,}", lambda match: match.group(1), normalized)
+    return normalized
+
+
+def _repair_ocr_word_boundaries(text: str) -> str:
+    normalized = str(text or "")
+    normalized = _join_spaced_acronyms(normalized)
+    normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", normalized)
+    normalized = re.sub(r"(?<=\d)\s+(?=[年月日.%])", "", normalized)
+    normalized = re.sub(r"(?<=[年月])\s+(?=\d)", "", normalized)
+    normalized = re.sub(r"(?<=\d)\s*(?=[./-])", "", normalized)
+    normalized = re.sub(r"(?<=[./-])\s*(?=\d)", "", normalized)
+    normalized = re.sub(r"(?<=\d)\s+(?=%)", "", normalized)
+    normalized = re.sub(r"(?<=A)\s*/\s*(?=B\b)", "/", normalized, flags=re.IGNORECASE)
+    return normalized
+
+
+def _repair_ocr_section_titles(text: str) -> str:
+    normalized = str(text or "")
+    for pattern, replacement in _OCR_TITLE_FIXUPS:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized
+
+
+def _repair_ocr_text(text: str) -> dict[str, str]:
+    raw_ocr_text = _clean_extracted_text(text)
+    normalized = raw_ocr_text.replace("—", "-").replace("–", "-").replace("•", "·")
+    normalized = _repair_ocr_section_titles(normalized)
+    normalized = _repair_ocr_word_boundaries(normalized)
+    normalized = _repair_ocr_punctuation(normalized)
+    normalized = _repair_ocr_time_format(normalized)
+    normalized = _clean_extracted_text(normalized)
+    return {
+        "raw_ocr_text": raw_ocr_text,
+        "normalized_ocr_text": normalized,
+    }
 
 
 def _count_resume_keywords(text: str) -> int:
@@ -471,6 +553,8 @@ def _ocr_image_to_text(image, *, context: str) -> dict[str, Any]:
     variants, preprocess_meta = _build_ocr_variants(image)
 
     best_text = ""
+    best_raw_ocr_text = ""
+    best_normalized_ocr_text = ""
     best_variant = variants[0][0]
     best_analysis = _analyze_text_quality("")
     variants_tried = 0
@@ -480,12 +564,15 @@ def _ocr_image_to_text(image, *, context: str) -> dict[str, Any]:
             break
 
         raw_text = pytesseract.image_to_string(variant_image, lang=OCR_LANG) or ""
-        cleaned_text = _clean_extracted_text(raw_text)
-        analysis = _analyze_text_quality(cleaned_text)
+        repaired = _repair_ocr_text(raw_text)
+        normalized_ocr_text = repaired["normalized_ocr_text"]
+        analysis = _analyze_text_quality(normalized_ocr_text)
         variants_tried += 1
 
         if not best_text:
-            best_text = cleaned_text
+            best_text = normalized_ocr_text
+            best_raw_ocr_text = repaired["raw_ocr_text"]
+            best_normalized_ocr_text = normalized_ocr_text
             best_variant = variant_name
             best_analysis = analysis
             continue
@@ -493,12 +580,16 @@ def _ocr_image_to_text(image, *, context: str) -> dict[str, Any]:
         current_score = (int(analysis["score"]), int(analysis["length"]))
         best_score = (int(best_analysis["score"]), int(best_analysis["length"]))
         if current_score > best_score:
-            best_text = cleaned_text
+            best_text = normalized_ocr_text
+            best_raw_ocr_text = repaired["raw_ocr_text"]
+            best_normalized_ocr_text = normalized_ocr_text
             best_variant = variant_name
             best_analysis = analysis
 
     return {
         "text": best_analysis["clean_text"] or best_text,
+        "raw_ocr_text": best_raw_ocr_text,
+        "normalized_ocr_text": best_normalized_ocr_text or best_analysis["clean_text"] or best_text,
         "variant": best_variant,
         "variants_tried": variants_tried,
         "quality_analysis": best_analysis,
@@ -529,6 +620,7 @@ def _extract_pdf_with_ocr(file_obj) -> dict[str, Any]:
         raise ValueError(f"PDF OCR 调用 poppler 失败（{exc}）。") from exc
 
     page_texts: list[str] = []
+    raw_page_texts: list[str] = []
     failed_pages = 0
     used_binarization = False
     used_preprocessing = False
@@ -542,6 +634,7 @@ def _extract_pdf_with_ocr(file_obj) -> dict[str, Any]:
             continue
 
         page_text = str(page_result.get("text") or "").strip()
+        page_raw_text = str(page_result.get("raw_ocr_text") or "").strip()
         used_binarization = used_binarization or bool(page_result.get("used_binarization"))
         used_preprocessing = used_preprocessing or bool(page_result.get("preprocessed"))
         if not page_text:
@@ -549,11 +642,17 @@ def _extract_pdf_with_ocr(file_obj) -> dict[str, Any]:
 
         if total_pages > 1:
             page_texts.append(f"[第{index}页]\n{page_text}")
+            if page_raw_text:
+                raw_page_texts.append(f"[第{index}页]\n{page_raw_text}")
         else:
             page_texts.append(page_text)
+            if page_raw_text:
+                raw_page_texts.append(page_raw_text)
 
     return {
         "text": _join_page_texts(page_texts),
+        "raw_ocr_text": _join_page_texts(raw_page_texts),
+        "normalized_ocr_text": _join_page_texts(page_texts),
         "page_count": total_pages,
         "pages_with_text": len(page_texts),
         "failed_pages": failed_pages,
@@ -589,6 +688,8 @@ def _safe_result(
     used_ocr: bool = False,
     ocr_fallback_attempted: bool = False,
     ocr_fallback_succeeded: bool = False,
+    raw_ocr_text: str = "",
+    normalized_ocr_text: str = "",
 ) -> dict:
     clean = (text or "").strip()
     final_quality = "ok" if (quality or "").lower() == "ok" else "weak"
@@ -615,6 +716,8 @@ def _safe_result(
         "used_ocr": bool(used_ocr),
         "ocr_fallback_attempted": bool(ocr_fallback_attempted),
         "ocr_fallback_succeeded": bool(ocr_fallback_succeeded),
+        "raw_ocr_text": str(raw_ocr_text or "").strip(),
+        "normalized_ocr_text": str(normalized_ocr_text or clean).strip(),
     }
 
 
@@ -639,6 +742,7 @@ def _text_result(text: str, *, file_type: str, success_message: str, weak_messag
         file_type=file_type,
         can_evaluate=True,
         should_skip=False,
+        normalized_ocr_text=text,
     )
 
 
@@ -676,16 +780,18 @@ def _image_result_with_ocr(file_obj) -> dict:
             "",
             method="ocr",
             quality="weak",
-            message="图片 OCR 已执行（含图像预处理），但未提取到稳定文本，建议跳过或人工处理。",
+            message="图片 OCR 已执行（含图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核或人工处理。",
             file_type="image",
             can_evaluate=False,
             should_skip=True,
             used_ocr=True,
+            raw_ocr_text=str(ocr_result.get("raw_ocr_text") or ""),
+            normalized_ocr_text=str(ocr_result.get("normalized_ocr_text") or ""),
         )
 
     message = "图片 OCR 已完成（含图像预处理），提取成功。"
     if quality == "weak":
-        message = "图片 OCR 已完成（含图像预处理），但识别质量较弱，建议人工复核。"
+        message = "图片 OCR 已完成（含图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。"
     return _safe_result(
         text,
         method="ocr",
@@ -695,6 +801,8 @@ def _image_result_with_ocr(file_obj) -> dict:
         can_evaluate=True,
         should_skip=False,
         used_ocr=True,
+        raw_ocr_text=str(ocr_result.get("raw_ocr_text") or ""),
+        normalized_ocr_text=str(ocr_result.get("normalized_ocr_text") or text),
     )
 
 
@@ -718,6 +826,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
             used_ocr=False,
             ocr_fallback_attempted=False,
             ocr_fallback_succeeded=False,
+            normalized_ocr_text=pdf_text,
         )
 
     prefix = f"PDF 文本提取失败（{pdf_text_error}）。" if pdf_text_error else "PDF 文本提取质量较弱。"
@@ -737,6 +846,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
                 used_ocr=False,
                 ocr_fallback_attempted=True,
                 ocr_fallback_succeeded=False,
+                normalized_ocr_text=pdf_text,
             )
         return _safe_result(
             "",
@@ -763,6 +873,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
                 used_ocr=False,
                 ocr_fallback_attempted=True,
                 ocr_fallback_succeeded=False,
+                normalized_ocr_text=pdf_text,
             )
         return _safe_result(
             "",
@@ -784,25 +895,29 @@ def _pdf_result_with_fallback(file_obj) -> dict:
                 pdf_text,
                 method="text",
                 quality="weak",
-                message="已尝试 PDF OCR fallback（300 DPI + 图像预处理），但仍只拿到弱质量文本，建议人工复核。",
+                message="已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。",
                 file_type="pdf",
                 can_evaluate=True,
                 should_skip=False,
                 used_ocr=True,
                 ocr_fallback_attempted=True,
                 ocr_fallback_succeeded=False,
+                raw_ocr_text=str(ocr_result.get("raw_ocr_text") or ""),
+                normalized_ocr_text=pdf_text,
             )
         return _safe_result(
             "",
             method="ocr",
             quality="weak",
-            message="已尝试 PDF OCR fallback（300 DPI + 图像预处理），但未提取到稳定文本，建议跳过或人工处理。",
+            message="已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核或人工处理。",
             file_type="pdf",
             can_evaluate=False,
             should_skip=True,
             used_ocr=True,
             ocr_fallback_attempted=True,
             ocr_fallback_succeeded=False,
+            raw_ocr_text=str(ocr_result.get("raw_ocr_text") or ""),
+            normalized_ocr_text=str(ocr_result.get("normalized_ocr_text") or ""),
         )
 
     if (pdf_text or "").strip():
@@ -812,22 +927,24 @@ def _pdf_result_with_fallback(file_obj) -> dict:
                 selected_text,
                 method="text",
                 quality="weak" if selected_analysis["weak"] else "ok",
-                message="已尝试 PDF OCR fallback（300 DPI + 图像预处理），但原始文本提取结果更稳定。"
+                message="已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但原始文本提取结果更稳定。"
                 if not selected_analysis["weak"]
-                else "已尝试 PDF OCR fallback（300 DPI + 图像预处理），但文本整体仍偏弱，建议人工复核。",
+                else "已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但文本整体仍偏弱，建议人工复核。",
                 file_type="pdf",
                 can_evaluate=True,
                 should_skip=False,
                 used_ocr=True,
                 ocr_fallback_attempted=True,
                 ocr_fallback_succeeded=False,
+                raw_ocr_text=str(ocr_result.get("raw_ocr_text") or ""),
+                normalized_ocr_text=selected_text,
             )
 
     failed_pages = int(ocr_result.get("failed_pages") or 0)
     ocr_quality = _quality_label(ocr_text)
     message = "已使用 PDF OCR fallback（300 DPI + 图像预处理），提取成功。"
     if ocr_quality == "weak":
-        message = "已使用 PDF OCR fallback（300 DPI + 图像预处理），但识别质量较弱，建议人工复核。"
+        message = "已使用 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。"
     if failed_pages > 0:
         message += f" 其中 {failed_pages} 页 OCR 失败，已保留可识别页面。"
     return _safe_result(
@@ -841,6 +958,8 @@ def _pdf_result_with_fallback(file_obj) -> dict:
         used_ocr=True,
         ocr_fallback_attempted=True,
         ocr_fallback_succeeded=True,
+        raw_ocr_text=str(ocr_result.get("raw_ocr_text") or ""),
+        normalized_ocr_text=str(ocr_result.get("normalized_ocr_text") or ocr_text),
     )
 
 
