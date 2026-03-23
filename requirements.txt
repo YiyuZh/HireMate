@@ -7,3 +7,4 @@ pytesseract
 pdf2image
 python-dotenv
 pymysql
+cryptography

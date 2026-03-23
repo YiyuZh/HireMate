@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from src.role_profiles import (
@@ -24,6 +25,13 @@ from src.role_profiles import (
 
 ScoreDetail = dict[str, Any]
 DetailedScores = dict[str, ScoreDetail]
+SCORE_DIMENSION_ORDER = [
+    "教育背景匹配度",
+    "相关经历匹配度",
+    "技能匹配度",
+    "表达完整度",
+    "综合推荐度",
+]
 
 
 def _clip_score(v: int) -> int:
@@ -41,6 +49,131 @@ def _snippet(text: str, max_len: int = 45) -> str:
 
 def _norm_skill(s: str) -> str:
     return (s or "").lower().replace(" ", "")
+
+
+def _norm_text(text: str) -> str:
+    return (text or "").lower().replace(" ", "")
+
+
+def _collect_keyword_hits(raw_norm: str, keywords: list[str]) -> list[str]:
+    hits: list[str] = []
+    for keyword in keywords or []:
+        normalized = _norm_text(keyword)
+        if normalized and normalized in raw_norm and keyword not in hits:
+            hits.append(keyword)
+    return hits
+
+
+def _extend_unique(target: list[str], values: list[str]) -> None:
+    for value in values:
+        if value and value not in target:
+            target.append(value)
+
+
+def _bool_cn(flag: bool) -> str:
+    return "有" if flag else "无"
+
+
+def _normalize_evidence_text(text: str) -> str:
+    return re.sub(r"[\W_]+", "", str(text or "").strip().lower())
+
+
+def _parse_representative_evidence(raw_text: str, default_label: str = "证据摘要") -> dict[str, str]:
+    clean = str(raw_text or "").strip()
+    if not clean:
+        return {}
+
+    matched = re.match(r"^代表片段（(.+?)）[:：]\s*(.+)$", clean)
+    if matched:
+        return {
+            "label": matched.group(1).strip() or default_label,
+            "text": matched.group(2).strip(),
+            "raw": clean,
+        }
+
+    matched = re.match(r"^([^:：]{2,20})[:：]\s*(.+)$", clean)
+    if matched:
+        return {
+            "label": matched.group(1).strip() or default_label,
+            "text": matched.group(2).strip(),
+            "raw": clean,
+        }
+
+    return {"label": default_label, "text": clean, "raw": clean}
+
+
+def _representative_evidence_priority(dimension: str, raw_text: str) -> tuple[int, int]:
+    clean = str(raw_text or "").strip()
+    if not clean:
+        return (-999, 0)
+
+    priority = 0
+    if clean.startswith("代表片段"):
+        priority += 120
+    elif clean.startswith("原文片段"):
+        priority += 100
+    elif clean.startswith("命中必备技能"):
+        priority += 92
+    elif clean.startswith("简历学历/专业"):
+        priority += 84
+    elif clean.startswith("结构完整度"):
+        priority += 70
+    elif clean.startswith("规则摘要"):
+        priority += 18
+
+    if "硬门槛触发" in clean or "岗位最低分门槛触发" in clean:
+        priority += 95 if dimension == "综合推荐度" else 28
+    if "命中必备技能" in clean and dimension == "技能匹配度":
+        priority += 25
+    if "简历学历/专业" in clean and dimension == "教育背景匹配度":
+        priority += 18
+    if "关键链路" in clean or "完整度信号" in clean or "模板命中" in clean:
+        priority -= 18
+    if "岗位评分模板" in clean or "岗位自定义评分配置" in clean:
+        priority -= 35
+
+    return (priority, len(clean))
+
+
+def _select_representative_evidence(dimension: str, detail: ScoreDetail) -> dict[str, str]:
+    evidence_items = detail.get("evidence") or []
+    if not isinstance(evidence_items, list):
+        evidence_items = [str(evidence_items)] if evidence_items else []
+
+    ranked_items = sorted(
+        (str(item or "").strip() for item in evidence_items if str(item or "").strip()),
+        key=lambda item: _representative_evidence_priority(dimension, item),
+        reverse=True,
+    )
+    if ranked_items:
+        return _parse_representative_evidence(ranked_items[0], default_label="代表证据")
+
+    reason = str(detail.get("reason") or "").strip()
+    return _parse_representative_evidence(reason, default_label="评分说明") if reason else {}
+
+
+def hydrate_representative_evidence(details: DetailedScores) -> DetailedScores:
+    for dimension in SCORE_DIMENSION_ORDER:
+        detail = details.get(dimension)
+        if not isinstance(detail, dict):
+            continue
+
+        representative = _select_representative_evidence(dimension, detail)
+        if not representative:
+            detail.pop("representative_evidence", None)
+            continue
+
+        existing_meta = detail.get("meta")
+        meta = existing_meta if isinstance(existing_meta, dict) else {}
+        meta["representative_evidence_text"] = representative.get("text", "")
+        detail["meta"] = meta
+        detail["representative_evidence"] = {
+            "dimension": dimension,
+            "label": representative.get("label", "代表证据"),
+            "text": representative.get("text", ""),
+            "raw": representative.get("raw", representative.get("text", "")),
+        }
+    return details
 
 
 def _skill_match(required_skill: str, resume_skill: str) -> bool:
@@ -149,148 +282,320 @@ def _score_experience(parsed_resume: dict[str, Any], role_profile: dict[str, Any
     result_hits = sum(1 for f in fragments if f.get("result_keywords"))
     role_hits = sum(1 for f in fragments if f.get("role_keywords"))
 
-    completeness_score = 1
-    if len(fragments) >= 1:
-        completeness_score += 1
-    if time_hits >= 1 and action_hits >= 1:
-        completeness_score += 1
-    if result_hits >= 1 or role_hits >= 1:
-        completeness_score += 1
-
     # 层次 2：岗位相关性（模板化）
-    generic_action_keywords = ["负责", "推动", "协调", "落地", "分析"]
+    generic_action_keywords = ["负责", "参与", "协助", "配合", "推动", "协调", "跟进", "支持", "落地", "分析"]
+    base_output_keywords = ["文档", "报告", "方案", "原型", "策略", "结论", "洞察", "看板", "报表"]
+    extra_result_keywords = ["提升", "增长", "降低", "转化", "留存", "效率", "准确率", "召回率", "结论", "洞察", "复盘"]
+    pm_support_keywords = ["需求分析", "需求拆解", "prd", "需求文档", "原型", "竞品", "竞品分析", "产品方案", "上线", "复盘"]
+    pm_secondary_keywords = ["用户研究", "用户访谈", "ab测试", "a/b测试"]
+    data_support_keywords = ["sql", "python", "数据分析", "业务分析", "指标", "指标体系", "报表", "看板", "可视化", "实验", "ab测试", "a/b测试", "分析报告"]
+    research_method_keywords = ["用户访谈", "访谈", "访谈提纲", "问卷", "问卷设计", "可用性测试", "定性研究", "定量研究", "用户研究", "研究方案"]
+    research_support_keywords = research_method_keywords + ["样本", "研究报告", "洞察", "研究结论", "建议"]
     method_keywords = role_profile.get("experience_method_keywords") or []
     ai_product_keywords = role_profile.get("experience_ai_keywords") or []
     eval_keywords = role_profile.get("experience_eval_keywords") or []
+    core_keywords = role_profile.get("experience_core_keywords") or method_keywords
+    output_keywords = list(dict.fromkeys((role_profile.get("experience_output_keywords") or []) + base_output_keywords))
+
+    role_kind = "default"
+    role_focus_label = "岗位核心方法与产出"
+    if role_profile is AI_PM_PROFILE:
+        role_kind = "ai_pm"
+        role_focus_label = "AI 产品方法与模型/业务落地"
+    elif role_profile is GENERAL_PM_PROFILE:
+        role_kind = "general_pm"
+        role_focus_label = "产品需求分析与方案落地"
+    elif role_profile is DATA_ANALYST_PROFILE:
+        role_kind = "data_analyst"
+        role_focus_label = "数据分析方法与业务洞察"
+    elif role_profile is USER_RESEARCH_PROFILE:
+        role_kind = "user_research"
+        role_focus_label = "研究方法与洞察输出"
 
     ai_hits = 0
     method_hits = 0
     eval_hits = 0
+    output_hits = 0
+    result_signal_hits = 0
     generic_hits = 0
-    ai_project_or_intern_hits = 0
-    quote_lines: list[str] = []
+    role_core_hits = 0
 
-    for f in fragments:
-        raw = (f.get("raw_text") or "")
-        raw_norm = raw.lower().replace(" ", "")
+    ai_fragments = 0
+    method_fragments = 0
+    eval_fragments = 0
+    method_signal_fragments = 0
+    output_fragments = 0
+    result_signal_fragments = 0
+    role_core_fragments = 0
+    generic_fragments = 0
+    generic_only_fragments = 0
+    strong_fragments = 0
+    triad_fragments = 0
 
-        matched_ai = any(k.replace(" ", "") in raw_norm for k in ai_product_keywords)
-        matched_method = any(k.replace(" ", "") in raw_norm for k in method_keywords)
-        matched_eval = any(k.replace(" ", "") in raw_norm for k in eval_keywords)
-        matched_generic = any(k.replace(" ", "") in raw_norm for k in generic_action_keywords)
-        matched_ai_project_or_intern = matched_ai and any(k in raw_norm for k in ["项目", "实习", "产品"])
+    method_signal_keywords: list[str] = []
+    output_signal_keywords: list[str] = []
+    result_signal_keywords: list[str] = []
+    fragment_candidates: list[dict[str, Any]] = []
+    normalized_fragments: list[str] = []
 
-        if matched_ai:
-            ai_hits += 1
+    for fragment in fragments:
+        raw = (fragment.get("raw_text") or "").strip()
+        raw_norm = _norm_text(raw)
+        normalized_fragments.append(raw_norm)
+
+        ai_matches = _collect_keyword_hits(raw_norm, ai_product_keywords)
+        method_matches = _collect_keyword_hits(raw_norm, method_keywords)
+        eval_matches = _collect_keyword_hits(raw_norm, eval_keywords)
+        role_core_matches = _collect_keyword_hits(raw_norm, core_keywords)
+        output_matches = _collect_keyword_hits(raw_norm, output_keywords)
+        extra_result_matches = _collect_keyword_hits(raw_norm, extra_result_keywords)
+        parsed_result_matches = fragment.get("result_keywords") or []
+        result_matches = list(dict.fromkeys(parsed_result_matches + extra_result_matches))
+        generic_matches = _collect_keyword_hits(raw_norm, generic_action_keywords)
+
+        matched_method = bool(ai_matches or method_matches or eval_matches)
+        matched_output = bool(output_matches)
+        matched_result = bool(result_matches)
+        matched_role_core = bool(role_core_matches)
+        matched_generic = bool(generic_matches)
+        matched_generic_only = matched_generic and not (matched_method or matched_output or matched_result or matched_role_core)
+        matched_strong = matched_method and (matched_output or matched_result) and matched_role_core
+        matched_triad = matched_method and matched_output and matched_result and matched_role_core
+
+        ai_hits += len(ai_matches)
+        method_hits += len(method_matches)
+        eval_hits += len(eval_matches)
+        output_hits += len(output_matches)
+        result_signal_hits += len(result_matches)
+        generic_hits += len(generic_matches)
+        role_core_hits += len(role_core_matches)
+
+        if ai_matches:
+            ai_fragments += 1
+        if method_matches:
+            method_fragments += 1
+        if eval_matches:
+            eval_fragments += 1
         if matched_method:
-            method_hits += 1
-        if matched_eval:
-            eval_hits += 1
-        if matched_generic:
-            generic_hits += 1
-        if matched_ai_project_or_intern:
-            ai_project_or_intern_hits += 1
+            method_signal_fragments += 1
+        if output_matches:
+            output_fragments += 1
+        if result_matches:
+            result_signal_fragments += 1
+        if role_core_matches:
+            role_core_fragments += 1
+        if generic_matches:
+            generic_fragments += 1
+        if matched_generic_only:
+            generic_only_fragments += 1
+        if matched_strong:
+            strong_fragments += 1
+        if matched_triad:
+            triad_fragments += 1
 
-        if (matched_method or matched_ai or matched_eval or matched_generic) and len(quote_lines) < 3:
-            quote_lines.append(_snippet(raw))
+        _extend_unique(method_signal_keywords, ai_matches + method_matches + eval_matches + role_core_matches)
+        _extend_unique(output_signal_keywords, output_matches)
+        _extend_unique(result_signal_keywords, result_matches)
 
-    # 相关性分数：AI/产品方法/评估信号主导，通用动作词仅弱加分
-    relevance_score = 0
-    if ai_hits >= 1:
-        relevance_score += 2
-    if method_hits >= 2:
-        relevance_score += 2
-    elif method_hits == 1:
-        relevance_score += 1
-    if eval_hits >= 1:
-        relevance_score += 1
-    if ai_project_or_intern_hits >= 1:
-        relevance_score += 1
-    if generic_hits >= 1:
-        relevance_score += 1  # 弱加分
+        candidate_labels: list[str] = []
+        if matched_role_core:
+            candidate_labels.append("模板命中")
+        if matched_method:
+            candidate_labels.append("方法")
+        if matched_output:
+            candidate_labels.append("产出")
+        if matched_result:
+            candidate_labels.append("结果")
+        if matched_generic_only or (matched_generic and not candidate_labels):
+            candidate_labels.append("通用执行")
 
-    raw_score = completeness_score + relevance_score
+        rank = 0
+        if matched_triad:
+            rank += 7
+        elif matched_strong:
+            rank += 5
+        elif matched_method and (matched_output or matched_result):
+            rank += 4
+        elif matched_method:
+            rank += 2
+        if matched_role_core:
+            rank += 2
+        if matched_output:
+            rank += 1
+        if matched_result:
+            rank += 1
+        if matched_generic_only:
+            rank -= 1
 
-    # 约束：若只有通用动作词、没有 AI / 产品方法证据，上限不高
-    has_ai_or_method = (ai_hits + method_hits + eval_hits) > 0
-    if not has_ai_or_method and generic_hits > 0:
-        score = min(_clip_score(raw_score), int(role_profile.get("hard_cap_when_generic_only") or 3))
-    else:
-        score = _clip_score(raw_score)
+        focus_keywords = list(dict.fromkeys((ai_matches + method_matches + eval_matches + role_core_matches + output_matches + result_matches)[:3]))
+        fragment_candidates.append(
+            {
+                "rank": rank,
+                "raw": raw,
+                "label": "+".join(candidate_labels) if candidate_labels else "一般经历",
+                "keywords": focus_keywords,
+                "generic_only": matched_generic_only,
+            }
+        )
 
-    if role_profile is DATA_ANALYST_PROFILE:
-        if has_ai_or_method and score >= 4:
-            reason = "候选人具备较完整的数据分析项目证据，能体现指标分析与业务洞察能力。"
-        elif not has_ai_or_method and generic_hits > 0:
-            reason = "经历以通用执行描述为主，缺少数据分析方法与项目证据，建议重点核验。"
-        else:
-            reason = "具备部分数据分析经历，但业务结论与项目支撑仍需面试进一步确认。"
-    elif has_ai_or_method and score >= 4:
-        reason = "候选人在 AI 产品项目中展示了较完整的方法与落地证据，岗位相关性较好。"
-    elif not has_ai_or_method and generic_hits > 0:
-        reason = "经历中以通用执行动作为主，AI 产品方法与关键证据偏弱，建议重点核验。"
-    else:
-        reason = "经历与岗位存在一定匹配，但关键 AI 产品证据仍需在面试中进一步确认。"
+    has_ai_or_method = (ai_fragments + method_fragments + eval_fragments) > 0
+    has_output_signal = output_fragments > 0
+    has_result_signal = result_signal_fragments > 0
+    has_role_core_support = role_core_fragments > 0
+    has_method_output_result = triad_fragments > 0
+    has_method_and_output_or_result = strong_fragments > 0 or (has_ai_or_method and (has_output_signal or has_result_signal))
 
-    has_data_project_support = method_hits > 0 and any(
-        kw in (f.get("raw_text") or "").lower().replace(" ", "") for f in fragments for kw in ["数据", "指标", "sql", "python", "报表", "可视化"]
-    )
-    has_research_project_support = method_hits > 0 and any(
-        kw in (f.get("raw_text") or "").lower().replace(" ", "")
-        for f in fragments
-        for kw in ["研究", "访谈", "问卷", "可用性", "洞察", "报告"]
-    )
-    has_pm_project_support = method_hits > 0 and any(
-        kw in (f.get("raw_text") or "").lower().replace(" ", "")
-        for f in fragments
-        for kw in ["产品", "需求", "prd", "原型", "竞品", "用户"]
-    )
     has_prd_or_prototype = any(
-        kw in (f.get("raw_text") or "").lower().replace(" ", "")
-        for f in fragments
-        for kw in ["prd", "需求文档", "原型", "axure", "figma"]
+        any(keyword in raw_norm for keyword in ["prd", "需求文档", "原型", "axure", "figma"]) for raw_norm in normalized_fragments
     )
-    market_activity_only = all(
-        any(k in (f.get("raw_text") or "").lower().replace(" ", "") for k in ["活动", "运营", "拉新", "投放", "传播"])
-        and not any(k in (f.get("raw_text") or "").lower().replace(" ", "") for k in ["访谈", "问卷", "可用性", "洞察", "研究"])
-        for f in fragments
-    ) if fragments else False
+    has_pm_project_support = has_role_core_support and any(
+        any(keyword in raw_norm for keyword in pm_support_keywords) for raw_norm in normalized_fragments
+    )
+    has_pm_secondary_support = any(
+        any(keyword in raw_norm for keyword in pm_secondary_keywords) for raw_norm in normalized_fragments
+    )
+    has_data_project_support = has_role_core_support and any(
+        any(keyword in raw_norm for keyword in data_support_keywords) for raw_norm in normalized_fragments
+    )
+    has_research_project_support = has_role_core_support and any(
+        any(keyword in raw_norm for keyword in research_method_keywords) for raw_norm in normalized_fragments
+    )
+    has_ai_project_support = ai_fragments > 0
+    has_sql_or_metric_support = any(
+        any(keyword in raw_norm for keyword in ["sql", "指标", "指标体系", "报表", "看板", "可视化", "实验", "ab测试", "a/b测试", "python"])
+        for raw_norm in normalized_fragments
+    )
+    has_research_method_support = any(
+        any(keyword in raw_norm for keyword in research_method_keywords)
+        for raw_norm in normalized_fragments
+    )
+    market_activity_only = bool(normalized_fragments) and all(
+        any(keyword in raw_norm for keyword in ["活动", "运营", "拉新", "投放", "传播", "社媒", "增长运营"])
+        and not any(keyword in raw_norm for keyword in research_support_keywords)
+        for raw_norm in normalized_fragments
+    )
 
-    if role_profile is GENERAL_PM_PROFILE:
-        if has_ai_or_method and has_pm_project_support and score >= 4:
-            reason = "候选人具备较完整的产品方法与项目实践证据，能够支撑通用产品岗位推进。"
-        elif not has_pm_project_support:
-            reason = "产品项目或实习支撑不足，建议重点核验需求拆解与方案落地能力。"
-            score = min(score, 3)
-        elif not has_prd_or_prototype:
-            reason = "经历中缺少 PRD/原型等关键交付证据，建议重点追问方法论实操。"
-            score = min(score, 3)
-        else:
-            reason = "具备部分产品岗位相关经历，但关键交付证据仍需在面试中进一步确认。"
+    role_high_support = has_role_core_support
+    role_top_support = has_method_output_result and has_role_core_support
+    if role_kind == "ai_pm":
+        role_high_support = has_pm_project_support and has_ai_project_support and (has_prd_or_prototype or has_output_signal)
+        role_top_support = role_high_support and has_prd_or_prototype and has_method_output_result
+    elif role_kind == "general_pm":
+        role_high_support = has_pm_project_support and (has_prd_or_prototype or has_pm_secondary_support)
+        role_top_support = role_high_support and has_prd_or_prototype and has_method_output_result
+    elif role_kind == "data_analyst":
+        role_high_support = has_data_project_support and has_sql_or_metric_support
+        role_top_support = role_high_support and has_method_output_result
+    elif role_kind == "user_research":
+        role_high_support = has_research_project_support and has_research_method_support and not market_activity_only
+        role_top_support = role_high_support and has_method_output_result and has_output_signal
 
-    if role_profile is USER_RESEARCH_PROFILE:
-        if has_ai_or_method and score >= 4:
-            reason = "候选人呈现了较完整的研究方法与研究产出证据，岗位匹配度较好。"
-        elif market_activity_only:
-            reason = "经历偏市场活动执行，尚不足以直接代表用户研究能力，建议重点核验研究方法。"
-            score = min(score, 3)
-        else:
-            reason = "研究经历存在，但方法与可验证产出证据仍需进一步确认。"
+    score = 1
+    if fragments:
+        score = 2
+    if has_ai_or_method or has_role_core_support:
+        score = 3
+    if has_method_and_output_or_result and role_high_support:
+        score = 4
+    if has_method_output_result and role_top_support:
+        score = 5
+
+    if not has_ai_or_method and generic_fragments > 0:
+        score = min(score, 2, int(role_profile.get("hard_cap_when_generic_only") or 3))
+    elif has_ai_or_method and not (has_output_signal or has_result_signal):
+        score = min(score, 3)
+
+    if role_kind == "ai_pm" and not has_ai_project_support:
+        score = min(score, 3)
+    if role_kind in {"ai_pm", "general_pm"} and score >= 4 and not has_prd_or_prototype and not has_output_signal:
+        score = min(score, 3)
+    if role_kind == "data_analyst" and score >= 4 and not has_sql_or_metric_support:
+        score = min(score, 3)
+    if role_kind == "user_research" and market_activity_only:
+        score = min(score, 2 if not has_research_method_support else 3)
+
+    score = _clip_score(score)
+
+    method_preview_values = method_signal_keywords[:3]
+    output_preview_values = [value for value in output_signal_keywords if value not in method_preview_values][:3]
+    result_preview_values = [
+        value
+        for value in result_signal_keywords
+        if value not in method_preview_values and value not in output_preview_values
+    ][:3] or result_signal_keywords[:3]
+
+    method_preview = "、".join(method_preview_values) if method_preview_values else ""
+    output_preview = "、".join(output_preview_values) if output_preview_values else ""
+    result_preview = "、".join(result_preview_values) if result_preview_values else ""
+
+    experience_pattern = "limited_relevance"
+    if not has_ai_or_method and generic_fragments > 0:
+        experience_pattern = "generic_execution_only"
+        reason = f"经历主要停留在“负责/推动/协调”等通用执行描述，缺少与 {role_focus_label} 直接相关的方法、产出和结果证据。"
+    elif has_ai_or_method and not (has_output_signal or has_result_signal):
+        experience_pattern = "method_without_outcome"
+        reason = (
+            f"已出现 {method_preview or '岗位相关方法'} 等方法信号，但缺少明确产出或结果，"
+            "相关经历暂不宜给到高分。"
+        )
+    elif score >= 5:
+        experience_pattern = "strong_template_match"
+        reason = (
+            f"同时呈现 {method_preview or '岗位相关方法'} 等方法，具备 {output_preview or '关键交付'} 与 "
+            f"{result_preview or '结果信号'}，且与 {role_focus_label} 高度匹配。"
+        )
+    elif score == 4:
+        experience_pattern = "method_output_or_result"
+        reason = (
+            f"具备 {method_preview or '岗位相关方法'}，并给出了 {output_preview or result_preview or '产出/结果'} 等证据，"
+            f"与 {role_focus_label} 的核心任务较为匹配。"
+        )
+    else:
+        experience_pattern = "partial_template_match"
+        reason = (
+            f"有 {method_preview or '部分岗位相关方法'} 与 {output_preview or result_preview or '零散产出/结果'} 证据，"
+            f"但与 {role_focus_label} 的直接匹配仍不够完整，建议面试继续核验。"
+        )
 
     evidence = [
+        f"关键链路：方法({method_signal_fragments})/产出({output_fragments})/结果({result_signal_fragments})/仅通用执行({generic_only_fragments})",
         f"完整度信号：时间({time_hits})/动作({action_hits})/结果({result_hits})/角色({role_hits})",
-        f"岗位相关命中：AI词({ai_hits})/产品方法词({method_hits})/评估优化词({eval_hits})/通用动作词({generic_hits})",
-        f"AI 产品项目/实习证据命中：{ai_project_or_intern_hits}",
-        f"研究项目支撑：{'有' if has_research_project_support else '无'}；市场活动替代风险：{'是' if market_activity_only else '否'}",
-        f"产品项目支撑：{'有' if has_pm_project_support else '无'}；PRD/原型证据：{'有' if has_prd_or_prototype else '无'}",
     ]
-    for q in quote_lines:
-        evidence.append(f"原文片段：{q}")
+
+    if role_kind == "ai_pm":
+        evidence.append(
+            f"AI 产品支撑：{_bool_cn(has_ai_project_support)}；产品任务支撑：{_bool_cn(has_pm_project_support)}；PRD/原型：{_bool_cn(has_prd_or_prototype)}"
+        )
+    elif role_kind == "general_pm":
+        evidence.append(
+            f"产品任务支撑：{_bool_cn(has_pm_project_support)}；PRD/原型：{_bool_cn(has_prd_or_prototype)}；需求/用户/A-B/上线复盘命中：{_bool_cn(has_role_core_support)}"
+        )
+    elif role_kind == "data_analyst":
+        evidence.append(
+            f"数据分析支撑：{_bool_cn(has_data_project_support)}；SQL/指标/报表/实验：{_bool_cn(has_sql_or_metric_support)}；业务结论/洞察：{_bool_cn(has_result_signal)}"
+        )
+    elif role_kind == "user_research":
+        evidence.append(
+            f"研究任务支撑：{_bool_cn(has_research_project_support)}；访谈/问卷/可用性：{_bool_cn(has_research_method_support)}；市场活动替代风险：{'是' if market_activity_only else '否'}"
+        )
+    else:
+        evidence.append(
+            f"模板命中：核心任务({role_core_fragments})；方法关键词({method_hits + eval_hits + ai_hits})；产出关键词({output_hits})；结果关键词({result_signal_hits})"
+        )
+
+    ranked_candidates = sorted(
+        fragment_candidates,
+        key=lambda item: (item["rank"], len(item["keywords"]), len(item["raw"])),
+        reverse=True,
+    )
+    for candidate in ranked_candidates[:2]:
+        keyword_hint = f"；命中：{'、'.join(candidate['keywords'])}" if candidate["keywords"] else ""
+        evidence.append(f"代表片段（{candidate['label']}）：{_snippet(candidate['raw'], max_len=60)}{keyword_hint}")
 
     return {
         "score": score,
         "reason": reason,
-        "evidence": _top_evidence(evidence),
+        "evidence": _top_evidence(evidence, limit=4),
         "meta": {
             "has_ai_or_method": has_ai_or_method,
             "has_data_project_support": has_data_project_support,
@@ -298,6 +603,10 @@ def _score_experience(parsed_resume: dict[str, Any], role_profile: dict[str, Any
             "has_pm_project_support": has_pm_project_support,
             "has_prd_or_prototype": has_prd_or_prototype,
             "market_activity_only": market_activity_only,
+            "has_output_signal": has_output_signal,
+            "has_result_signal": has_result_signal,
+            "has_method_output_result": has_method_output_result,
+            "experience_pattern": experience_pattern,
         },
     }
 
@@ -565,6 +874,7 @@ def score_candidate(parsed_jd: dict[str, Any], parsed_resume: dict[str, Any]) ->
     details["综合推荐度"].setdefault("evidence", []).append(
         f"岗位自定义评分配置：{'已启用' if has_custom_config else '未启用（使用模板默认）'}"
     )
+    hydrate_representative_evidence(details)
     return details
 
 

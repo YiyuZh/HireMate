@@ -82,8 +82,10 @@ AI_PM_PROFILE: dict[str, Any] = {
         "大模型", "llm", "prompt", "rag", "agent", "知识库", "模型评估", "数据分析", "prd", "原型", "用户研究"
     ],
     "experience_ai_keywords": ["大模型", "llm", "aigc", "agent", "rag", "prompt", "知识库"],
-    "experience_method_keywords": ["需求分析", "prd", "产品方案", "原型", "原型设计", "用户研究"],
-    "experience_eval_keywords": ["模型评估", "评估", "数据分析", "迭代", "优化", "实验", "ab测试", "a/b测试"],
+    "experience_method_keywords": ["需求分析", "需求拆解", "prd", "产品方案", "原型", "原型设计", "用户研究", "用户访谈", "竞品分析"],
+    "experience_eval_keywords": ["模型评估", "评估", "数据分析", "迭代", "优化", "实验", "ab测试", "a/b测试", "上线复盘"],
+    "experience_core_keywords": ["需求分析", "需求拆解", "prd", "需求文档", "原型", "竞品", "用户研究", "用户访谈", "ab测试", "a/b测试", "上线", "复盘", "模型评估", "prompt", "rag", "agent"],
+    "experience_output_keywords": ["prd", "需求文档", "原型", "产品方案", "策略", "评估报告", "复盘", "分析结论", "方案"],
     "hard_cap_when_generic_only": 3,
 }
 
@@ -97,8 +99,10 @@ GENERAL_PM_PROFILE: dict[str, Any] = {
         "需求分析", "用户需求", "prd", "需求文档", "原型", "axure", "figma", "用户研究", "竞品分析", "数据分析"
     ],
     "experience_ai_keywords": [],
-    "experience_method_keywords": ["需求分析", "prd", "原型", "用户研究", "竞品", "产品方案", "需求拆解"],
-    "experience_eval_keywords": ["数据分析", "指标", "转化", "留存", "复盘", "迭代", "优化", "ab测试", "a/b测试"],
+    "experience_method_keywords": ["需求分析", "prd", "原型", "用户研究", "用户访谈", "竞品", "产品方案", "需求拆解"],
+    "experience_eval_keywords": ["数据分析", "指标", "转化", "留存", "复盘", "迭代", "优化", "ab测试", "a/b测试", "上线复盘"],
+    "experience_core_keywords": ["需求分析", "需求拆解", "prd", "需求文档", "原型", "竞品", "竞品分析", "用户研究", "用户访谈", "ab测试", "a/b测试", "上线", "复盘", "产品方案"],
+    "experience_output_keywords": ["prd", "需求文档", "原型", "产品方案", "流程图", "竞品分析", "复盘", "策略", "方案"],
     "hard_cap_when_generic_only": 3,
     "weights": {
         "教育背景匹配度": 0.18,
@@ -117,8 +121,10 @@ DATA_ANALYST_PROFILE: dict[str, Any] = {
     "signals": ["数据分析师", "数据分析实习生", "数据分析", "指标体系", "a/b测试", "ab测试", "报表", "可视化"],
     "skill_focus_keywords": ["sql", "python", "excel", "指标体系", "a/b测试", "ab测试", "数据分析", "报表", "可视化"],
     "experience_ai_keywords": [],
-    "experience_method_keywords": ["数据分析", "业务分析", "指标体系", "报表", "可视化", "ab测试", "a/b测试"],
-    "experience_eval_keywords": ["分析", "结论", "洞察", "优化", "迭代", "指标", "实验"],
+    "experience_method_keywords": ["数据分析", "业务分析", "sql", "python", "指标体系", "报表", "可视化", "ab测试", "a/b测试", "分析报告"],
+    "experience_eval_keywords": ["分析", "结论", "洞察", "优化", "迭代", "指标", "实验", "业务结论"],
+    "experience_core_keywords": ["sql", "python", "数据分析", "业务分析", "指标", "指标体系", "报表", "看板", "可视化", "ab测试", "a/b测试", "实验", "分析报告", "业务结论"],
+    "experience_output_keywords": ["分析报告", "报表", "看板", "可视化", "洞察", "结论", "指标体系", "复盘"],
     "hard_cap_when_generic_only": 3,
     "weights": {
         "教育背景匹配度": 0.16,
@@ -141,8 +147,10 @@ USER_RESEARCH_PROFILE: dict[str, Any] = {
         "定性研究", "定量研究", "用户访谈", "问卷设计", "可用性测试", "洞察提炼", "研究报告", "研究项目"
     ],
     "experience_ai_keywords": [],
-    "experience_method_keywords": ["定性研究", "定量研究", "用户访谈", "问卷设计", "可用性测试", "可用性", "用户研究"],
-    "experience_eval_keywords": ["洞察", "研究结论", "建议", "研究报告", "分析", "样本", "方法"],
+    "experience_method_keywords": ["定性研究", "定量研究", "用户访谈", "访谈提纲", "问卷设计", "问卷", "可用性测试", "可用性", "用户研究", "研究方案"],
+    "experience_eval_keywords": ["洞察", "研究结论", "建议", "研究报告", "分析", "样本", "方法", "洞察输出"],
+    "experience_core_keywords": ["用户访谈", "访谈", "访谈提纲", "问卷", "问卷设计", "可用性测试", "定性研究", "定量研究", "用户研究", "研究方案", "样本"],
+    "experience_output_keywords": ["研究报告", "洞察", "研究结论", "建议", "访谈纪要", "问卷结果", "可用性测试报告"],
     "hard_cap_when_generic_only": 3,
     "weights": {
         "教育背景匹配度": 0.14,
@@ -165,6 +173,8 @@ DEFAULT_PROFILE: dict[str, Any] = {
     "experience_ai_keywords": [],
     "experience_method_keywords": ["需求分析", "prd", "原型", "用户研究"],
     "experience_eval_keywords": ["数据分析", "优化", "迭代", "ab测试", "a/b测试"],
+    "experience_core_keywords": ["需求分析", "prd", "原型", "用户研究", "数据分析", "sql", "访谈", "问卷"],
+    "experience_output_keywords": ["文档", "报告", "方案", "结论", "洞察"],
     "hard_cap_when_generic_only": 3,
 }
 

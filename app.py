@@ -8,7 +8,9 @@ from hashlib import sha256
 import json
 import os
 import re
+import sys
 from time import perf_counter
+import traceback
 from uuid import uuid4
 
 import streamlit as st
@@ -22,7 +24,7 @@ from src.auth import (
     mark_login_success,
     reset_user_password,
 )
-from src.db import get_connection, init_db
+from src.db import get_connection, get_db_backend, init_db
 from src.interviewer import build_interview_plan
 from src.legacy_json_compat import migrate_legacy_json_if_needed
 from src.utils import load_env
@@ -81,7 +83,7 @@ from src.ai_reviewer import (
     test_ai_connection,
 )
 from src.scorer import score_candidate, to_score_values
-from src.screener import build_screening_decision
+from src.screener import build_evidence_bridge, build_screening_decision, collect_evidence_snippets
 from src.user_store import count_users, get_user_by_id, list_users, set_user_active, set_user_admin
 from src.v2_workspace import (
     build_candidate_row,
@@ -92,9 +94,22 @@ from src.v2_workspace import (
 )
 
 load_env()
-init_db()
-if os.getenv("HIREMATE_AUTO_MIGRATE_JSON", "0").strip() == "1":
-    migrate_legacy_json_if_needed()
+_APP_DB_INIT_ERROR: Exception | None = None
+_APP_DB_INIT_TRACEBACK = ""
+_APP_DB_INIT_BACKEND = get_db_backend()
+
+try:
+    init_db()
+    if os.getenv("HIREMATE_AUTO_MIGRATE_JSON", "0").strip() == "1":
+        migrate_legacy_json_if_needed()
+except Exception as exc:  # noqa: BLE001
+    _APP_DB_INIT_ERROR = exc
+    _APP_DB_INIT_TRACEBACK = traceback.format_exc()
+    print(
+        f"[HireMate] Database initialization failed for backend={_APP_DB_INIT_BACKEND}: {exc}",
+        file=sys.stderr,
+    )
+    traceback.print_exc()
 
 SAMPLE_JD = """岗位名称：AI 产品经理实习生
 
@@ -138,28 +153,80 @@ def _short_text(raw: str, max_len: int = 90) -> str:
     return text[: max_len - 1] + "…"
 
 
-def _collect_evidence_snippets(parsed_resume: dict, max_items: int = 5) -> list[dict]:
-    snippets: list[dict] = []
+def _collect_evidence_snippets(parsed_resume: dict, parsed_jd: dict | None = None, max_items: int = 5) -> list[dict]:
+    return collect_evidence_snippets(
+        parsed_resume,
+        parsed_jd=parsed_jd if isinstance(parsed_jd, dict) else {},
+        limit=max_items,
+    )
 
-    for frag in parsed_resume.get("internships") or []:
-        raw = (frag.get("raw_text") or "").strip()
-        if raw:
-            snippets.append({"source": "实习", "text": _short_text(raw)})
-        if len(snippets) >= max_items:
-            return snippets
 
-    for frag in parsed_resume.get("projects") or []:
-        raw = (frag.get("raw_text") or "").strip()
-        if raw:
-            snippets.append({"source": "项目", "text": _short_text(raw)})
-        if len(snippets) >= max_items:
-            return snippets
+def _dimension_chip_label(dimension: str) -> str:
+    mapping = {
+        "教育背景匹配度": "教育",
+        "相关经历匹配度": "经历",
+        "技能匹配度": "技能",
+        "表达完整度": "表达",
+        "综合推荐度": "综合",
+    }
+    return mapping.get(str(dimension or "").strip(), str(dimension or "其他"))
 
-    education = (parsed_resume.get("education") or "").strip()
-    if education and len(snippets) < max_items:
-        snippets.append({"source": "教育", "text": _short_text(education)})
 
-    return snippets
+def _sync_detail_evidence_bridge(detail: dict) -> dict:
+    score_details = detail.get("score_details") if isinstance(detail.get("score_details"), dict) else {}
+    evidence_snippets = detail.get("evidence_snippets") if isinstance(detail.get("evidence_snippets"), list) else []
+    bridge = build_evidence_bridge(score_details, evidence_snippets)
+    if isinstance(bridge.get("score_details"), dict):
+        detail["score_details"] = bridge["score_details"]
+    if isinstance(bridge.get("summary_snippets"), list):
+        detail["evidence_snippets"] = bridge["summary_snippets"]
+    detail["evidence_bridge"] = bridge if isinstance(bridge, dict) else {}
+    return detail.get("evidence_bridge") if isinstance(detail.get("evidence_bridge"), dict) else {}
+
+
+def _remaining_dimension_evidence(detail: dict) -> list[str]:
+    evidence = detail.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = [str(evidence)] if evidence else []
+    representative = detail.get("representative_evidence") if isinstance(detail.get("representative_evidence"), dict) else {}
+    representative_raw = str(representative.get("raw") or "").strip()
+    if not representative_raw:
+        return evidence
+    return [item for item in evidence if str(item or "").strip() != representative_raw]
+
+
+def _render_dimension_evidence_summary(score_details: dict, evidence_bridge: dict | None = None) -> None:
+    bridge = evidence_bridge if isinstance(evidence_bridge, dict) else {}
+    rows = bridge.get("dimension_evidence") if isinstance(bridge.get("dimension_evidence"), list) else []
+    if not rows:
+        rows = []
+        ordered_dims = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度", "综合推荐度"]
+        for dim_name in ordered_dims:
+            dim_detail = score_details.get(dim_name) if isinstance(score_details.get(dim_name), dict) else {}
+            representative = dim_detail.get("representative_evidence") if isinstance(dim_detail.get("representative_evidence"), dict) else {}
+            if representative:
+                rows.append(representative)
+
+    if not rows:
+        st.caption("当前未提取到维度代表证据。")
+        return
+
+    for item in rows:
+        dim_name = str(item.get("dimension") or "其他")
+        score_value = str(item.get("score") or "-")
+        label = str(item.get("label") or "代表证据").strip()
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        chips = f"<span class='chip'>{_dimension_chip_label(dim_name)} {score_value}/5</span>"
+        if label:
+            chips += f"<span class='chip'>{label}</span>"
+        if str(item.get('linked_snippet_id') or '').strip():
+            chips += "<span class='chip'>摘要层已展示</span>"
+        st.markdown(
+            f"<div class='module-box'>{chips}{text}</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def _decision_summary(result_text: str) -> str:
@@ -172,7 +239,7 @@ def _decision_summary(result_text: str) -> str:
     return "建议结合面试与业务需求进一步判断。"
 
 
-def _show_decision(result_text: str) -> None:
+def _show_decision(result_text: str, reasons: list[str] | None = None) -> None:
     style = "status-success"
     if result_text == "建议人工复核":
         style = "status-warning"
@@ -180,6 +247,10 @@ def _show_decision(result_text: str) -> None:
         style = "status-error"
 
     summary = _decision_summary(result_text)
+    if result_text in {"建议人工复核", "暂不推荐"} and reasons:
+        first_reason = str(reasons[0] or "").strip()
+        if first_reason:
+            summary = _short_text(first_reason, max_len=72)
     st.markdown(
         (
             f"<div class='status-box {style}'><strong>初筛结论：</strong>{result_text}"
@@ -477,6 +548,32 @@ def _render_hero() -> None:
     )
 
 
+def _db_init_troubleshooting_tips(backend: str) -> list[str]:
+    if backend == "mysql":
+        return [
+            "如果 MySQL 8 使用 `caching_sha2_password` 或 `sha256_password`，请确认镜像内已安装 `cryptography`。",
+            "确认 MySQL 服务已经启动，并检查 `HIREMATE_MYSQL_HOST`、`HIREMATE_MYSQL_PORT`、`HIREMATE_MYSQL_USER`、`HIREMATE_MYSQL_PASSWORD`、`HIREMATE_MYSQL_DATABASE` 是否正确。",
+            "如果卡在 schema bootstrap，请确认数据库账号具备建表/建索引权限，并检查 `sql/mysql_schema.sql`、`sql/mysql_indexes.sql` 是否可正常执行。",
+        ]
+    return [
+        "确认 SQLite 数据目录存在且当前进程可写。",
+        "如果正在使用容器挂载卷，请确认 `/app/data` 对应用进程可写。",
+    ]
+
+
+def _render_db_init_error_page() -> None:
+    backend = _APP_DB_INIT_BACKEND or get_db_backend()
+    st.error(f"数据库初始化失败，当前 backend：`{backend}`")
+    st.caption("HireMate 没有静默降级到其他数据库后端，请先排查当前错误。")
+    st.markdown("**常见排查建议**")
+    for tip in _db_init_troubleshooting_tips(backend):
+        st.markdown(f"- {tip}")
+    st.markdown("**原始异常摘要**")
+    st.code(str(_APP_DB_INIT_ERROR) or "unknown database initialization error", language="text")
+    with st.expander("查看原始异常栈", expanded=False):
+        st.code(_APP_DB_INIT_TRACEBACK or "traceback unavailable", language="text")
+
+
 def _render_score_cards(score_details: dict) -> None:
     score_order = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度", "综合推荐度"]
     for i in range(0, len(score_order), 2):
@@ -488,15 +585,20 @@ def _render_score_cards(score_details: dict) -> None:
                 st.markdown(f"**{dim}**")
                 st.metric("分数", f"{detail.get('score', '-')}/5")
                 st.caption(_business_reason(dim, detail))
+                representative = detail.get("representative_evidence") if isinstance(detail.get("representative_evidence"), dict) else {}
+                representative_text = str(representative.get("text") or "").strip()
+                if representative_text:
+                    st.markdown(f"**代表证据：** {representative_text}")
 
                 evidence = detail.get("evidence")
                 if evidence:
                     with st.expander("查看证据", expanded=False):
-                        if isinstance(evidence, list):
-                            for item in evidence:
+                        remaining_evidence = _remaining_dimension_evidence(detail)
+                        if isinstance(remaining_evidence, list):
+                            for item in remaining_evidence:
                                 st.markdown(f"- {item}")
                         else:
-                            st.write(evidence)
+                            st.write(remaining_evidence)
                 st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1037,6 +1139,7 @@ def _persist_workspace_candidate_state(
     operator: dict[str, str] | None = None,
 ) -> bool:
     actor = operator or _current_operator()
+    _sync_detail_evidence_bridge(detail)
     details[candidate_id] = detail
     st.session_state.v2_rows = rows
     st.session_state.v2_details = details
@@ -1194,6 +1297,7 @@ def _restore_ai_baseline(
     selected_row["候选池"] = str(
         detail.get("baseline_candidate_pool") or _candidate_pool_label(selected_row.get("初筛结论", ""))
     )
+    _sync_detail_evidence_bridge(detail)
     _update_selected_row_from_detail(detail, selected_row)
     return True
 
@@ -2751,10 +2855,19 @@ def _render_evidence_snippets(snippets: list[dict]) -> None:
         return
 
     for item in snippets:
+        if not isinstance(item, dict):
+            item = {"source": "其他", "text": str(item or "")}
         source = item.get("source", "其他")
         text = item.get("text", "")
+        tag = str(item.get("tag") or "").strip()
+        related_dimensions = item.get("related_dimensions") if isinstance(item.get("related_dimensions"), list) else []
+        chips = f"<span class='chip'>{source}</span>"
+        if tag:
+            chips += f"<span class='chip'>{tag}</span>"
+        for dim_name in related_dimensions[:3]:
+            chips += f"<span class='chip'>{_dimension_chip_label(str(dim_name))}</span>"
         st.markdown(
-            f"<div class='module-box'><span class='chip'>{source}</span>{text}</div>",
+            f"<div class='module-box'>{chips}{text}</div>",
             unsafe_allow_html=True,
         )
 
@@ -2861,6 +2974,7 @@ def _build_review_record(result: dict, jd_title: str, resume_file: str = "") -> 
         "risk_points": risk_result.get("risk_points", []),
         "interview_summary": interview_plan.get("interview_summary", ""),
         "evidence_snippets": result.get("evidence_snippets", []),
+        "evidence_bridge": result.get("evidence_bridge", {}),
         "ai_review_status": str(result.get("ai_review_status") or "not_generated"),
         "ai_input_hash": str(result.get("ai_input_hash") or ""),
         "ai_prompt_version": str(result.get("ai_prompt_version") or ""),
@@ -3744,7 +3858,12 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
         screening_result=screening_result["screening_result"],
     )
 
-    evidence_snippets = _collect_evidence_snippets(parsed_resume)
+    evidence_snippets = _collect_evidence_snippets(parsed_resume, parsed_jd=parsed_jd)
+    evidence_bridge = build_evidence_bridge(score_details, evidence_snippets)
+    if isinstance(evidence_bridge.get("score_details"), dict):
+        score_details = evidence_bridge["score_details"]
+    if isinstance(evidence_bridge.get("summary_snippets"), list):
+        evidence_snippets = evidence_bridge["summary_snippets"]
 
     return {
         "parsed_jd": parsed_jd,
@@ -3755,6 +3874,7 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
         "screening_result": screening_result,
         "interview_plan": interview_plan,
         "evidence_snippets": evidence_snippets,
+        "evidence_bridge": evidence_bridge,
         "ai_review_suggestion": {},
         "ai_review_status": "not_generated",
         "ai_input_hash": "",
@@ -3824,8 +3944,16 @@ def _apply_jd_to_workspace(title: str) -> None:
     st.session_state.v2_selected_jd_prev = clean_title
     st.session_state.v2_jd_text_area = jd_text
     st.session_state.batch_selected_jd_prev = clean_title
-    st.session_state.batch_jd_text_area = jd_text
+    st.session_state.batch_jd_text_area_pending = jd_text
     st.session_state.workspace_selected_jd_title = clean_title
+
+
+def _apply_pending_batch_jd_text_area() -> None:
+    if "batch_jd_text_area_pending" not in st.session_state:
+        return
+    pending_text = str(st.session_state.pop("batch_jd_text_area_pending") or "")
+    st.session_state.batch_jd_text_area = pending_text
+    st.session_state.v2_jd_text_area = pending_text
 
 
 def _sync_batch_screening_jd_context(jd_titles: list[str]) -> str:
@@ -3851,6 +3979,7 @@ def _sync_batch_screening_jd_context(jd_titles: list[str]) -> str:
 
     st.session_state.batch_selected_jd_prev = ""
     st.session_state.batch_saved_jd_select = ""
+    st.session_state.batch_jd_text_area_pending = ""
     if not workspace_jd:
         st.session_state.workspace_selected_jd_title = ""
     return ""
@@ -4910,6 +5039,7 @@ def _render_job_library() -> None:
                     if st.session_state.get("batch_selected_jd_prev") == selected_job:
                         st.session_state.batch_selected_jd_prev = ""
                         st.session_state.batch_jd_text_area = ""
+                        st.session_state.batch_jd_text_area_pending = ""
                     _sync_job_management_drafts("")
                     st.session_state.joblib_flash_success = "岗位已删除。"
                     st.rerun()
@@ -5178,14 +5308,23 @@ def _render_v1() -> None:
                     append_review(_build_review_record(result, jd_title=effective_title))
 
                     st.markdown("<div class='section-title'>1) 初筛结论</div>", unsafe_allow_html=True)
-                    _show_decision(result["screening_result"]["screening_result"])
+                    _show_decision(
+                        result["screening_result"]["screening_result"],
+                        result["screening_result"].get("screening_reasons", []),
+                    )
                     for reason in result["screening_result"].get("screening_reasons", []):
                         st.markdown(f"- {reason}")
 
                     st.markdown("<div class='section-title'>2) 五维评分</div>", unsafe_allow_html=True)
                     _render_score_cards(result["score_details"])
 
-                    st.markdown("<div class='section-title'>3) 风险与建议动作</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='section-title'>3) 维度代表证据</div>", unsafe_allow_html=True)
+                    _render_dimension_evidence_summary(
+                        result["score_details"],
+                        result.get("evidence_bridge", {}),
+                    )
+
+                    st.markdown("<div class='section-title'>4) 风险与建议动作</div>", unsafe_allow_html=True)
                     st.markdown("<div class='module-box'>", unsafe_allow_html=True)
                     risk_result = result["risk_result"]
                     risk_level = risk_result.get("risk_level", "unknown")
@@ -5196,7 +5335,7 @@ def _render_v1() -> None:
                         st.markdown(f"- ⚠️ {rp}")
                     st.markdown("</div>", unsafe_allow_html=True)
 
-                    st.markdown("<div class='section-title'>4) 面试建议</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='section-title'>5) 面试建议</div>", unsafe_allow_html=True)
                     st.markdown("<div class='module-box'>", unsafe_allow_html=True)
                     plan = result["interview_plan"]
                     st.markdown("**建议追问问题（3-5）**")
@@ -5210,7 +5349,7 @@ def _render_v1() -> None:
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
-                    st.markdown("<div class='section-title'>5) 关键证据片段</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='section-title'>6) 关键证据片段摘要</div>", unsafe_allow_html=True)
                     _render_evidence_snippets(result.get("evidence_snippets", []))
 
                     with st.expander("查看结构化解析结果（调试/扩展）"):
@@ -5853,16 +5992,22 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         if timeline_summary.get("时间线不清晰风险", "否") == "是":
             st.warning("检测到时间线不清晰风险，建议优先人工核验时间字段。")
 
-        st.markdown("**3) 关键证据片段**")
+        evidence_bridge = _sync_detail_evidence_bridge(detail)
+        score_details = detail.get("score_details") or {}
+
+        st.markdown("**3) 维度代表证据**")
+        _render_dimension_evidence_summary(score_details, evidence_bridge)
+
+        st.markdown("**4) 关键证据片段摘要**")
         _render_evidence_snippets((detail.get("evidence_snippets", []) or [])[:5])
 
-        st.markdown("**4) 风险与建议动作**")
+        st.markdown("**5) 风险与建议动作**")
         st.write(f"风险等级：{_risk_level_label(risk_level)}")
         st.write(f"建议动作：{suggested_action}")
         for rp in risk_result.get("risk_points", []):
             st.markdown(f"- ⚠️ {rp}")
 
-        st.markdown("**5) 面试建议**")
+        st.markdown("**6) 面试建议**")
         interview_plan = detail.get("interview_plan", {})
         st.caption("建议追问问题")
         for q in interview_plan.get("interview_questions", []):
@@ -5872,8 +6017,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             st.markdown(f"- {fp}")
         st.caption(f"面试总结：{interview_plan.get('interview_summary', '')}")
 
-        st.markdown("**6) 五维评分（辅助信息）**")
-        score_details = detail.get("score_details") or {}
+        st.markdown("**7) 五维评分（辅助信息）**")
         st.caption(
             _score_brief_summary(
                 score_details=score_details,
@@ -5891,13 +6035,21 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
                 reason = dim_detail.get("reason") or ""
                 if reason:
                     st.caption(f"说明：{reason}")
-                evidences = dim_detail.get("evidence") or []
+                representative = (
+                    dim_detail.get("representative_evidence")
+                    if isinstance(dim_detail.get("representative_evidence"), dict)
+                    else {}
+                )
+                representative_text = str(representative.get("text") or "").strip()
+                if representative_text:
+                    st.caption(f"代表证据：{representative_text}")
+                evidences = _remaining_dimension_evidence(dim_detail)
                 if evidences:
                     st.markdown("证据说明：")
                     for ev in evidences:
                         st.markdown(f"- {ev}")
 
-        st.markdown("**7) 原始提取与解析信息**")
+        st.markdown("**8) 原始提取与解析信息**")
         with st.expander("展开查看原始提取与解析信息", expanded=False):
             method_raw = extract_info.get("method", "text")
             quality_raw = extract_info.get("quality", "weak")
@@ -5922,7 +6074,7 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         review_notes = st.session_state.get("v2_manual_review_notes", {})
         review_status = st.session_state.get("v2_manual_review_status", {})
 
-        st.markdown("**8) 人工备注与人工决策**")
+        st.markdown("**9) 人工备注与人工决策**")
         note_value = review_notes.get(cand_id, "")
         note_input = st.text_area(
             "人工备注",
@@ -6519,6 +6671,8 @@ def _render_batch_screening() -> None:
             _apply_jd_to_workspace(selected_jd)
             st.rerun()
 
+    _apply_pending_batch_jd_text_area()
+
     ocr_caps = check_ocr_capabilities()
     _render_batch_ocr_health_panel(ocr_caps)
 
@@ -6800,6 +6954,11 @@ def _render_candidate_workspace() -> None:
 
 st.set_page_config(page_title="HireMate", page_icon="🧠", layout="wide")
 _inject_page_style()
+
+if _APP_DB_INIT_ERROR is not None:
+    _render_hero()
+    _render_db_init_error_page()
+    st.stop()
 
 current_user = _restore_authenticated_user()
 if not current_user:

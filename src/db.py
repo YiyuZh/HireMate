@@ -19,6 +19,11 @@ except ImportError:  # pragma: no cover - optional until MySQL backend is enable
     pymysql = None
     DictCursor = None
 
+try:
+    import cryptography  # noqa: F401
+except ImportError:  # pragma: no cover - optional until MySQL backend is enabled.
+    cryptography = None
+
 DEFAULT_DB_PATH = "/app/data/hiremate.db"
 DEFAULT_MYSQL_CHARSET = "utf8mb4"
 
@@ -682,6 +687,12 @@ def _upgrade_schema(conn: sqlite3.Connection) -> None:
 def _open_mysql_connection():
     if pymysql is None:
         raise RuntimeError("pymysql is required when HIREMATE_DB_BACKEND=mysql")
+    if cryptography is None:
+        raise RuntimeError(
+            "MySQL backend requires the 'cryptography' package in the image when using "
+            "MySQL 8 sha256_password or caching_sha2_password authentication. "
+            "Add 'cryptography' to requirements.txt, rebuild the Docker image, and restart the container."
+        )
 
     required_envs = {
         "host": "HIREMATE_MYSQL_HOST",
@@ -699,16 +710,29 @@ def _open_mysql_connection():
     except ValueError as exc:
         raise RuntimeError(f"invalid HIREMATE_MYSQL_PORT: {port_raw}") from exc
 
-    return pymysql.connect(
-        host=str(os.getenv("HIREMATE_MYSQL_HOST") or "").strip(),
-        port=port,
-        user=str(os.getenv("HIREMATE_MYSQL_USER") or "").strip(),
-        password=str(os.getenv("HIREMATE_MYSQL_PASSWORD") or ""),
-        database=str(os.getenv("HIREMATE_MYSQL_DATABASE") or "").strip(),
-        charset=str(os.getenv("HIREMATE_MYSQL_CHARSET", DEFAULT_MYSQL_CHARSET) or DEFAULT_MYSQL_CHARSET).strip() or DEFAULT_MYSQL_CHARSET,
-        autocommit=False,
-        cursorclass=DictCursor,
-    )
+    try:
+        return pymysql.connect(
+            host=str(os.getenv("HIREMATE_MYSQL_HOST") or "").strip(),
+            port=port,
+            user=str(os.getenv("HIREMATE_MYSQL_USER") or "").strip(),
+            password=str(os.getenv("HIREMATE_MYSQL_PASSWORD") or ""),
+            database=str(os.getenv("HIREMATE_MYSQL_DATABASE") or "").strip(),
+            charset=str(os.getenv("HIREMATE_MYSQL_CHARSET", DEFAULT_MYSQL_CHARSET) or DEFAULT_MYSQL_CHARSET).strip() or DEFAULT_MYSQL_CHARSET,
+            autocommit=False,
+            cursorclass=DictCursor,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "cryptography" in message and (
+            "sha256_password" in message or "caching_sha2_password" in message
+        ):
+            raise RuntimeError(
+                "MySQL backend failed during authentication because the container is missing the "
+                "'cryptography' package required by PyMySQL for MySQL 8 sha256_password / "
+                "caching_sha2_password auth. Install 'cryptography' in requirements.txt, rebuild "
+                "the image, and restart the service."
+            ) from exc
+        raise
 
 
 def open_mysql_connection() -> DBConnection:
@@ -794,6 +818,54 @@ def init_mysql_schema() -> dict[str, int]:
     return bootstrap_mysql_schema()
 
 
+def _build_mysql_init_error(exc: Exception) -> RuntimeError:
+    message = str(exc).strip() or exc.__class__.__name__
+    lowered = message.lower()
+
+    if (
+        "cryptography" in lowered
+        or "missing mysql env vars" in lowered
+        or "invalid hiremate_mysql_port" in lowered
+        or "pymysql is required" in lowered
+    ):
+        return RuntimeError(message)
+
+    if (
+        "access denied" in lowered
+        or "permission denied" in lowered
+        or "1044" in lowered
+        or "1045" in lowered
+    ):
+        return RuntimeError(
+            "MySQL backend initialization failed during schema bootstrap. "
+            "Check HIREMATE_MYSQL_USER / HIREMATE_MYSQL_PASSWORD and make sure the account can "
+            "access the target database and create tables/indexes. "
+            f"Original error: {message}"
+        )
+
+    if (
+        "can't connect" in lowered
+        or "connection refused" in lowered
+        or "timed out" in lowered
+        or "unknown mysql server host" in lowered
+        or "name or service not known" in lowered
+        or "2003" in lowered
+        or "2005" in lowered
+    ):
+        return RuntimeError(
+            "MySQL backend initialization failed because the application could not connect to the "
+            "MySQL server. Check that MySQL is running and that HIREMATE_MYSQL_HOST / "
+            "HIREMATE_MYSQL_PORT are reachable from the app container. "
+            f"Original error: {message}"
+        )
+
+    return RuntimeError(
+        "MySQL backend initialization failed during schema bootstrap. Check MySQL connectivity, "
+        "credentials, and whether the application user can bootstrap schema objects successfully. "
+        f"Original error: {message}"
+    )
+
+
 def init_db() -> None:
     global _SCHEMA_READY, _SCHEMA_BACKEND
     backend = get_db_backend()
@@ -801,7 +873,10 @@ def init_db() -> None:
         with _INIT_LOCK:
             if _SCHEMA_READY and _SCHEMA_BACKEND == backend:
                 return
-            bootstrap_mysql_schema()
+            try:
+                bootstrap_mysql_schema()
+            except Exception as exc:
+                raise _build_mysql_init_error(exc) from exc
             _SCHEMA_READY = True
             _SCHEMA_BACKEND = backend
         return
