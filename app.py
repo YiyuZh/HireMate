@@ -4595,6 +4595,32 @@ def _build_runtime_ai_reviewer_scoring_config(
     return effective_scoring_cfg
 
 
+def _batch_ai_reviewer_widget_sync_payload(runtime: dict, *, jd_title: str) -> dict:
+    payload = dict(runtime or {})
+    provider = str(payload.get("provider") or "openai")
+    return {
+        "batch_ai_reviewer_enable": bool(payload.get("enable_ai_reviewer", False)),
+        "batch_ai_reviewer_provider": provider,
+        "batch_ai_reviewer_auto_generate": bool(payload.get("auto_generate_for_new_batch", False)),
+        "batch_ai_reviewer_runtime_api_key_mode": _default_ai_key_mode_for_ui(provider, payload),
+        "batch_ai_reviewer_runtime_model": str(payload.get("model") or ""),
+        "batch_ai_reviewer_runtime_model_preset": str(payload.get("model") or ""),
+        "batch_ai_reviewer_runtime_api_base": str(payload.get("api_base") or ""),
+        "batch_ai_reviewer_runtime_api_key_env": str(payload.get("api_key_env_name") or ""),
+        "batch_ai_reviewer_runtime_api_key_value": str(payload.get("api_key_value") or ""),
+        "batch_ai_reviewer_runtime_provider_prev": provider,
+        "batch_ai_reviewer_runtime_jd_prev": str(jd_title or "").strip(),
+    }
+
+
+def _apply_pending_batch_ai_reviewer_widget_state() -> None:
+    pending = st.session_state.pop("batch_ai_reviewer_widget_sync_pending", None)
+    if not isinstance(pending, dict):
+        return
+    for key, value in pending.items():
+        st.session_state[key] = value
+
+
 def _sync_batch_ai_reviewer_widget_state(jd_title: str) -> None:
     clean_title = str(jd_title or "").strip()
     prev_title = str(st.session_state.get("batch_ai_reviewer_runtime_jd_prev") or "").strip()
@@ -4602,19 +4628,10 @@ def _sync_batch_ai_reviewer_widget_state(jd_title: str) -> None:
         return
 
     runtime = _normalize_batch_ai_reviewer_runtime_config({}, jd_title=clean_title)
-    st.session_state.batch_ai_reviewer_enable = bool(runtime.get("enable_ai_reviewer", False))
-    st.session_state.batch_ai_reviewer_provider = str(runtime.get("provider") or "openai")
-    st.session_state.batch_ai_reviewer_auto_generate = bool(runtime.get("auto_generate_for_new_batch", False))
-    st.session_state.batch_ai_reviewer_runtime_api_key_mode = _default_ai_key_mode_for_ui(
-        str(runtime.get("provider") or "openai"),
+    st.session_state["batch_ai_reviewer_widget_sync_pending"] = _batch_ai_reviewer_widget_sync_payload(
         runtime,
+        jd_title=clean_title,
     )
-    st.session_state.batch_ai_reviewer_runtime_model = str(runtime.get("model") or "")
-    st.session_state.batch_ai_reviewer_runtime_model_preset = str(runtime.get("model") or "")
-    st.session_state.batch_ai_reviewer_runtime_api_base = str(runtime.get("api_base") or "")
-    st.session_state.batch_ai_reviewer_runtime_api_key_env = str(runtime.get("api_key_env_name") or "")
-    st.session_state.batch_ai_reviewer_runtime_provider_prev = str(runtime.get("provider") or "openai")
-    st.session_state.batch_ai_reviewer_runtime_jd_prev = clean_title
 
 
 def _current_batch_ai_reviewer_runtime(jd_title: str) -> dict:
@@ -7237,6 +7254,7 @@ def _render_batch_screening() -> None:
     _apply_pending_batch_jd_text_area()
 
     _sync_batch_ai_reviewer_widget_state(current_jd)
+    _apply_pending_batch_ai_reviewer_widget_state()
     st.markdown("<div class='module-box'>", unsafe_allow_html=True)
     st.markdown("**本批次 AI reviewer 设置**")
     st.caption("AI reviewer 仍然只作为建议层，不会直接替代人工“通过 / 待复核 / 淘汰”操作。当前批次创建后，候选人工作台会继承这里的运行配置。")
@@ -7252,8 +7270,6 @@ def _render_batch_screening() -> None:
         value=bool(st.session_state.get("batch_ai_reviewer_auto_generate", False)),
         key="batch_ai_reviewer_auto_generate",
     )
-    st.session_state.batch_ai_reviewer_enable = bool(batch_ai_enable)
-    st.session_state.batch_ai_reviewer_auto_generate = bool(batch_ai_auto_generate)
 
     batch_ai_provider_options = get_ai_provider_options()
     current_batch_ai_provider = str(st.session_state.get("batch_ai_reviewer_provider") or "openai")
