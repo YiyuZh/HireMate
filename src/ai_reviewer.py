@@ -11,6 +11,8 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+from src.rag import build_ai_reviewer_grounding
+
 OPENAI_DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEEPSEEK_DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 AI_REVIEWER_PROMPT_VERSION = "v1"
@@ -469,6 +471,13 @@ def build_ai_reviewer_prompt(
     schema = get_ai_reviewer_output_schema(mode)
     caps = ai_cfg.get("capabilities") or {}
     limits = ai_cfg.get("score_adjustment_limit") or {}
+    rag_grounding = build_ai_reviewer_grounding(
+        parsed_jd,
+        parsed_resume,
+        score_details=score_details,
+        evidence_snippets=evidence_snippets,
+        screening_result=screening_result,
+    )
 
     payload = {
         "role_profile": role_profile.get("profile_name", "通用岗位模板"),
@@ -481,6 +490,7 @@ def build_ai_reviewer_prompt(
         "risk_result": risk_result,
         "screening_result": screening_result,
         "evidence_snippets": evidence_snippets or [],
+        "rag_grounding": rag_grounding if rag_grounding.get("enabled") else {},
     }
 
     mode_rules = {

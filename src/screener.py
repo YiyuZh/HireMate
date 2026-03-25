@@ -15,6 +15,7 @@ from typing import Any
 from src.ai_reviewer import run_ai_reviewer
 from src.interviewer import build_interview_plan
 from src.jd_parser import parse_jd
+from src.rag import build_evidence_grounding
 from src.resume_parser import parse_resume
 from src.role_profiles import DEFAULT_SCREENING_THRESHOLDS, detect_role_profile, get_profile_by_name
 from src.risk_analyzer import analyze_risk
@@ -593,9 +594,20 @@ def _resolve_evidence_role_profile(parsed_jd: dict[str, Any], role_profile: dict
     return detect_role_profile(parsed_jd)
 
 
-def _build_evidence_keyword_sets(parsed_jd: dict[str, Any], role_profile: dict[str, Any]) -> dict[str, list[str]]:
+def _build_evidence_keyword_sets(
+    parsed_jd: dict[str, Any],
+    role_profile: dict[str, Any],
+    grounding: dict[str, Any] | None = None,
+) -> dict[str, list[str]]:
+    grounding_payload = grounding if isinstance(grounding, dict) else {}
     jd_keywords = _dedupe_keywords(
-        [*(parsed_jd.get("required_skills") or []), *(parsed_jd.get("bonus_skills") or [])]
+        [
+            *(parsed_jd.get("required_skills") or []),
+            *(parsed_jd.get("bonus_skills") or []),
+            *(parsed_jd.get("expanded_required_skills") or []),
+            *(parsed_jd.get("expanded_bonus_skills") or []),
+            *(grounding_payload.get("jd_terms") or []),
+        ]
     )
     method_keywords = _dedupe_keywords(
         [
@@ -603,9 +615,10 @@ def _build_evidence_keyword_sets(parsed_jd: dict[str, Any], role_profile: dict[s
             *(role_profile.get("experience_method_keywords") or []),
             *(role_profile.get("experience_ai_keywords") or []),
             *(role_profile.get("experience_eval_keywords") or []),
+            *(grounding_payload.get("method_terms") or []),
         ]
     )
-    result_keywords = _dedupe_keywords(RESULT_SIGNAL_KEYWORDS)
+    result_keywords = _dedupe_keywords([*RESULT_SIGNAL_KEYWORDS, *(grounding_payload.get("result_terms") or [])])
     education_keywords = _dedupe_keywords(
         [
             *EDUCATION_SIGNAL_KEYWORDS,
@@ -747,7 +760,12 @@ def collect_evidence_snippets(
 ) -> list[dict[str, str]]:
     parsed_jd_payload = parsed_jd if isinstance(parsed_jd, dict) else {}
     resolved_role_profile = _resolve_evidence_role_profile(parsed_jd_payload, role_profile)
-    keyword_sets = _build_evidence_keyword_sets(parsed_jd_payload, resolved_role_profile)
+    grounding = build_evidence_grounding(
+        parsed_resume,
+        parsed_jd=parsed_jd_payload,
+        role_profile=resolved_role_profile,
+    )
+    keyword_sets = _build_evidence_keyword_sets(parsed_jd_payload, resolved_role_profile, grounding)
 
     ranked_candidates: list[dict[str, Any]] = []
     source_specs = [

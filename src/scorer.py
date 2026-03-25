@@ -392,6 +392,14 @@ def _skill_match(required_skill: str, resume_skill: str) -> bool:
     return False
 
 
+def _skill_group_match(skill: str, resume_skills: list[str], alias_map: dict[str, list[str]] | None = None) -> tuple[bool, str]:
+    aliases = alias_map.get(str(skill), []) if isinstance(alias_map, dict) else []
+    for candidate in [str(skill), *[str(item) for item in aliases]]:
+        if any(_skill_match(candidate, resume_skill) for resume_skill in resume_skills):
+            return True, candidate
+    return False, ""
+
+
 def _score_education(parsed_jd: dict[str, Any], parsed_resume: dict[str, Any]) -> ScoreDetail:
     degree_req = parsed_jd.get("degree_requirement", "")
     major_pref = parsed_jd.get("major_preference", "")
@@ -794,16 +802,26 @@ def _score_skills(parsed_jd: dict[str, Any], parsed_resume: dict[str, Any], role
     bonus = parsed_jd.get("bonus_skills", []) or []
     resume_skills = parsed_resume.get("skills", []) or []
     role_focus = role_profile.get("skill_focus_keywords", []) or []
+    required_alias_map = parsed_jd.get("required_skill_aliases_map") if isinstance(parsed_jd.get("required_skill_aliases_map"), dict) else {}
+    bonus_alias_map = parsed_jd.get("bonus_skill_aliases_map") if isinstance(parsed_jd.get("bonus_skill_aliases_map"), dict) else {}
 
     required_hits: list[str] = []
+    required_alias_hits: list[str] = []
     for req in required:
-        if any(_skill_match(req, rs) for rs in resume_skills):
+        matched, matched_term = _skill_group_match(req, resume_skills, required_alias_map)
+        if matched:
             required_hits.append(req)
+            if matched_term and _norm_skill(matched_term) != _norm_skill(req):
+                required_alias_hits.append(f"{req}->{matched_term}")
 
     bonus_hits: list[str] = []
+    bonus_alias_hits: list[str] = []
     for b in bonus:
-        if any(_skill_match(b, rs) for rs in resume_skills):
+        matched, matched_term = _skill_group_match(b, resume_skills, bonus_alias_map)
+        if matched:
             bonus_hits.append(b)
+            if matched_term and _norm_skill(matched_term) != _norm_skill(b):
+                bonus_alias_hits.append(f"{b}->{matched_term}")
 
     role_focus_hits: list[str] = []
     for focus in role_focus:
@@ -864,6 +882,9 @@ def _score_skills(parsed_jd: dict[str, Any], parsed_resume: dict[str, Any], role
         f"模板重点技能命中：{role_focus_hits if role_focus_hits else '无'}",
         f"SQL 证据：{'有' if has_sql else '无'}",
     ]
+
+    if required_alias_hits or bonus_alias_hits:
+        evidence.append("RAG synonym expansion hits: " + " | ".join(required_alias_hits + bonus_alias_hits))
 
     return {"score": score, "reason": reason, "evidence": _top_evidence(evidence)}
 

@@ -4462,6 +4462,7 @@ def _jd_ai_reviewer_defaults_for_title(jd_title: str = "") -> dict:
             defaults.get("api_key_env_name") or get_default_ai_api_key_env_name(provider)
         ).strip()
         or get_default_ai_api_key_env_name(provider),
+        "auto_generate_for_new_batch": bool(defaults.get("auto_generate_for_new_batch", False)),
     }
 
 
@@ -4493,7 +4494,12 @@ def _normalize_batch_ai_reviewer_runtime_config(runtime_cfg: dict | None, *, jd_
         ).strip()
         or get_default_ai_api_key_env_name(provider),
         "api_key_value": str(incoming.get("api_key_value") or ""),
-        "auto_generate_for_new_batch": bool(incoming.get("auto_generate_for_new_batch", False)),
+        "auto_generate_for_new_batch": bool(
+            incoming.get(
+                "auto_generate_for_new_batch",
+                jd_defaults.get("auto_generate_for_new_batch", defaults.get("auto_generate_for_new_batch", False)),
+            )
+        ),
     }
 
 
@@ -4593,6 +4599,45 @@ def _build_runtime_ai_reviewer_scoring_config(
 
     effective_scoring_cfg["ai_reviewer"] = effective_ai_cfg
     return effective_scoring_cfg
+
+
+def _save_batch_ai_reviewer_defaults_for_jd(jd_title: str, runtime_cfg: dict | None) -> tuple[bool, str]:
+    clean_title = str(jd_title or "").strip()
+    if not clean_title:
+        return False, "当前未选择岗位，无法保存默认设置。"
+
+    runtime = _normalize_batch_ai_reviewer_runtime_config(runtime_cfg, jd_title=clean_title)
+    safe_runtime = _sanitize_ai_runtime_cfg_for_storage(runtime)
+    scoring_cfg = _normalize_scoring_config(load_jd_scoring_config(clean_title))
+    existing_ai_cfg = scoring_cfg.get("ai_reviewer") if isinstance(scoring_cfg.get("ai_reviewer"), dict) else {}
+    scoring_cfg["ai_reviewer"] = {
+        **_default_ai_reviewer_config(),
+        **existing_ai_cfg,
+        "enable_ai_reviewer": bool(safe_runtime.get("enable_ai_reviewer", False)),
+        "ai_reviewer_mode": "suggest_only",
+        "provider": str(safe_runtime.get("provider") or existing_ai_cfg.get("provider") or "openai"),
+        "model": str(safe_runtime.get("model") or existing_ai_cfg.get("model") or ""),
+        "api_base": str(safe_runtime.get("api_base") or existing_ai_cfg.get("api_base") or ""),
+        "api_key_mode": str(safe_runtime.get("api_key_mode") or existing_ai_cfg.get("api_key_mode") or "env_name"),
+        "api_key_env_name": str(safe_runtime.get("api_key_env_name") or existing_ai_cfg.get("api_key_env_name") or ""),
+        "auto_generate_for_new_batch": bool(safe_runtime.get("auto_generate_for_new_batch", False)),
+        "capabilities": {
+            **_default_ai_reviewer_config().get("capabilities", {}),
+            **(existing_ai_cfg.get("capabilities") or {}),
+        },
+        "score_adjustment_limit": {
+            **_default_ai_reviewer_config().get("score_adjustment_limit", {}),
+            **(existing_ai_cfg.get("score_adjustment_limit") or {}),
+        },
+    }
+    upsert_jd_scoring_config(clean_title, scoring_cfg)
+
+    if str(st.session_state.get("joblib_selected_title") or "").strip() == clean_title:
+        st.session_state.joblib_draft_scoring_config = _normalize_scoring_config(scoring_cfg)
+
+    if str(runtime.get("api_key_mode") or "").strip().lower() == "direct_input":
+        return True, "已保存当前岗位默认设置。出于安全考虑，直接输入的 API Key 不会被保存，下次仍需重新输入。"
+    return True, "已保存当前岗位默认设置；下次切到该岗位时会自动带出这套配置。"
 
 
 def _batch_ai_reviewer_widget_sync_payload(runtime: dict, *, jd_title: str) -> dict:
@@ -7332,14 +7377,39 @@ def _render_batch_screening() -> None:
         feature_label="本批次 AI reviewer",
     )
     batch_connection_key = "batch_ai_reviewer_connection_test_result"
+    batch_default_save_feedback = st.session_state.pop("batch_ai_reviewer_default_save_feedback", None)
+    if isinstance(batch_default_save_feedback, dict):
+        feedback_kind = str(batch_default_save_feedback.get("kind") or "success")
+        feedback_message = str(batch_default_save_feedback.get("message") or "").strip()
+        if feedback_message:
+            if feedback_kind == "warning":
+                st.warning(feedback_message)
+            else:
+                st.success(feedback_message)
+
     batch_action_cols = st.columns(2)
     with batch_action_cols[0]:
         if st.button("测试 AI 连接", key="batch_ai_reviewer_test_btn", use_container_width=True):
             st.session_state[batch_connection_key] = test_ai_connection(batch_ai_runtime_cfg, purpose="ai_reviewer")
     with batch_action_cols[1]:
-        if batch_ai_provider == "deepseek":
-            st.info("当前 provider=deepseek 时，优先直接输入 API Key 联调；也可切换到环境变量名模式。")
+        if st.button("保存为当前岗位默认设置", key="batch_ai_reviewer_save_defaults_btn", use_container_width=True):
+            try:
+                ok, message = _save_batch_ai_reviewer_defaults_for_jd(current_jd, batch_ai_runtime_cfg)
+                st.session_state["batch_ai_reviewer_default_save_feedback"] = {
+                    "kind": "success" if ok else "warning",
+                    "message": message,
+                }
+                st.rerun()
+            except ValueError as err:
+                st.session_state["batch_ai_reviewer_default_save_feedback"] = {
+                    "kind": "warning",
+                    "message": str(err),
+                }
+                st.rerun()
     _render_ai_connection_result(st.session_state.get(batch_connection_key))
+    if batch_ai_provider == "deepseek":
+        st.info("当前 provider=deepseek 时，优先直接输入 API Key 联调；也可切换到环境变量名模式。")
+    st.caption("点击“保存为当前岗位默认设置”后，下次切到这个岗位会自动带出当前 reviewer 配置；直接输入的 API Key 不会被保存。")
     st.markdown("</div>", unsafe_allow_html=True)
 
     ocr_caps = check_ocr_capabilities()

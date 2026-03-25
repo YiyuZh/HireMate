@@ -1,0 +1,6 @@
+{"case_id":"jd_alignment_ai_pm_skills","task":"jd_alignment","query":"AI 产品经理实习生 SQL Python PRD 大模型 Prompt","expected_source_types":["jd","role_profile"],"expected_substrings":["SQL","PRD","大模型"],"top_k":3}
+{"case_id":"jd_alignment_method_terms","task":"jd_alignment","query":"需求分析 用户研究 竞品分析 A/B 测试 上线复盘","expected_source_types":["jd","rubric","role_profile"],"expected_substrings":["需求分析","A/B","用户研究"],"top_k":3}
+{"case_id":"evidence_grounding_skill_hits","task":"evidence_grounding","query":"简历里与 SQL Python A/B 测试 相关的关键证据","expected_source_types":["resume_fragment","evidence"],"expected_substrings":["SQL","Python","A/B"],"top_k":3}
+{"case_id":"evidence_grounding_project_method","task":"evidence_grounding","query":"找出与 JD 解析 简历解析 多维打分 风险分析 相关的项目证据","expected_source_types":["resume_fragment","evidence"],"expected_substrings":["JD 解析","简历解析","多维打分"],"top_k":3}
+{"case_id":"ai_reviewer_grounding_role_fit","task":"ai_reviewer","query":"给 AI reviewer 补充岗位模板匹配的 方法 产出 结果 证据","expected_source_types":["role_profile","resume_fragment","evidence"],"expected_substrings":["岗位模板","竞品分析","用户研究"],"top_k":3}
+{"case_id":"ai_reviewer_grounding_skill_summary","task":"ai_reviewer","query":"补充与 SQL Python Prompt PRD 相关的 grounding 证据","expected_source_types":["resume_fragment","evidence","jd"],"expected_substrings":["SQL","Python","Prompt"],"top_k":3}

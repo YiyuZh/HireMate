@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from typing import Pattern
 
+from src.rag import expand_jd_with_rag
+
 
 def _clean_text(text: str) -> str:
     """轻量清洗：保留换行，便于区块抽取。"""
@@ -196,7 +198,7 @@ def parse_jd(jd_text: str) -> dict[str, str | list[str]]:
     ]
     competency_requirements = _extract_keywords(text, competency_candidates)
 
-    return {
+    parsed = {
         "job_title": job_title,
         "degree_requirement": degree_requirement,
         "major_preference": major_preference,
@@ -205,6 +207,7 @@ def parse_jd(jd_text: str) -> dict[str, str | list[str]]:
         "internship_requirement": internship_requirement,
         "competency_requirements": competency_requirements,
     }
+    return expand_jd_with_rag(parsed, jd_text=text)
 
 
 if __name__ == "__main__":
