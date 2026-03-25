@@ -1,5 +1,5 @@
 {
-    email <CADDY_ACME_EMAIL>
+    email {$CADDY_ACME_EMAIL}
     servers {
         protocols h1 h2 h3
     }
@@ -23,17 +23,17 @@
     }
 }
 
-<PRIMARY_DOMAIN> {
+{$PRIMARY_DOMAIN} {
     import common_site
     reverse_proxy portal-nginx:80
 }
 
-<HIREMATE_DOMAIN> {
+{$HIREMATE_DOMAIN} {
     import common_site
     reverse_proxy hiremate:8501
 }
 
-<INTERVIEW_DOMAIN> {
+{$INTERVIEW_DOMAIN} {
     import common_site
     import ai_backend_routes
 
@@ -42,7 +42,7 @@
     }
 }
 
-<ADMIN_DOMAIN> {
+{$ADMIN_DOMAIN} {
     import common_site
     import ai_backend_routes
 

@@ -47,6 +47,12 @@ services:
     image: caddy:2
     container_name: hiremate-caddy
     restart: unless-stopped
+    environment:
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?Set CADDY_ACME_EMAIL in .env}
+      PRIMARY_DOMAIN: ${PRIMARY_DOMAIN:?Set PRIMARY_DOMAIN in .env}
+      HIREMATE_DOMAIN: ${HIREMATE_DOMAIN:?Set HIREMATE_DOMAIN in .env}
+      INTERVIEW_DOMAIN: ${INTERVIEW_DOMAIN:?Set INTERVIEW_DOMAIN in .env}
+      ADMIN_DOMAIN: ${ADMIN_DOMAIN:?Set ADMIN_DOMAIN in .env}
     ports:
       - "80:80"
       - "443:443"
