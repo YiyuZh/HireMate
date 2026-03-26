@@ -1,5 +1,8 @@
 {
     email {$CADDY_ACME_EMAIL}
+    # Prefer RSA leaf certificates on this gateway because the current
+    # Windows/Schannel public path resets during ECDSA certificate handshakes.
+    key_type rsa2048
     servers {
         protocols h1 h2 h3
     }
