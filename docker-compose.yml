@@ -20,7 +20,13 @@ services:
       retries: 12
 
   hiremate:
-    build: .
+    build:
+      context: .
+      args:
+        APT_MIRROR_HOST: ${APT_MIRROR_HOST:-mirrors.tuna.tsinghua.edu.cn}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
     container_name: hiremate
     restart: unless-stopped
     volumes:
