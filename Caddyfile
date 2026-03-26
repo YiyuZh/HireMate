@@ -63,8 +63,3 @@
         reverse_proxy ai-interview-admin:80
     }
 }
-
-{$API_DOMAIN} {
-    import common_site
-    reverse_proxy ai-interview-app:8001
-}

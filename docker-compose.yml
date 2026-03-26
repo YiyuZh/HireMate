@@ -53,7 +53,6 @@ services:
       HIREMATE_DOMAIN: ${HIREMATE_DOMAIN:?Set HIREMATE_DOMAIN in .env}
       INTERVIEW_DOMAIN: ${INTERVIEW_DOMAIN:?Set INTERVIEW_DOMAIN in .env}
       ADMIN_DOMAIN: ${ADMIN_DOMAIN:?Set ADMIN_DOMAIN in .env}
-      API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN in .env}
     ports:
       - "80:80"
       - "443:443"
