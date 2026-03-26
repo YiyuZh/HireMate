@@ -18,7 +18,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
-    && python -c "import pymysql, cryptography; print('mysql deps ok')"
+    && python -c "import pymysql, cryptography; print('mysql deps ok')" \
+    && python - <<'PY'
+from pathlib import Path
+import streamlit
+
+streamlit_root = Path(streamlit.__file__).resolve().parent
+static_root = streamlit_root / "static"
+print(f"streamlit version: {streamlit.__version__}")
+print(f"streamlit static root: {static_root}")
+if not static_root.exists():
+    raise SystemExit("streamlit static assets directory is missing")
+if not any(static_root.rglob('*.js')):
+    raise SystemExit("streamlit static assets do not include js files")
+print("streamlit static assets ok")
+PY
 
 COPY . .
 RUN mkdir -p /app/bootstrap_data /app/data \

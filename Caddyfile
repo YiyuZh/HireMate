@@ -16,6 +16,18 @@
     }
 }
 
+(hiremate_cache_policy) {
+    @hiremate_static path /static/*
+    header @hiremate_static Cache-Control "public, max-age=31536000, immutable"
+
+    @hiremate_dynamic {
+        not path /static/* /_stcore/* /favicon.ico /favicon.png /robots.txt
+    }
+    header @hiremate_dynamic Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+    header @hiremate_dynamic Pragma "no-cache"
+    header @hiremate_dynamic Expires "0"
+}
+
 (ai_backend_routes) {
     @backend path /api/* /uploads/* /client/* /backoffice/*
     handle @backend {
@@ -30,6 +42,7 @@
 
 {$HIREMATE_DOMAIN} {
     import common_site
+    import hiremate_cache_policy
     reverse_proxy hiremate:8501
 }
 
@@ -51,3 +64,7 @@
     }
 }
 
+{$API_DOMAIN} {
+    import common_site
+    reverse_proxy ai-interview-app:8001
+}
