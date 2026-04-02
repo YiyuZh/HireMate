@@ -43,6 +43,14 @@
     reverse_proxy portal-nginx:80
 }
 
+blog.zenithy.art {
+    import common_site
+    handle {
+        rewrite * /blog{path}
+        reverse_proxy portal-nginx:80
+    }
+}
+
 {$HIREMATE_DOMAIN} {
     import common_site
     import hiremate_cache_policy

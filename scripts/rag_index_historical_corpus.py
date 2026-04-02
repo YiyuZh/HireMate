@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import json
 from pathlib import Path
 import sys
 
@@ -70,6 +71,7 @@ def main() -> int:
     parser.add_argument("--batch-limit-per-jd", type=int, default=None, help="Limit batch count per JD title.")
     parser.add_argument("--candidate-limit-per-batch", type=int, default=None, help="Limit candidate count per batch.")
     parser.add_argument("--collection", default="default", help="Vector store collection name.")
+    parser.add_argument("--report-path", default="", help="Optional JSON report output path.")
     args = parser.parse_args()
 
     load_env()
@@ -97,6 +99,21 @@ def main() -> int:
         str((doc.get("metadata") or {}).get("source_type") or "unknown")
         for doc in documents
     )
+
+    if args.report_path:
+        report_path = Path(args.report_path)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "store_path": str(store_path),
+            "collection": args.collection,
+            "review_count": review_count,
+            "batch_count": batch_count,
+            "candidate_count": candidate_count,
+            "document_count": len(documents),
+            "source_type_distribution": dict(distribution),
+            "index_summary": summary,
+        }
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("RAG historical corpus index built")
     print(f"store_path: {store_path}")

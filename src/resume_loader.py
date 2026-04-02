@@ -9,11 +9,12 @@ from typing import Any
 
 FALLBACK_TEXT = "[未提取到稳定文本，请人工核对后再评估]"
 OCR_LANG = "chi_sim+eng"
-PDF_OCR_DPI = 300
-OCR_UPSCALE_TRIGGER = 1800
-OCR_UPSCALE_TARGET = 2400
-OCR_DOWNSCALE_TRIGGER = 3800
-OCR_DOWNSCALE_TARGET = 3200
+PDF_OCR_DPI = 360
+OCR_UPSCALE_TRIGGER = 2000
+OCR_UPSCALE_TARGET = 2800
+OCR_DOWNSCALE_TRIGGER = 4200
+OCR_DOWNSCALE_TARGET = 3600
+TESSERACT_PSM_CONFIGS = ("--oem 3 --psm 6", "--oem 3 --psm 11", "--oem 3 --psm 3", "")
 
 _SPACE_RE = re.compile(r"[ \t\f\v]+")
 _MULTI_BLANK_RE = re.compile(r"\n{3,}")
@@ -557,34 +558,47 @@ def _ocr_image_to_text(image, *, context: str) -> dict[str, Any]:
     best_normalized_ocr_text = ""
     best_variant = variants[0][0]
     best_analysis = _analyze_text_quality("")
+    best_config = ""
     variants_tried = 0
 
     for index, (variant_name, variant_image) in enumerate(variants):
         if index > 0 and best_text and not best_analysis["weak"]:
             break
 
-        raw_text = pytesseract.image_to_string(variant_image, lang=OCR_LANG) or ""
-        repaired = _repair_ocr_text(raw_text)
-        normalized_ocr_text = repaired["normalized_ocr_text"]
-        analysis = _analyze_text_quality(normalized_ocr_text)
-        variants_tried += 1
+        for config in TESSERACT_PSM_CONFIGS:
+            raw_text = (
+                pytesseract.image_to_string(variant_image, lang=OCR_LANG, config=config).strip()
+                if config
+                else (pytesseract.image_to_string(variant_image, lang=OCR_LANG) or "").strip()
+            )
+            repaired = _repair_ocr_text(raw_text)
+            normalized_ocr_text = repaired["normalized_ocr_text"]
+            analysis = _analyze_text_quality(normalized_ocr_text)
+            variants_tried += 1
 
-        if not best_text:
-            best_text = normalized_ocr_text
-            best_raw_ocr_text = repaired["raw_ocr_text"]
-            best_normalized_ocr_text = normalized_ocr_text
-            best_variant = variant_name
-            best_analysis = analysis
-            continue
+            if not best_text:
+                best_text = normalized_ocr_text
+                best_raw_ocr_text = repaired["raw_ocr_text"]
+                best_normalized_ocr_text = normalized_ocr_text
+                best_variant = variant_name
+                best_analysis = analysis
+                best_config = config
+                if not best_analysis["weak"]:
+                    break
+                continue
 
-        current_score = (int(analysis["score"]), int(analysis["length"]))
-        best_score = (int(best_analysis["score"]), int(best_analysis["length"]))
-        if current_score > best_score:
-            best_text = normalized_ocr_text
-            best_raw_ocr_text = repaired["raw_ocr_text"]
-            best_normalized_ocr_text = normalized_ocr_text
-            best_variant = variant_name
-            best_analysis = analysis
+            current_score = (int(analysis["score"]), int(analysis["length"]))
+            best_score = (int(best_analysis["score"]), int(best_analysis["length"]))
+            if current_score > best_score:
+                best_text = normalized_ocr_text
+                best_raw_ocr_text = repaired["raw_ocr_text"]
+                best_normalized_ocr_text = normalized_ocr_text
+                best_variant = variant_name
+                best_analysis = analysis
+                best_config = config
+
+            if not best_analysis["weak"]:
+                break
 
     return {
         "text": best_analysis["clean_text"] or best_text,
@@ -592,6 +606,7 @@ def _ocr_image_to_text(image, *, context: str) -> dict[str, Any]:
         "normalized_ocr_text": best_normalized_ocr_text or best_analysis["clean_text"] or best_text,
         "variant": best_variant,
         "variants_tried": variants_tried,
+        "ocr_config": best_config,
         "quality_analysis": best_analysis,
         "preprocessed": bool(preprocess_meta["preprocessed"]),
         "operations": preprocess_meta["operations"],
@@ -895,7 +910,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
                 pdf_text,
                 method="text",
                 quality="weak",
-                message="已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。",
+                message=f"已尝试 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。",
                 file_type="pdf",
                 can_evaluate=True,
                 should_skip=False,
@@ -909,7 +924,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
             "",
             method="ocr",
             quality="weak",
-            message="已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核或人工处理。",
+            message=f"已尝试 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核或人工处理。",
             file_type="pdf",
             can_evaluate=False,
             should_skip=True,
@@ -927,9 +942,11 @@ def _pdf_result_with_fallback(file_obj) -> dict:
                 selected_text,
                 method="text",
                 quality="weak" if selected_analysis["weak"] else "ok",
-                message="已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但原始文本提取结果更稳定。"
-                if not selected_analysis["weak"]
-                else "已尝试 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但文本整体仍偏弱，建议人工复核。",
+                message=(
+                    f"已尝试 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理与文本修复），但原始文本提取结果更稳定。"
+                    if not selected_analysis["weak"]
+                    else f"已尝试 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理与文本修复），但文本整体仍偏弱，建议人工复核。"
+                ),
                 file_type="pdf",
                 can_evaluate=True,
                 should_skip=False,
@@ -942,9 +959,9 @@ def _pdf_result_with_fallback(file_obj) -> dict:
 
     failed_pages = int(ocr_result.get("failed_pages") or 0)
     ocr_quality = _quality_label(ocr_text)
-    message = "已使用 PDF OCR fallback（300 DPI + 图像预处理），提取成功。"
+    message = f"已使用 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理），提取成功。"
     if ocr_quality == "weak":
-        message = "已使用 PDF OCR fallback（300 DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。"
+        message = f"已使用 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。"
     if failed_pages > 0:
         message += f" 其中 {failed_pages} 页 OCR 失败，已保留可识别页面。"
     return _safe_result(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -44,6 +45,11 @@ def main() -> int:
         default=str(resolve_vector_store_path(DEFAULT_VECTOR_STORE_PATH)),
         help="Vector store path.",
     )
+    parser.add_argument(
+        "--report-path",
+        default="",
+        help="Optional JSON report output path.",
+    )
     args = parser.parse_args()
 
     store_path = str(resolve_vector_store_path(args.store_path))
@@ -53,6 +59,15 @@ def main() -> int:
         raise SystemExit("benchmark case file is empty")
 
     summary = run_benchmark(cases, store_path=store_path, runtime_config=runtime_config)
+
+    if args.report_path:
+        report_path = Path(args.report_path)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "summary": summary,
+            "cases": cases,
+        }
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("RAG benchmark")
     print(f"case_files: {len(args.cases)}")
