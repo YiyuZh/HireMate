@@ -53,7 +53,51 @@ _RESUME_KEYWORDS = (
     "bachelor",
     "master",
 )
+_RESUME_KEYWORDS_V2 = (
+    "教育背景",
+    "教育经历",
+    "工作经历",
+    "实习经历",
+    "项目经历",
+    "项目经验",
+    "技能",
+    "专业技能",
+    "技术栈",
+    "校园经历",
+    "个人简介",
+    "自我评价",
+    "联系方式",
+    "education",
+    "experience",
+    "work experience",
+    "internship",
+    "project",
+    "projects",
+    "skills",
+    "summary",
+    "profile",
+    "university",
+    "college",
+    "bachelor",
+    "master",
+)
 _EDUCATION_SIGNAL_KEYWORDS = (
+    "教育背景",
+    "教育经历",
+    "学历",
+    "专业",
+    "本科",
+    "硕士",
+    "博士",
+    "university",
+    "college",
+    "bachelor",
+    "master",
+    "phd",
+    "major",
+    "degree",
+)
+_EDUCATION_SIGNAL_KEYWORDS_V2 = (
     "教育背景",
     "教育经历",
     "学历",
@@ -84,6 +128,21 @@ _EXPERIENCE_SIGNAL_KEYWORDS = (
     "projects",
     "employment",
 )
+_EXPERIENCE_SIGNAL_KEYWORDS_V2 = (
+    "工作经历",
+    "实习经历",
+    "项目经历",
+    "项目经验",
+    "校园经历",
+    "经历",
+    "experience",
+    "work experience",
+    "internship",
+    "intern",
+    "project",
+    "projects",
+    "employment",
+)
 _SKILL_SIGNAL_KEYWORDS = (
     "技能",
     "专业技能",
@@ -97,7 +156,35 @@ _SKILL_SIGNAL_KEYWORDS = (
     "sql",
     "excel",
 )
+_SKILL_SIGNAL_KEYWORDS_V2 = (
+    "技能",
+    "专业技能",
+    "技术栈",
+    "技能清单",
+    "skills",
+    "tech stack",
+    "tool",
+    "tools",
+    "python",
+    "sql",
+    "excel",
+)
 _OCR_TITLE_FIXUPS = [
+    (re.compile(r"教\s*育\s*背\s*景"), "教育背景"),
+    (re.compile(r"教\s*育\s*经\s*历"), "教育经历"),
+    (re.compile(r"实\s*习\s*经\s*历"), "实习经历"),
+    (re.compile(r"工\s*作\s*经\s*历"), "工作经历"),
+    (re.compile(r"项\s*目\s*经\s*历"), "项目经历"),
+    (re.compile(r"项\s*目\s*经\s*验"), "项目经验"),
+    (re.compile(r"专\s*业\s*技\s*能"), "专业技能"),
+    (re.compile(r"技\s*能\s*清\s*单"), "技能清单"),
+    (re.compile(r"技\s*术\s*栈"), "技术栈"),
+    (re.compile(r"校\s*园\s*经\s*历"), "校园经历"),
+    (re.compile(r"自\s*我\s*评\s*价"), "自我评价"),
+    (re.compile(r"个\s*人\s*简\s*介"), "个人简介"),
+    (re.compile(r"联\s*系\s*方\s*式"), "联系方式"),
+]
+_OCR_TITLE_FIXUPS_V2 = [
     (re.compile(r"教\s*育\s*背\s*景"), "教育背景"),
     (re.compile(r"教\s*育\s*经\s*历"), "教育经历"),
     (re.compile(r"实\s*习\s*经\s*历"), "实习经历"),
@@ -150,8 +237,26 @@ def _message_indicates_ocr_missing(message: str) -> bool:
     return any(keyword in msg for keyword in keywords)
 
 
+def _message_indicates_ocr_missing_v2(message: str) -> bool:
+    msg = (message or "").lower()
+    keywords = [
+        "ocr 不可用",
+        "未启用 ocr",
+        "ocr unavailable",
+        "tesseract",
+        "poppler",
+        "pdfinfo",
+        "pdftoppm",
+        "pytesseract",
+        "pdf2image",
+        "pillow",
+        "pymupdf",
+    ]
+    return any(keyword in msg for keyword in keywords)
+
+
 def _derive_parse_status(quality: str, message: str, *, can_evaluate: bool) -> str:
-    if _message_indicates_ocr_missing(message):
+    if _message_indicates_ocr_missing_v2(message):
         return "OCR能力缺失"
     if not can_evaluate:
         return "弱质量识别"
@@ -267,6 +372,8 @@ def _repair_ocr_section_titles(text: str) -> str:
     normalized = str(text or "")
     for pattern, replacement in _OCR_TITLE_FIXUPS:
         normalized = pattern.sub(replacement, normalized)
+    for pattern, replacement in _OCR_TITLE_FIXUPS_V2:
+        normalized = pattern.sub(replacement, normalized)
     return normalized
 
 
@@ -286,7 +393,7 @@ def _repair_ocr_text(text: str) -> dict[str, str]:
 
 def _count_resume_keywords(text: str) -> int:
     lowered = (text or "").lower()
-    return sum(1 for keyword in _RESUME_KEYWORDS if keyword.lower() in lowered)
+    return sum(1 for keyword in _RESUME_KEYWORDS_V2 if keyword.lower() in lowered)
 
 
 def _has_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
@@ -386,9 +493,9 @@ def _compact_quality_analysis(text: str) -> dict[str, Any]:
         "has_contact_signal": bool(analysis.get("has_contact_signal")),
         "score": int(analysis.get("score") or 0),
         "weak": bool(analysis.get("weak", True)),
-        "education_keyword_hit": _has_any_keyword(clean, _EDUCATION_SIGNAL_KEYWORDS),
-        "experience_keyword_hit": _has_any_keyword(clean, _EXPERIENCE_SIGNAL_KEYWORDS),
-        "skill_keyword_hit": _has_any_keyword(clean, _SKILL_SIGNAL_KEYWORDS),
+        "education_keyword_hit": _has_any_keyword(clean, _EDUCATION_SIGNAL_KEYWORDS_V2),
+        "experience_keyword_hit": _has_any_keyword(clean, _EXPERIENCE_SIGNAL_KEYWORDS_V2),
+        "skill_keyword_hit": _has_any_keyword(clean, _SKILL_SIGNAL_KEYWORDS_V2),
     }
 
 
@@ -690,6 +797,85 @@ def _extract_pdf_with_ocr(file_obj, *, dpi: int | None = None) -> dict[str, Any]
     }
 
 
+def _extract_pdf_with_ocr_v2(file_obj, *, dpi: int | None = None) -> dict[str, Any]:
+    _import_pytesseract("PDF OCR")
+    if not _tesseract_available():
+        raise ValueError("PDF OCR 需要 tesseract（未安装或未加入 PATH）。")
+
+    raw = file_obj.getvalue()
+    ocr_dpi = int(dpi or PDF_OCR_DPI)
+    images: list[Any] = []
+    poppler_error: str | None = None
+
+    try:
+        from pdf2image import convert_from_bytes
+        if not _poppler_available():
+            raise RuntimeError("missing poppler")
+        images = convert_from_bytes(raw, dpi=ocr_dpi)
+    except Exception as exc:
+        poppler_error = str(exc)
+
+    if not images:
+        try:
+            import fitz  # PyMuPDF
+            Image, _, _, _ = _import_pillow("PDF OCR")
+            doc = fitz.open(stream=raw, filetype="pdf")
+            for page in doc:
+                pix = page.get_pixmap(dpi=ocr_dpi, alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                images.append(image)
+            doc.close()
+        except ModuleNotFoundError as exc:
+            raise ValueError(
+                "PDF OCR 需要 pdf2image+poppler 或 PyMuPDF（fitz），当前环境缺少相关依赖。"
+            ) from exc
+        except Exception as exc:
+            detail = f"；poppler 报错：{poppler_error}" if poppler_error else ""
+            raise ValueError(f"PDF OCR 渲染失败（{exc}）{detail}") from exc
+
+    page_texts: list[str] = []
+    raw_page_texts: list[str] = []
+    failed_pages = 0
+    used_binarization = False
+    used_preprocessing = False
+    total_pages = len(images)
+
+    for index, image in enumerate(images, start=1):
+        try:
+            page_result = _ocr_image_to_text(image, context="PDF OCR")
+        except Exception:
+            failed_pages += 1
+            continue
+
+        page_text = str(page_result.get("text") or "").strip()
+        page_raw_text = str(page_result.get("raw_ocr_text") or "").strip()
+        used_binarization = used_binarization or bool(page_result.get("used_binarization"))
+        used_preprocessing = used_preprocessing or bool(page_result.get("preprocessed"))
+        if not page_text:
+            continue
+
+        if total_pages > 1:
+            page_texts.append(f"[第{index}页]\n{page_text}")
+            if page_raw_text:
+                raw_page_texts.append(f"[第{index}页]\n{page_raw_text}")
+        else:
+            page_texts.append(page_text)
+            if page_raw_text:
+                raw_page_texts.append(page_raw_text)
+
+    return {
+        "text": _join_page_texts(page_texts),
+        "raw_ocr_text": _join_page_texts(raw_page_texts),
+        "normalized_ocr_text": _join_page_texts(page_texts),
+        "page_count": total_pages,
+        "pages_with_text": len(page_texts),
+        "failed_pages": failed_pages,
+        "used_binarization": used_binarization,
+        "preprocessed": used_preprocessing,
+        "dpi": ocr_dpi,
+    }
+
+
 def _extract_image_with_ocr(file_obj) -> dict[str, Any]:
     Image, _, _, ImageOps = _import_pillow("图片 OCR")
     _import_pytesseract("图片 OCR")
@@ -739,7 +925,7 @@ def _safe_result(
         "can_evaluate": final_can_evaluate,
         "should_skip": final_should_skip,
         "source_type": file_type,
-        "ocr_missing": _message_indicates_ocr_missing(message),
+        "ocr_missing": _message_indicates_ocr_missing_v2(message),
         "quality_analysis": analysis,
         "used_ocr": bool(used_ocr),
         "ocr_fallback_attempted": bool(ocr_fallback_attempted),
@@ -860,7 +1046,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
     prefix = f"PDF 文本提取失败（{pdf_text_error}）。" if pdf_text_error else "PDF 文本提取质量较弱。"
     try:
         file_obj.seek(0)
-        ocr_result = _extract_pdf_with_ocr(file_obj)
+        ocr_result = _extract_pdf_with_ocr_v2(file_obj)
     except ValueError as exc:
         if (pdf_text or "").strip():
             return _safe_result(
@@ -921,7 +1107,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
         if int(ocr_result.get("page_count") or 0) <= 2 and _is_text_quality_weak(ocr_text):
             try:
                 file_obj.seek(0)
-                high_ocr_result = _extract_pdf_with_ocr(file_obj, dpi=PDF_OCR_DPI_HIGH)
+                high_ocr_result = _extract_pdf_with_ocr_v2(file_obj, dpi=PDF_OCR_DPI_HIGH)
                 high_text = str(high_ocr_result.get("text") or "")
                 if high_text.strip():
                     selected_text, selected_source, selected_analysis = _select_stronger_text(ocr_text, high_text)
@@ -1039,6 +1225,7 @@ def check_ocr_capabilities() -> dict:
         "pillow": True,
         "pytesseract": True,
         "pdf2image": True,
+        "pymupdf": True,
     }
     missing: list[str] = []
     try:
@@ -1059,6 +1246,12 @@ def check_ocr_capabilities() -> dict:
         missing.append("pdf2image")
         dependency_status["pdf2image"] = False
 
+    try:
+        import fitz  # noqa: F401
+    except ModuleNotFoundError:
+        missing.append("pymupdf")
+        dependency_status["pymupdf"] = False
+
     runtime_missing: list[str] = []
     tesseract_ok = _tesseract_available()
     poppler_ok = _poppler_available()
@@ -1072,7 +1265,13 @@ def check_ocr_capabilities() -> dict:
         runtime_missing.append("poppler")
 
     image_ocr_available = all(dep not in missing for dep in ["pillow", "pytesseract"]) and tesseract_ok
-    pdf_ocr_available = all(dep not in missing for dep in ["pdf2image", "pytesseract"]) and tesseract_ok and poppler_ok
+    pdf_ocr_available = (
+        tesseract_ok
+        and (
+            (all(dep not in missing for dep in ["pdf2image", "pytesseract"]) and poppler_ok)
+            or (dependency_status["pymupdf"] and "pytesseract" not in missing)
+        )
+    )
 
     hints: list[str] = []
     if not dependency_status["pillow"]:
@@ -1081,6 +1280,8 @@ def check_ocr_capabilities() -> dict:
         hints.append("缺少 pytesseract：图片 OCR 和 PDF OCR fallback 都无法调用 Tesseract。")
     if not dependency_status["pdf2image"]:
         hints.append("缺少 pdf2image：扫描版 PDF 无法走 OCR fallback。")
+    if not dependency_status["pymupdf"]:
+        hints.append("缺少 PyMuPDF：当 poppler 不可用时无法用备用渲染通道。")
     if not tesseract_ok:
         hints.append("未检测到 tesseract：图片 OCR 与 PDF OCR fallback 都不可用。")
     if not poppler_ok:

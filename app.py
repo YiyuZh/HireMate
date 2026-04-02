@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from time import perf_counter
 import traceback
 from uuid import uuid4
@@ -3007,6 +3008,8 @@ def _render_evidence_snippets(snippets: list[dict]) -> None:
     for item in snippets:
         if not isinstance(item, dict):
             item = {"source": "其他", "text": str(item or "")}
+        if bool(item.get("hide_in_summary")):
+            continue
         source = item.get("source", "其他")
         text = item.get("text", "")
         tag = str(item.get("tag") or "").strip()
@@ -3172,6 +3175,59 @@ def _current_user_is_admin() -> bool:
 
 def _format_user_datetime(value: str) -> str:
     return str(value or "").strip() or "-"
+
+
+def _resolve_user_data_dir() -> Path:
+    db_path = os.getenv("HIREMATE_DB_PATH", "/app/data/hiremate.db")
+    return Path(db_path).resolve().parent
+
+
+def _user_api_key_store_path() -> Path:
+    return _resolve_user_data_dir() / "user_api_keys.json"
+
+
+def _load_user_api_key_store() -> dict:
+    path = _user_api_key_store_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_user_api_key_store(payload: dict) -> None:
+    path = _user_api_key_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_user_api_key(provider: str) -> str:
+    session_user = _session_user() or {}
+    user_id = str(session_user.get("user_id") or "").strip()
+    if not user_id:
+        return ""
+    store = _load_user_api_key_store()
+    user_bucket = store.get(user_id) if isinstance(store.get(user_id), dict) else {}
+    return str(user_bucket.get(str(provider or "openai").lower()) or "")
+
+
+def _set_user_api_key(provider: str, api_key: str) -> bool:
+    session_user = _session_user() or {}
+    user_id = str(session_user.get("user_id") or "").strip()
+    if not user_id:
+        return False
+    clean_key = str(api_key or "").strip()
+    store = _load_user_api_key_store()
+    if not isinstance(store.get(user_id), dict):
+        store[user_id] = {}
+    bucket = store[user_id]
+    if clean_key:
+        bucket[str(provider or "openai").lower()] = clean_key
+    else:
+        bucket.pop(str(provider or "openai").lower(), None)
+    _save_user_api_key_store(store)
+    return True
 
 
 def _format_user_option(user: dict) -> str:
@@ -4385,18 +4441,6 @@ def _looks_like_api_key_input(value: str) -> bool:
 
 
 def _default_ai_key_mode_for_ui(provider: str, current_cfg: dict | None) -> str:
-    cfg = current_cfg if isinstance(current_cfg, dict) else {}
-    explicit_mode = str(cfg.get("api_key_mode") or "").strip().lower()
-    if explicit_mode in {"direct_input", "env_name"}:
-        return explicit_mode
-
-    if str(cfg.get("api_key_value") or "").strip():
-        return "direct_input"
-
-    configured_env = str(cfg.get("api_key_env_name") or "").strip()
-    default_env = get_default_ai_api_key_env_name(provider)
-    if configured_env and configured_env != default_env:
-        return "env_name"
     return "direct_input"
 
 
@@ -4425,8 +4469,12 @@ def _resolve_batch_ai_direct_key(batch_id: str) -> str:
     clean_batch_id = str(batch_id or "").strip()
     secret_map = st.session_state.get("batch_ai_reviewer_direct_key_by_batch_id", {})
     if not isinstance(secret_map, dict) or not clean_batch_id:
-        return ""
-    return str(secret_map.get(clean_batch_id) or "").strip()
+        return _get_user_api_key("openai")
+    direct_key = str(secret_map.get(clean_batch_id) or "").strip()
+    if direct_key:
+        return direct_key
+    runtime_provider = str(st.session_state.get("batch_ai_reviewer_provider") or "openai").strip().lower()
+    return _get_user_api_key(runtime_provider)
 
 
 def _jd_ai_reviewer_defaults_for_title(jd_title: str = "") -> dict:
@@ -4783,54 +4831,37 @@ def _render_ai_api_key_config_inputs(prefix: str, provider: str, current_cfg: di
     direct_key_key = f"{prefix}_api_key_value"
     env_key = f"{prefix}_api_key_env"
 
-    current_mode = str(st.session_state.get(mode_key) or "").strip().lower()
-    if current_mode not in {"direct_input", "env_name"}:
-        st.session_state[mode_key] = _default_ai_key_mode_for_ui(provider, cfg)
+    st.session_state[mode_key] = "direct_input"
+    stored_key = _get_user_api_key(provider)
+    if not str(st.session_state.get(direct_key_key) or "").strip() and stored_key:
+        st.session_state[direct_key_key] = stored_key
 
-    st.radio(
-        "API Key 配置方式",
-        options=["direct_input", "env_name"],
-        index=0 if str(st.session_state.get(mode_key) or "direct_input") == "direct_input" else 1,
-        format_func=lambda value: "直接输入 API Key（推荐）" if value == "direct_input" else "使用环境变量名（高级）",
-        horizontal=True,
-        key=mode_key,
-    )
-    st.caption("环境变量名示例：DEEPSEEK_API_KEY。不要在环境变量名输入框填写 sk-xxxx 这类真实 API key。")
+    direct_value = st.text_input(
+        "API Key（当前账号）",
+        value=str(st.session_state.get(direct_key_key) or ""),
+        key=direct_key_key,
+        type="password",
+        help="将保存到当前账号，仅本账号可见。不会在页面明文显示。",
+    ).strip()
 
-    mode = str(st.session_state.get(mode_key) or "direct_input").strip().lower()
-    direct_value = str(st.session_state.get(direct_key_key) or "")
-    env_default = str(
-        st.session_state.get(env_key)
-        or cfg.get("api_key_env_name")
-        or get_default_ai_api_key_env_name(provider)
-    ).strip() or get_default_ai_api_key_env_name(provider)
+    cols = st.columns(2)
+    if cols[0].button("保存到我的账号", key=f"{prefix}_save_user_key"):
+        if direct_value:
+            _set_user_api_key(provider, direct_value)
+            st.success("已保存到当前账号。")
+        else:
+            st.warning("请先输入 API Key。")
+    if cols[1].button("清除已保存的 Key", key=f"{prefix}_clear_user_key"):
+        _set_user_api_key(provider, "")
+        st.session_state[direct_key_key] = ""
+        st.success("已清除当前账号保存的 Key。")
 
-    if mode == "direct_input":
-        direct_value = st.text_input(
-            "API Key（当前会话）",
-            value=direct_value,
-            key=direct_key_key,
-            type="password",
-            help="适合联调 / 测试；不会在页面明文显示。刷新后仍保留在当前会话内，但不会建议写成环境变量名。",
-        ).strip()
-        st.caption("当前使用直接输入 key 模式。适合联调 / 测试；离开当前会话后如需继续使用，请重新输入。")
-        env_name = env_default
-    else:
-        with st.expander("高级：环境变量名", expanded=True):
-            env_name = st.text_input(
-                "环境变量名",
-                value=env_default,
-                key=env_key,
-                help="例如 DEEPSEEK_API_KEY。不要在这里填写 sk-xxxx 这类真实 API key。",
-            ).strip()
-            st.caption("这里填写的是环境变量名，不是 API Key 本身。")
-            if _looks_like_api_key_input(env_name):
-                st.warning("这里应填写环境变量名，例如 DEEPSEEK_API_KEY，不要填写 sk-xxxx。")
-        direct_value = str(st.session_state.get(direct_key_key) or "").strip()
+    env_name = ""
+    mode = "direct_input"
 
     return {
         "api_key_mode": mode,
-        "api_key_env_name": str(st.session_state.get(env_key) or env_default).strip() or get_default_ai_api_key_env_name(provider),
+        "api_key_env_name": env_name,
         "api_key_value": direct_value,
     }
 
@@ -5944,6 +5975,7 @@ def _run_batch_screening(
     uploaded_files: list,
     *,
     batch_ai_runtime_cfg: dict | None = None,
+    force_allow_weak: bool = False,
 ) -> None:
     """批量初筛执行器：逐文件提取、评估并输出清晰反馈。"""
     operator = _current_operator()
@@ -5992,6 +6024,10 @@ def _run_batch_screening(
             if parse_status == "OCR能力缺失":
                 ocr_missing_files.append(file_name)
             parse_stat_counts[parse_status] = parse_stat_counts.get(parse_status, 0) + 1
+            if not can_evaluate and force_allow_weak:
+                message = f"{message}（已强制进入初筛）"
+                parse_status = "弱质量识别"
+                can_evaluate = True
 
             if not can_evaluate:
                 skipped_files.append(file_name)
@@ -7351,7 +7387,7 @@ def _render_batch_screening() -> None:
         st.caption(
             "DeepSeek 默认 `deepseek-chat` + `https://api.deepseek.com/v1`。"
             if batch_ai_provider == "deepseek"
-            else "优先直接输入 API Key 联调；如已在容器里配置环境变量，可切到高级模式。"
+            else "API Key 可保存到账号，下次直接复用。"
         )
 
     _render_ai_api_key_config_inputs(
@@ -7408,7 +7444,7 @@ def _render_batch_screening() -> None:
                 st.rerun()
     _render_ai_connection_result(st.session_state.get(batch_connection_key))
     if batch_ai_provider == "deepseek":
-        st.info("当前 provider=deepseek 时，优先直接输入 API Key 联调；也可切换到环境变量名模式。")
+        st.info("当前 provider=deepseek 时，请直接输入 API Key 联调。")
     st.caption("点击“保存为当前岗位默认设置”后，下次切到这个岗位会自动带出当前 reviewer 配置；直接输入的 API Key 不会被保存。")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -7475,6 +7511,11 @@ def _render_batch_screening() -> None:
             st.warning("当前上传文件均未通过稳定评估预检查。请优先改用 txt/docx、补齐 OCR 环境，或人工处理后再重试。")
         st.dataframe(preview_rows, use_container_width=True, hide_index=True)
 
+    force_allow_weak = st.checkbox(
+        "允许弱文本/空文本进入初筛（仅在 OCR 无法识别时使用）",
+        value=False,
+        key="batch_force_allow_weak",
+    )
     if st.button("开始批量初筛", type="primary", key="batch_run_btn"):
         if not batch_jd_text.strip():
             st.warning("请先填写 JD。")
@@ -7488,6 +7529,7 @@ def _render_batch_screening() -> None:
                     jd_text=batch_jd_text,
                     uploaded_files=uploaded_files,
                     batch_ai_runtime_cfg=batch_ai_runtime_cfg,
+                    force_allow_weak=bool(force_allow_weak),
                 )
 
     rows = st.session_state.get("v2_rows", [])
@@ -7766,6 +7808,109 @@ pending_page = (st.session_state.get("pending_navigation_page") or "").strip()
 if pending_page in pages:
     st.session_state.active_page = pending_page
 pending_page_nav = (st.session_state.get("pending_navigation_page_nav") or "").strip()
+def _render_ai_runtime_hint_v2(
+    provider: str,
+    api_base: str,
+    *,
+    api_key_value: str = "",
+) -> None:
+    runtime_cfg = resolve_ai_runtime_config(
+        {
+            "provider": provider,
+            "api_base": api_base,
+            "api_key_env_name": "",
+            "api_key_mode": "direct_input",
+            "api_key_value": api_key_value,
+        }
+    )
+    resolved_base = str(runtime_cfg.get("api_base") or "")
+    direct_present = bool(str(runtime_cfg.get("api_key_value") or "").strip())
+    base_required = provider_requires_explicit_api_base(provider)
+    base_missing = base_required and not str(api_base or "").strip()
+    api_key_hint = f"API Key：当前使用直接输入 key 模式（{'已填写' if direct_present else '未填写'}）"
+
+    st.caption(
+        f"{api_key_hint} ｜ api_base：{resolved_base or '-'}{'（required）' if base_required else ''} ｜ "
+        f"api_base 状态：{'未填写' if base_missing else '已就绪'}"
+    )
+
+
+def _render_ai_runtime_warning_v2(
+    provider: str,
+    api_base: str,
+    *,
+    api_key_value: str = "",
+    enabled: bool,
+    feature_label: str,
+) -> None:
+    if not enabled:
+        return
+
+    runtime_cfg = resolve_ai_runtime_config(
+        {
+            "provider": provider,
+            "api_base": api_base,
+            "api_key_env_name": "",
+            "api_key_mode": "direct_input",
+            "api_key_value": api_key_value,
+        }
+    )
+    provider_norm = str(runtime_cfg.get("provider") or "").strip().lower()
+    direct_present = bool(str(runtime_cfg.get("api_key_value") or "").strip())
+    base_required = provider_requires_explicit_api_base(provider_norm)
+    base_missing = base_required and not str(api_base or "").strip()
+    if not direct_present:
+        st.info(f"当前 {feature_label} 使用直接输入 key 模式，但尚未输入 API Key；测试连接或真实调用会失败。")
+    if base_missing:
+        st.warning(f"当前 {feature_label} 需要填写 api_base，但尚未填写。")
+
+
+def _render_ai_runtime_hint(
+    provider: str,
+    api_base: str,
+    api_key_env_name: str,
+    *,
+    api_key_mode: str = "env_name",
+    api_key_value: str = "",
+) -> None:
+    _render_ai_runtime_hint_v2(provider, api_base, api_key_value=api_key_value)
+
+
+def _render_ai_runtime_warning(
+    provider: str,
+    api_base: str,
+    api_key_env_name: str,
+    *,
+    api_key_mode: str = "env_name",
+    api_key_value: str = "",
+    enabled: bool,
+    feature_label: str,
+) -> None:
+    _render_ai_runtime_warning_v2(
+        provider,
+        api_base,
+        api_key_value=api_key_value,
+        enabled=enabled,
+        feature_label=feature_label,
+    )
+
+
+_save_batch_ai_reviewer_defaults_for_jd_base = _save_batch_ai_reviewer_defaults_for_jd
+
+
+def _save_batch_ai_reviewer_defaults_for_jd(jd_title: str, runtime_cfg: dict | None) -> tuple[bool, str]:
+    ok, msg = _save_batch_ai_reviewer_defaults_for_jd_base(jd_title, runtime_cfg)
+    if not ok:
+        return ok, msg
+    runtime = _normalize_batch_ai_reviewer_runtime_config(runtime_cfg or {}, jd_title=str(jd_title or "").strip())
+    if str(runtime.get("api_key_mode") or "").strip().lower() == "direct_input":
+        direct_key = str(runtime.get("api_key_value") or "").strip()
+        if direct_key:
+            _set_user_api_key(str(runtime.get("provider") or "openai"), direct_key)
+            return True, "已保存当前岗位默认设置。API Key 已保存到当前账号，下次可直接复用。"
+    return ok, msg
+
+
 if pending_page_nav in pages:
     st.session_state.active_page_nav = pending_page_nav
 st.session_state.pending_navigation_page = ""

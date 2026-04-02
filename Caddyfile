@@ -45,6 +45,14 @@
 
 blog.zenithy.art {
     import common_site
+    @blog_admin path /admin /admin/* 
+    basicauth @blog_admin {
+        autsky6666@gmail.com $2b$12$bM/k/LvfDRXIKywrhrLmh.wEa8v8N15cluiTcQStDUjMtBNReZbYm
+    }
+    handle @blog_admin {
+        rewrite * /blog{path}
+        reverse_proxy portal-nginx:80
+    }
     handle {
         rewrite * /blog{path}
         reverse_proxy portal-nginx:80

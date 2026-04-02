@@ -5,6 +5,7 @@ python-docx
 pillow
 pytesseract
 pdf2image
+pymupdf
 python-dotenv
 pymysql
 cryptography

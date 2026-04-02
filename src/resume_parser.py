@@ -62,6 +62,31 @@ SECTION_TITLES = [
     "Project",
     "Skills",
 ]
+
+SECTION_TITLE_ALIASES = {
+    "教育背景": "教育",
+    "教育经历": "教育",
+    "Education": "教育",
+    "实习经历": "实习",
+    "实习": "实习",
+    "Internship": "实习",
+    "工作经历": "经历",
+    "经历": "经历",
+    "Experience": "经历",
+    "项目经历": "项目",
+    "项目经验": "项目",
+    "项目": "项目",
+    "Project": "项目",
+    "专业技能": "技能",
+    "技能清单": "技能",
+    "技术栈": "技能",
+    "技能": "技能",
+    "Skills": "技能",
+    "校园经历": "校园经历",
+    "自我评价": "自我评价",
+    "个人简介": "个人简介",
+    "联系方式": "联系方式",
+}
 SPACED_TITLE_FIXUPS = [
     (re.compile(r"教\s*育\s*背\s*景"), "教育背景"),
     (re.compile(r"教\s*育\s*经\s*历"), "教育经历"),
@@ -246,6 +271,28 @@ def _split_lines(text: str) -> list[str]:
 
 def _has_time(text: str) -> bool:
     return any(re.search(p, text) for p in TIME_PATTERNS)
+
+
+def _extract_section_blocks(text: str) -> dict[str, list[str]]:
+    lines = _split_lines(text)
+    blocks: dict[str, list[str]] = {}
+    current_label = ""
+    for line in lines:
+        label = ""
+        for title in SECTION_TITLES:
+            if line.strip() == title or title.lower() == line.strip().lower():
+                label = SECTION_TITLE_ALIASES.get(title, title)
+                break
+            if line.startswith(title):
+                label = SECTION_TITLE_ALIASES.get(title, title)
+                break
+        if label:
+            current_label = label
+            blocks.setdefault(current_label, [])
+            continue
+        if current_label:
+            blocks.setdefault(current_label, []).append(line)
+    return blocks
 
 
 def _build_evidence_fragment(raw_text: str) -> dict[str, Any]:
@@ -455,6 +502,7 @@ def _fallback_extract_fragments(text: str, kind: str) -> list[dict[str, Any]]:
 def parse_resume(resume_text: str) -> dict[str, Any]:
     """解析简历文本，输出稳定结构。"""
     text = normalize_resume_ocr_text_v2(resume_text)
+    section_blocks = _extract_section_blocks(text)
 
     # ===== 基础字段 =====
     name = _extract_first(
@@ -480,25 +528,38 @@ def parse_resume(resume_text: str) -> dict[str, Any]:
         ],
     )
 
-    education_block = _extract_section_block(text, ["教育背景", "教育经历", "Education"])
+    education_block = _extract_section_block_v2(text, ["教育背景", "教育经历", "Education"])
     graduation_date = _extract_graduation_date(text, education_block)
 
     # ===== 经历区块优先抽取 =====
-    internship_block = _extract_section_block(text, ["实习经历", "实习", "Internship"])
-    project_block = _extract_section_block(text, ["项目经历", "项目", "Project"])
+    internship_block = _extract_section_block_v2(text, ["实习经历", "实习", "Internship"])
+    project_block = _extract_section_block_v2(text, ["项目经历", "项目", "Project"])
 
     internships = _extract_fragments_from_block(internship_block, kind="internship")
     projects = _extract_fragments_from_block(project_block, kind="project")
 
     # ===== 保守 fallback（仅区块缺失时启用） =====
     if not internships and not internship_block:
-        internships = _fallback_extract_fragments(text, kind="internship")
+        internships = _fallback_extract_fragments_v2(text, kind="internship")
 
     if not projects and not project_block:
-        projects = _fallback_extract_fragments(text, kind="project")
+        projects = _fallback_extract_fragments_v2(text, kind="project")
 
     # ===== 其他字段 =====
-    skills = _extract_keywords(text, SKILL_KEYWORDS)
+    extra_skills = [
+        "Axure",
+        "Figma",
+        "PRD",
+        "原型",
+        "交互",
+        "用户研究",
+        "需求分析",
+        "数据分析",
+        "SQL",
+        "Python",
+        "Excel",
+    ]
+    skills = _extract_keywords(text, SKILL_KEYWORDS + extra_skills)
     awards = _extract_keywords(text, AWARD_KEYWORDS)
     languages = _extract_keywords(text, LANGUAGE_KEYWORDS)
 
@@ -513,6 +574,7 @@ def parse_resume(resume_text: str) -> dict[str, Any]:
         "skills": skills,
         "awards": awards,
         "languages": languages,
+        "section_blocks": section_blocks,
     }
 
 

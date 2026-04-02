@@ -235,6 +235,30 @@ def build_evidence_bridge(score_details: dict[str, Any], evidence_snippets: list
                 best_match["related_dimensions"] = related_dimensions
             if dimension not in related_dimensions:
                 related_dimensions.append(dimension)
+            snippet_text = str(best_match.get("text") or "").strip()
+            if snippet_text and (entry.get("is_low_readability") or len(entry.get("display_text") or "") < 18):
+                entry["display_text"] = snippet_text
+                entry["text"] = snippet_text
+                if not entry.get("raw_text"):
+                    entry["raw_text"] = snippet_text
+                tags = entry.get("tags")
+                if not isinstance(tags, list):
+                    tags = []
+                if "来自关键证据" not in tags:
+                    tags.append("来自关键证据")
+                entry["tags"] = tags
+            elif snippet_text and best_score >= 48 and snippet_text not in str(entry.get("display_text") or ""):
+                entry["display_text"] = snippet_text
+                entry["text"] = snippet_text
+                tags = entry.get("tags")
+                if not isinstance(tags, list):
+                    tags = []
+                if "摘要对齐" not in tags:
+                    tags.append("摘要对齐")
+                entry["tags"] = tags
+
+            if snippet_text and _normalize_bridge_text(snippet_text) == _normalize_bridge_text(entry.get("display_text", "")):
+                best_match["hide_in_summary"] = True
 
         detail["representative_evidence"] = entry
         dimension_evidence.append(entry)
@@ -768,6 +792,29 @@ def collect_evidence_snippets(
     keyword_sets = _build_evidence_keyword_sets(parsed_jd_payload, resolved_role_profile, grounding)
 
     ranked_candidates: list[dict[str, Any]] = []
+    section_blocks = parsed_resume.get("section_blocks") if isinstance(parsed_resume, dict) else None
+    if isinstance(section_blocks, dict):
+        for label, lines in section_blocks.items():
+            if not lines:
+                continue
+            if label in {"实习", "实习经历"}:
+                source_name = "实习"
+            elif label in {"项目", "项目经历"}:
+                source_name = "项目"
+            elif label in {"经历", "工作经历"}:
+                source_name = "经历"
+            else:
+                source_name = ""
+
+            if not source_name:
+                continue
+
+            block_text = "\n".join(lines) if isinstance(lines, list) else str(lines)
+            for unit in _split_fragment_units(block_text):
+                candidate = _build_experience_candidate(source_name, unit, keyword_sets)
+                if candidate is not None:
+                    ranked_candidates.append(candidate)
+
     source_specs = [
         ("实习", parsed_resume.get("internships") or []),
         ("项目", parsed_resume.get("projects") or []),
