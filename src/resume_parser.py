@@ -120,6 +120,107 @@ def normalize_resume_ocr_text(text: str) -> str:
     return normalized.strip()
 
 
+def normalize_resume_ocr_text_v2(text: str) -> str:
+    normalized = _clean_text(text)
+    normalized = (
+        normalized.replace("—", "-")
+        .replace("–", "-")
+        .replace("‒", "-")
+        .replace("−", "-")
+        .replace("•", "·")
+    )
+    normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", normalized)
+    normalized = re.sub(r"((?:19|20)\d{2})\s*[./]\s*(\d{1,2})", r"\1.\2", normalized)
+    normalized = re.sub(r"((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月?", r"\1年\2月", normalized)
+    normalized = re.sub(
+        r"((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月?)\s*(?:-|~|—|–|至|到)\s*)((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月?|至今))",
+        r"\1\2",
+        normalized,
+    )
+    normalized = re.sub(r"\s*([，。；：！？、])\s*", r"\1", normalized)
+    normalized = re.sub(r"\s*([,;:])\s*", r"\1 ", normalized)
+
+    for pattern, replacement in SPACED_TITLE_FIXUPS:
+        normalized = pattern.sub(replacement, normalized)
+
+    for title in SECTION_TITLES:
+        normalized = re.sub(
+            rf"\s*{re.escape(title)}\s*[:：]?\s*",
+            f"\n{title}\n",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+    normalized = re.sub(
+        r"(?<!\n)((?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月?)\s*(?:-|~|至|到)\s*(?:至今|(?:19|20)\d{2}(?:\.\d{1,2}|年\d{1,2}月?)))",
+        r"\n\1\n",
+        normalized,
+    )
+    normalized = re.sub(r"([。；;])\s*", r"\1\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def _extract_section_block_v2(text: str, header_keywords: list[str]) -> str:
+    lines = _split_lines(text)
+    if not lines:
+        return ""
+
+    common_headers = [
+        "教育",
+        "实习",
+        "工作",
+        "项目",
+        "技能",
+        "技术栈",
+        "奖项",
+        "语言",
+        "自我评价",
+        "校园经历",
+    ]
+
+    start_idx = -1
+    for i, ln in enumerate(lines):
+        if any(k in ln for k in header_keywords):
+            start_idx = i
+            break
+    if start_idx == -1:
+        return ""
+
+    block_lines: list[str] = []
+    for j in range(start_idx + 1, len(lines)):
+        ln = lines[j]
+        if any(h in ln for h in common_headers) and not any(k in ln for k in header_keywords):
+            break
+        block_lines.append(ln)
+
+    return "\n".join(block_lines).strip()
+
+
+def _fallback_extract_fragments_v2(text: str, kind: str) -> list[dict[str, Any]]:
+    parts = [p.strip(" -•·") for p in re.split(r"[\n。；;]", text) if p.strip()]
+    fragments: list[dict[str, Any]] = []
+
+    exclude_keywords = ["大学", "学院", "本科", "硕士", "博士", "社团", "学生会", "课程", "成绩"]
+    if kind == "internship":
+        include_keywords = ["实习", "公司", "部门", "负责", "推动", "上线", "参与", "协作"]
+    else:
+        include_keywords = ["项目", "课题", "PRD", "A/B", "需求", "方案", "调研"]
+
+    for seg in parts:
+        if any(x in seg for x in exclude_keywords):
+            continue
+        if not any(x.lower() in seg.lower() for x in include_keywords):
+            continue
+
+        has_time = _has_time(seg)
+        action_or_result = bool(_extract_keywords(seg, ACTION_KEYWORDS + RESULT_KEYWORDS))
+        if has_time and action_or_result:
+            fragments.append(_build_evidence_fragment(seg))
+
+    return fragments[:6]
+
+
 def _extract_first(text: str, patterns: list[str]) -> str:
     """返回第一个命中值；未命中返回空字符串。"""
     for p in patterns:
@@ -149,6 +250,33 @@ def _has_time(text: str) -> bool:
 
 def _build_evidence_fragment(raw_text: str) -> dict[str, Any]:
     """把原始片段转换为评分可用证据结构。"""
+    if not education:
+        edu_block_v2 = _extract_section_block_v2(text, ["教育背景", "教育经历", "Education"])
+        if edu_block_v2:
+            education = "；".join(_split_lines(edu_block_v2)[:3])
+
+    if not internships:
+        internships = _fallback_extract_fragments_v2(text, kind="internship")
+
+    if not projects:
+        projects = _fallback_extract_fragments_v2(text, kind="project")
+
+    if not skills:
+        extra_skills = [
+            "Axure",
+            "Figma",
+            "PRD",
+            "原型",
+            "交互",
+            "用户研究",
+            "需求分析",
+            "数据分析",
+            "SQL",
+            "Python",
+            "Excel",
+        ]
+        skills = _extract_keywords(text, SKILL_KEYWORDS + extra_skills)
+
     return {
         "raw_text": raw_text,
         "time_found": _has_time(raw_text),
@@ -326,7 +454,7 @@ def _fallback_extract_fragments(text: str, kind: str) -> list[dict[str, Any]]:
 
 def parse_resume(resume_text: str) -> dict[str, Any]:
     """解析简历文本，输出稳定结构。"""
-    text = normalize_resume_ocr_text(resume_text)
+    text = normalize_resume_ocr_text_v2(resume_text)
 
     # ===== 基础字段 =====
     name = _extract_first(

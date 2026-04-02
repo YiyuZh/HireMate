@@ -10,6 +10,7 @@ from typing import Any
 FALLBACK_TEXT = "[未提取到稳定文本，请人工核对后再评估]"
 OCR_LANG = "chi_sim+eng"
 PDF_OCR_DPI = 360
+PDF_OCR_DPI_HIGH = 420
 OCR_UPSCALE_TRIGGER = 2000
 OCR_UPSCALE_TARGET = 2800
 OCR_DOWNSCALE_TRIGGER = 4200
@@ -549,6 +550,17 @@ def _select_stronger_text(primary_text: str, candidate_text: str) -> tuple[str, 
     return primary_analysis["clean_text"], "primary", primary_analysis
 
 
+def _should_force_ocr(text: str) -> bool:
+    analysis = _analyze_text_quality(text)
+    if not (text or "").strip():
+        return True
+    if analysis.get("keyword_hits", 0) == 0 and not analysis.get("has_time_pattern") and analysis.get("readable_lines", 0) <= 2:
+        return True
+    if float(analysis.get("meaningful_ratio") or 0.0) < 0.4:
+        return True
+    return False
+
+
 def _ocr_image_to_text(image, *, context: str) -> dict[str, Any]:
     pytesseract = _import_pytesseract(context)
     variants, preprocess_meta = _build_ocr_variants(image)
@@ -615,7 +627,7 @@ def _ocr_image_to_text(image, *, context: str) -> dict[str, Any]:
     }
 
 
-def _extract_pdf_with_ocr(file_obj) -> dict[str, Any]:
+def _extract_pdf_with_ocr(file_obj, *, dpi: int | None = None) -> dict[str, Any]:
     try:
         from pdf2image import convert_from_bytes
     except ModuleNotFoundError as exc:
@@ -629,8 +641,9 @@ def _extract_pdf_with_ocr(file_obj) -> dict[str, Any]:
         raise ValueError("PDF OCR 需要 tesseract（未安装或未加入 PATH）。")
 
     raw = file_obj.getvalue()
+    ocr_dpi = int(dpi or PDF_OCR_DPI)
     try:
-        images = convert_from_bytes(raw, dpi=PDF_OCR_DPI)
+        images = convert_from_bytes(raw, dpi=ocr_dpi)
     except Exception as exc:
         raise ValueError(f"PDF OCR 调用 poppler 失败（{exc}）。") from exc
 
@@ -673,7 +686,7 @@ def _extract_pdf_with_ocr(file_obj) -> dict[str, Any]:
         "failed_pages": failed_pages,
         "used_binarization": used_binarization,
         "preprocessed": used_preprocessing,
-        "dpi": PDF_OCR_DPI,
+        "dpi": ocr_dpi,
     }
 
 
@@ -829,7 +842,7 @@ def _pdf_result_with_fallback(file_obj) -> dict:
     except Exception as exc:
         pdf_text_error = str(exc)
 
-    if pdf_text and not _is_text_quality_weak(pdf_text):
+    if pdf_text and not _is_text_quality_weak(pdf_text) and not _should_force_ocr(pdf_text):
         return _safe_result(
             pdf_text,
             method="text",
@@ -904,6 +917,19 @@ def _pdf_result_with_fallback(file_obj) -> dict:
         )
 
     ocr_text = str(ocr_result.get("text") or "")
+    if ocr_text.strip() and PDF_OCR_DPI_HIGH > PDF_OCR_DPI:
+        if int(ocr_result.get("page_count") or 0) <= 2 and _is_text_quality_weak(ocr_text):
+            try:
+                file_obj.seek(0)
+                high_ocr_result = _extract_pdf_with_ocr(file_obj, dpi=PDF_OCR_DPI_HIGH)
+                high_text = str(high_ocr_result.get("text") or "")
+                if high_text.strip():
+                    selected_text, selected_source, selected_analysis = _select_stronger_text(ocr_text, high_text)
+                    if selected_source == "candidate":
+                        ocr_text = selected_text
+                        ocr_result = high_ocr_result
+            except Exception:
+                pass
     if not ocr_text.strip():
         if (pdf_text or "").strip():
             return _safe_result(
@@ -959,9 +985,9 @@ def _pdf_result_with_fallback(file_obj) -> dict:
 
     failed_pages = int(ocr_result.get("failed_pages") or 0)
     ocr_quality = _quality_label(ocr_text)
-    message = f"已使用 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理），提取成功。"
+    message = f"已使用 PDF OCR fallback（{int(ocr_result.get('dpi') or PDF_OCR_DPI)} DPI + 图像预处理），提取成功。"
     if ocr_quality == "weak":
-        message = f"已使用 PDF OCR fallback（{PDF_OCR_DPI} DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。"
+        message = f"已使用 PDF OCR fallback（{int(ocr_result.get('dpi') or PDF_OCR_DPI)} DPI + 图像预处理与文本修复），但当前 OCR 识别仍偏弱，建议人工复核。"
     if failed_pages > 0:
         message += f" 其中 {failed_pages} 页 OCR 失败，已保留可识别页面。"
     return _safe_result(
