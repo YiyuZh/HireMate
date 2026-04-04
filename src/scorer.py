@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import re
 from typing import Any
 
@@ -38,6 +39,18 @@ _REP_REPEAT_NOISE_RE = re.compile(r"([?？!！~～=+_*#|/\\-])\1{2,}")
 _REP_MEANINGFUL_TOKEN_RE = re.compile(
     r"(?:[\u4e00-\u9fff]{2,})|(?:[A-Za-z][A-Za-z0-9+/.#-]{1,})|(?:\d{4}[./-]\d{1,2})"
 )
+_POOL_SPLIT_PATTERN = re.compile(r"[\n\u3002\uFF1B;!?]+")
+_POOL_CLAUSE_PATTERN = re.compile(r"[，,、/|]")
+_POOL_METHOD_KEYWORDS = ["需求分析", "PRD", "原型", "SQL", "Python", "用户访谈", "问卷", "可用性", "指标", "A/B"]
+_POOL_RESULT_KEYWORDS = ["提升", "降低", "增长", "优化", "转化", "效率", "结论", "复盘", "上线"]
+_POOL_OUTPUT_KEYWORDS = ["文档", "报告", "方案", "原型", "策略", "看板", "报表"]
+_POOL_EDU_KEYWORDS = ["本科", "硕士", "博士", "大学", "学院", "专业", "毕业"]
+_POOL_RERANK_CFG = {
+    "min_quality_score": 8,
+    "min_text_len": 12,
+    "min_total_score": 18,
+    "max_debug_items": 12,
+}
 
 
 def _clip_score(v: int) -> int:
@@ -174,6 +187,345 @@ def _looks_like_low_readability_evidence(text: str, raw_text: str = "") -> bool:
     if len(clean) < 14 and not has_readable_phrase:
         return True
     return False
+
+
+def _clean_pool_text(text: str) -> str:
+    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.strip(" -—–•·")
+    return cleaned
+
+
+def _split_pool_units(text: str) -> list[str]:
+    normalized = _clean_pool_text(text)
+    if not normalized:
+        return []
+    candidates: list[str] = []
+    for part in _POOL_SPLIT_PATTERN.split(normalized):
+        part = _clean_pool_text(part)
+        if part:
+            candidates.append(part)
+            for clause in _POOL_CLAUSE_PATTERN.split(part):
+                clause = _clean_pool_text(clause)
+                if clause and clause not in candidates:
+                    candidates.append(clause)
+    return candidates
+
+
+def _pool_keyword_hits(text: str, keywords: list[str]) -> list[str]:
+    blob = _norm_text(text)
+    hits: list[str] = []
+    for keyword in keywords:
+        if keyword and _norm_text(keyword) in blob:
+            hits.append(keyword)
+    return hits
+
+
+def _build_evidence_pool(parsed_resume: dict[str, Any], parsed_jd: dict[str, Any]) -> list[dict[str, Any]]:
+    pool: list[dict[str, Any]] = []
+    section_blocks = parsed_resume.get("section_blocks") if isinstance(parsed_resume, dict) else None
+    if isinstance(section_blocks, dict):
+        for label, lines in section_blocks.items():
+            if not lines:
+                continue
+            if label in {"教育"}:
+                source = "教育"
+                base_tags = ["教育"]
+            elif label in {"实习", "实习经历"}:
+                source = "实习"
+                base_tags = ["经历"]
+            elif label in {"项目", "项目经历"}:
+                source = "项目"
+                base_tags = ["经历"]
+            elif label in {"经历", "工作经历"}:
+                source = "经历"
+                base_tags = ["经历"]
+            elif label in {"技能"}:
+                source = "技能"
+                base_tags = ["技能"]
+            else:
+                source = label
+                base_tags = []
+
+            block_text = "\n".join(lines) if isinstance(lines, list) else str(lines)
+            for unit in _split_pool_units(block_text):
+                if _looks_like_low_readability_evidence(unit):
+                    continue
+                tags = list(base_tags)
+                tags.extend(_pool_keyword_hits(unit, _POOL_METHOD_KEYWORDS))
+                tags.extend(_pool_keyword_hits(unit, _POOL_RESULT_KEYWORDS))
+                tags.extend(_pool_keyword_hits(unit, _POOL_OUTPUT_KEYWORDS))
+                if source == "教育":
+                    tags.extend(_pool_keyword_hits(unit, _POOL_EDU_KEYWORDS))
+                pool.append({"text": unit, "source": source, "tags": list(dict.fromkeys(tags))})
+
+    fragments = (parsed_resume.get("internships") or []) + (parsed_resume.get("projects") or [])
+    for frag in fragments:
+        raw = str((frag or {}).get("raw_text") or "").strip()
+        if not raw:
+            continue
+        for unit in _split_pool_units(raw):
+            if _looks_like_low_readability_evidence(unit):
+                continue
+            tags = ["经历"]
+            tags.extend(_pool_keyword_hits(unit, _POOL_METHOD_KEYWORDS))
+            tags.extend(_pool_keyword_hits(unit, _POOL_RESULT_KEYWORDS))
+            tags.extend(_pool_keyword_hits(unit, _POOL_OUTPUT_KEYWORDS))
+            pool.append({"text": unit, "source": "经历", "tags": list(dict.fromkeys(tags))})
+
+    degree = str(parsed_resume.get("degree") or "").strip()
+    major = str(parsed_resume.get("major") or "").strip()
+    graduation = str(parsed_resume.get("graduation_date") or "").strip()
+    if any([degree, major, graduation]):
+        parts = [p for p in [degree, major, graduation] if p]
+        pool.append({"text": "教育信息：" + " / ".join(parts), "source": "教育", "tags": ["教育"]})
+
+    education_ok = bool(parsed_resume.get("education"))
+    experience_ok = bool(parsed_resume.get("internships") or parsed_resume.get("projects"))
+    skills_ok = bool(parsed_resume.get("skills"))
+    pool.append(
+        {
+            "text": f"结构完整度：教育({education_ok})/经历({experience_ok})/技能({skills_ok})",
+            "source": "结构",
+            "tags": ["结构"],
+        }
+    )
+
+    required = parsed_jd.get("required_skills", []) or []
+    bonus = parsed_jd.get("bonus_skills", []) or []
+    if required or bonus:
+        pool.append(
+            {
+                "text": f"JD技能要求：必备{', '.join(required) if required else '无'}；加分{', '.join(bonus) if bonus else '无'}",
+                "source": "JD",
+                "tags": ["技能"],
+            }
+        )
+
+    return pool
+
+
+def _score_pool_item_for_dimension(
+    item: dict[str, Any],
+    dimension: str,
+    parsed_jd: dict[str, Any],
+) -> int:
+    text = str(item.get("text") or "")
+    tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+    score = 0
+
+    if dimension == "教育背景匹配度":
+        if "教育" in tags:
+            score += 40
+        score += len(_pool_keyword_hits(text, _POOL_EDU_KEYWORDS)) * 8
+        if parsed_jd.get("major_preference") and str(parsed_jd.get("major_preference")) in text:
+            score += 10
+    elif dimension == "相关经历匹配度":
+        if "经历" in tags:
+            score += 35
+        score += len(_pool_keyword_hits(text, _POOL_METHOD_KEYWORDS)) * 10
+        score += len(_pool_keyword_hits(text, _POOL_RESULT_KEYWORDS)) * 10
+        score += len(_pool_keyword_hits(text, _POOL_OUTPUT_KEYWORDS)) * 6
+    elif dimension == "技能匹配度":
+        if "技能" in tags:
+            score += 35
+        required = parsed_jd.get("required_skills", []) or []
+        bonus = parsed_jd.get("bonus_skills", []) or []
+        score += len(_pool_keyword_hits(text, required)) * 12
+        score += len(_pool_keyword_hits(text, bonus)) * 8
+    elif dimension == "表达完整度":
+        if "结构" in tags:
+            score += 50
+        score += 10 if len(text) >= 18 else 0
+    else:
+        score += 5
+
+    if len(text) >= 16:
+        score += 4
+    return score
+
+
+def _score_pool_item_quality(item: dict[str, Any]) -> int:
+    text = str(item.get("text") or "")
+    tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+    if _looks_like_low_readability_evidence(text):
+        return -50
+
+    quality = 0
+    length = len(text)
+    if 18 <= length <= 96:
+        quality += 18
+    elif length >= 12:
+        quality += 8
+    elif length >= 8:
+        quality += 3
+    else:
+        quality -= 6
+
+    if TIME_PATTERN.search(text):
+        quality += 8
+
+    if any(tag in tags for tag in ["经历", "技能", "教育"]):
+        quality += 6
+
+    method_hits = _pool_keyword_hits(text, _POOL_METHOD_KEYWORDS)
+    result_hits = _pool_keyword_hits(text, _POOL_RESULT_KEYWORDS)
+    output_hits = _pool_keyword_hits(text, _POOL_OUTPUT_KEYWORDS)
+    quality += len(method_hits) * 4
+    quality += len(result_hits) * 5
+    quality += len(output_hits) * 3
+
+    if re.fullmatch(r"[A-Za-z0-9/+.#\-\s]{1,16}", text):
+        quality -= 6
+
+    return quality
+
+
+def _pool_rerank_config() -> dict[str, int]:
+    cfg = dict(_POOL_RERANK_CFG)
+    env_min_quality = os.getenv("HIREMATE_EVIDENCE_MIN_QUALITY", "").strip()
+    env_min_len = os.getenv("HIREMATE_EVIDENCE_MIN_LEN", "").strip()
+    env_min_total = os.getenv("HIREMATE_EVIDENCE_MIN_TOTAL", "").strip()
+    env_max_debug = os.getenv("HIREMATE_EVIDENCE_DEBUG_MAX_ITEMS", "").strip()
+
+    def _maybe_int(value: str) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    parsed = _maybe_int(env_min_quality)
+    if parsed is not None:
+        cfg["min_quality_score"] = parsed
+    parsed = _maybe_int(env_min_len)
+    if parsed is not None:
+        cfg["min_text_len"] = parsed
+    parsed = _maybe_int(env_min_total)
+    if parsed is not None:
+        cfg["min_total_score"] = parsed
+    parsed = _maybe_int(env_max_debug)
+    if parsed is not None:
+        cfg["max_debug_items"] = parsed
+
+    return cfg
+
+
+def _append_pool_debug_meta(
+    detail: ScoreDetail,
+    dimension: str,
+    ranked: list[dict[str, Any]],
+    cfg: dict[str, int],
+) -> None:
+    if os.getenv("HIREMATE_EVIDENCE_DEBUG", "0").strip() not in {"1", "true", "yes", "on"}:
+        return
+
+    meta = detail.get("meta") if isinstance(detail.get("meta"), dict) else {}
+    meta["evidence_pool_debug"] = [
+        {
+            "text": item.get("text"),
+            "source": item.get("source"),
+            "tags": item.get("tags"),
+            "dim_score": item.get("_dim_score"),
+            "quality": item.get("_quality"),
+            "alignment": item.get("_alignment"),
+            "total": item.get("_total"),
+        }
+        for item in ranked[: cfg.get("max_debug_items", 12)]
+    ]
+    meta["evidence_pool_thresholds"] = {
+        "min_quality_score": cfg.get("min_quality_score"),
+        "min_text_len": cfg.get("min_text_len"),
+        "min_total_score": cfg.get("min_total_score"),
+    }
+    meta["evidence_pool_dimension"] = dimension
+    detail["meta"] = meta
+
+
+def _rerank_pool_for_dimension(
+    pool: list[dict[str, Any]],
+    dimension: str,
+    parsed_jd: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not pool:
+        return []
+
+    required = parsed_jd.get("required_skills", []) or []
+    bonus = parsed_jd.get("bonus_skills", []) or []
+
+    scored: list[dict[str, Any]] = []
+    for item in pool:
+        text = str(item.get("text") or "")
+        tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+        dim_score = _score_pool_item_for_dimension(item, dimension, parsed_jd)
+        quality = _score_pool_item_quality(item)
+        jd_hits = _pool_keyword_hits(text, required)
+        bonus_hits = _pool_keyword_hits(text, bonus)
+        alignment = len(jd_hits) * 8 + len(bonus_hits) * 4
+
+        if dimension == "相关经历匹配度":
+            if any(tag in tags for tag in ["经历"]):
+                alignment += 10
+            if _pool_keyword_hits(text, _POOL_METHOD_KEYWORDS) and _pool_keyword_hits(text, _POOL_RESULT_KEYWORDS):
+                alignment += 12
+        elif dimension == "技能匹配度":
+            if any(tag in tags for tag in ["技能"]):
+                alignment += 8
+        elif dimension == "教育背景匹配度":
+            if any(tag in tags for tag in ["教育"]):
+                alignment += 6
+
+        total = dim_score + quality + alignment
+        scored.append(
+            {
+                **item,
+                "_dim_score": dim_score,
+                "_quality": quality,
+                "_alignment": alignment,
+                "_total": total,
+            }
+        )
+
+    scored.sort(key=lambda item: (item["_total"], item["_quality"], item["_dim_score"]), reverse=True)
+    return scored
+
+
+def _apply_pool_evidence(
+    details: DetailedScores,
+    parsed_jd: dict[str, Any],
+    parsed_resume: dict[str, Any],
+) -> DetailedScores:
+    cfg = _pool_rerank_config()
+    pool = _build_evidence_pool(parsed_resume, parsed_jd)
+    if not pool:
+        return details
+
+    for dimension in [
+        "教育背景匹配度",
+        "相关经历匹配度",
+        "技能匹配度",
+        "表达完整度",
+        "综合推荐度",
+    ]:
+        detail = details.get(dimension)
+        if not isinstance(detail, dict):
+            continue
+        ranked = _rerank_pool_for_dimension(pool, dimension, parsed_jd)
+        filtered = [
+            item
+            for item in ranked
+            if str(item.get("text") or "").strip()
+            and len(str(item.get("text") or "")) >= cfg.get("min_text_len", 12)
+            and int(item.get("_quality") or 0) >= cfg.get("min_quality_score", 8)
+            and int(item.get("_total") or 0) >= cfg.get("min_total_score", 18)
+        ]
+        selected = (filtered or ranked)[:3]
+        if selected:
+            detail["meta"] = detail.get("meta") if isinstance(detail.get("meta"), dict) else {}
+            detail["meta"]["legacy_evidence"] = detail.get("evidence")
+            detail["evidence"] = [item["text"] for item in selected]
+        _append_pool_debug_meta(detail, dimension, ranked, cfg)
+
+    return details
 
 
 def _extract_representative_tags(dimension: str, label: str, raw_text: str, display_text: str) -> list[str]:
@@ -1073,6 +1425,7 @@ def score_candidate(parsed_jd: dict[str, Any], parsed_resume: dict[str, Any]) ->
     details["综合推荐度"].setdefault("evidence", []).append(
         f"岗位自定义评分配置：{'已启用' if has_custom_config else '未启用（使用模板默认）'}"
     )
+    details = _apply_pool_evidence(details, parsed_jd, parsed_resume)
     hydrate_representative_evidence(details)
     return details
 

@@ -719,6 +719,66 @@ def _build_experience_candidate(
     }
 
 
+def _build_relaxed_candidate(source: str, unit_text: str) -> dict[str, Any] | None:
+    clean = _clean_segment_text(unit_text)
+    if not clean:
+        return None
+    if _is_low_information_segment(clean):
+        return None
+    if not (TIME_PATTERN.search(clean) or any(k in clean for k in ["负责", "参与", "推动", "设计", "分析", "产出"])):
+        return None
+
+    snippet = _trim_snippet(clean, [])
+    score = 45
+    if TIME_PATTERN.search(snippet):
+        score += 6
+    if any(k in snippet for k in ["负责", "参与", "推动", "设计", "分析"]):
+        score += 6
+
+    return {
+        "source": source,
+        "text": snippet,
+        "tag": "经历片段",
+        "_score": score,
+    }
+
+
+def _fallback_section_candidates(parsed_resume: dict[str, Any]) -> list[dict[str, Any]]:
+    section_blocks = parsed_resume.get("section_blocks") if isinstance(parsed_resume, dict) else None
+    if not isinstance(section_blocks, dict):
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for label, lines in section_blocks.items():
+        if not lines:
+            continue
+        if label in {"实习", "实习经历"}:
+            source_name = "实习"
+        elif label in {"项目", "项目经历"}:
+            source_name = "项目"
+        elif label in {"经历", "工作经历"}:
+            source_name = "经历"
+        else:
+            source_name = ""
+        if not source_name:
+            continue
+
+        block_text = "\n".join(lines) if isinstance(lines, list) else str(lines)
+        for unit in _split_fragment_units(block_text):
+            candidate = _build_relaxed_candidate(source_name, unit)
+            if candidate is not None:
+                candidates.append(candidate)
+
+    return sorted(
+        candidates,
+        key=lambda item: (
+            int(item.get("_score") or 0),
+            len(str(item.get("text") or "")),
+        ),
+        reverse=True,
+    )[:6]
+
+
 def _build_education_candidates(parsed_resume: dict[str, Any], keyword_sets: dict[str, list[str]]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     education_blob = str(parsed_resume.get("education") or "").strip()
@@ -873,6 +933,18 @@ def collect_evidence_snippets(
         )
         if len(deduped) >= limit:
             break
+
+    if not deduped:
+        for candidate in _fallback_section_candidates(parsed_resume):
+            deduped.append(
+                {
+                    "source": str(candidate.get("source") or "经历"),
+                    "text": str(candidate.get("text") or "").strip(),
+                    "tag": str(candidate.get("tag") or "经历片段"),
+                }
+            )
+            if len(deduped) >= limit:
+                break
 
     return deduped
 

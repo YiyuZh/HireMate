@@ -49,6 +49,10 @@ blog.zenithy.art {
     basicauth @blog_admin {
         autsky6666@gmail.com $2b$12$bM/k/LvfDRXIKywrhrLmh.wEa8v8N15cluiTcQStDUjMtBNReZbYm
     }
+    @blog_assets path /assets/* /favicon* /manifest.json
+    handle @blog_assets {
+        reverse_proxy portal-nginx:80
+    }
     handle @blog_admin {
         rewrite * /blog{path}
         reverse_proxy portal-nginx:80

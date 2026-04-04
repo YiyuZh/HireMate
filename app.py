@@ -3004,12 +3004,13 @@ def _render_evidence_snippets(snippets: list[dict]) -> None:
     if not snippets:
         st.caption("未提取到可展示的关键证据片段。")
         return
+    visible = [item for item in snippets if isinstance(item, dict) and not item.get("hide_in_summary")]
+    if not visible:
+        visible = snippets
 
-    for item in snippets:
+    for item in visible:
         if not isinstance(item, dict):
             item = {"source": "其他", "text": str(item or "")}
-        if bool(item.get("hide_in_summary")):
-            continue
         source = item.get("source", "其他")
         text = item.get("text", "")
         tag = str(item.get("tag") or "").strip()
@@ -6661,7 +6662,33 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             st.markdown(f"- {fp}")
         st.caption(f"面试总结：{interview_plan.get('interview_summary', '')}")
 
-        st.markdown("**7) 五维评分（辅助信息）**")
+        st.markdown("**7) 证据池调试面板（仅调试）**")
+        debug_flag = st.checkbox(
+            "显示证据池重排调试信息",
+            value=bool(os.getenv("HIREMATE_EVIDENCE_DEBUG", "0").strip() in {"1", "true", "yes", "on"}),
+            key=f"workspace_show_evidence_debug_{candidate_id}",
+        )
+        if debug_flag:
+            dim_debug_rows: list[dict] = []
+            for dim_key, dim_detail in (score_details or {}).items():
+                if not isinstance(dim_detail, dict):
+                    continue
+                meta = dim_detail.get("meta") if isinstance(dim_detail.get("meta"), dict) else {}
+                debug_rows = meta.get("evidence_pool_debug") if isinstance(meta.get("evidence_pool_debug"), list) else []
+                if not debug_rows:
+                    continue
+                dim_debug_rows.append({"dimension": dim_key, "rows": debug_rows, "thresholds": meta.get("evidence_pool_thresholds")})
+
+            if not dim_debug_rows:
+                st.caption("当前没有证据池调试数据。请在环境变量中设置 HIREMATE_EVIDENCE_DEBUG=1 后重新生成报告。")
+            else:
+                for item in dim_debug_rows:
+                    st.markdown(f"**{_dimension_chip_label(item['dimension'])}**")
+                    if item.get("thresholds"):
+                        st.caption(f"阈值：{item.get('thresholds')}")
+                    st.table(item.get("rows"))
+
+        st.markdown("**8) 五维评分（辅助信息）**")
         st.caption(
             _score_brief_summary(
                 score_details=score_details,
