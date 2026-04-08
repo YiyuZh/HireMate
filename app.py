@@ -94,6 +94,7 @@ from src.v2_workspace import (
     search_by_name,
     sort_rows,
 )
+from src.analysis_pipeline import run_analysis_pipeline
 
 load_env()
 _APP_DB_INIT_ERROR: Exception | None = None
@@ -3026,6 +3027,83 @@ def _render_evidence_snippets(snippets: list[dict]) -> None:
         )
 
 
+def _render_analysis_confidence_panel(analysis_payload: dict, extract_info: dict) -> None:
+    analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
+    quality = str((extract_info or {}).get("quality") or "").lower()
+    analysis_mode = str(analysis.get("analysis_mode") or "normal")
+    ocr_conf = float(analysis.get("ocr_confidence") or 0.0)
+    structure_conf = float(analysis.get("structure_confidence") or 0.0)
+    parse_conf = float(analysis.get("parse_confidence") or 0.0)
+
+    cols = st.columns(4)
+    cols[0].metric("OCR 置信度", f"{ocr_conf:.2f}")
+    cols[1].metric("结构置信度", f"{structure_conf:.2f}")
+    cols[2].metric("解析置信度", f"{parse_conf:.2f}")
+    cols[3].metric("分析模式", analysis_mode)
+
+    if analysis_mode in {"weak_text", "manual_first"} or quality == "weak":
+        st.warning("当前 OCR/解析质量偏弱，建议优先人工复核关键信息。")
+
+
+def _render_ai_structured_profile(profile: dict) -> None:
+    if not isinstance(profile, dict) or not profile:
+        st.caption("暂无结构化候选人画像。")
+        return
+
+    st.write(f"教育概览：{profile.get('education_summary') or '未提取'}")
+    internships = profile.get("internship_summary") or []
+    if internships:
+        st.write("实习概览：")
+        for item in internships[:3]:
+            st.markdown(f"- {item}")
+    projects = profile.get("project_summary") or []
+    if projects:
+        st.write("项目概览：")
+        for item in projects[:3]:
+            st.markdown(f"- {item}")
+    st.write(f"技能清单：{profile.get('skill_inventory') or '未提取'}")
+    st.write(f"岗位族群猜测：{profile.get('role_family_guess') or 'unknown'}")
+    st.write(f"资历猜测：{profile.get('seniority_guess') or 'unknown'}")
+
+
+def _render_grounding_evidence(analysis_payload: dict) -> None:
+    analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
+    evidence_for = analysis.get("evidence_for") if isinstance(analysis.get("evidence_for"), list) else []
+    evidence_against = analysis.get("evidence_against") if isinstance(analysis.get("evidence_against"), list) else []
+    missing_points = analysis.get("missing_info_points") if isinstance(analysis.get("missing_info_points"), list) else []
+
+    st.markdown("**正向证据**")
+    if evidence_for:
+        _render_evidence_snippets(evidence_for)
+    else:
+        st.caption("暂无正向证据。")
+
+    st.markdown("**反证 / 质疑点**")
+    if evidence_against:
+        _render_evidence_snippets(evidence_against)
+    else:
+        st.caption("暂无反证。")
+
+    st.markdown("**缺失点**")
+    if missing_points:
+        for item in missing_points[:6]:
+            st.markdown(f"- {item}")
+    else:
+        st.caption("未识别到明显缺失点。")
+
+
+def _render_ai_adoption_status(detail: dict) -> None:
+    ai_status = str(detail.get("ai_review_status") or "not_generated")
+    ai_mode = str(detail.get("ai_mode") or "")
+    applied = detail.get("ai_applied_actions") if isinstance(detail.get("ai_applied_actions"), list) else []
+    applied_label = "已采纳" if applied else "未采纳"
+    st.write(f"AI reviewer 状态：{_ai_review_status_label(ai_status)}")
+    if ai_mode:
+        st.write(f"AI reviewer 模式：{ai_mode}")
+    st.write(f"AI 建议采纳状态：{applied_label}")
+    if applied:
+        st.caption("已采纳项：" + "、".join(str(item) for item in applied))
+
 def _render_history_records(limit: int = 5) -> None:
     """历史审核留痕：列表 + 选择查看单条详情（兼容旧记录字段缺失）。"""
     history = list_reviews(limit=limit)
@@ -4079,6 +4157,14 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
     )
 
     evidence_snippets = _collect_evidence_snippets(parsed_resume, parsed_jd=parsed_jd)
+    analysis_payload = run_analysis_pipeline(
+        parsed_resume=parsed_resume,
+        parsed_jd=parsed_jd,
+        extract_result={},
+        normalized_text=normalized_resume_text,
+        raw_text=resume_text,
+        evidence_snippets=evidence_snippets,
+    )
     evidence_bridge = build_evidence_bridge(score_details, evidence_snippets)
     if isinstance(evidence_bridge.get("score_details"), dict):
         score_details = evidence_bridge["score_details"]
@@ -4094,6 +4180,7 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
         "screening_result": screening_result,
         "interview_plan": interview_plan,
         "evidence_snippets": evidence_snippets,
+        "analysis_payload": analysis_payload,
         "evidence_bridge": evidence_bridge,
         "ai_review_suggestion": {},
         "ai_review_status": "not_generated",
@@ -6640,19 +6727,32 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
         evidence_bridge = _sync_detail_evidence_bridge(detail)
         score_details = detail.get("score_details") or {}
 
-        st.markdown("**3) 维度代表证据**")
+        analysis_payload = detail.get("analysis_payload") if isinstance(detail.get("analysis_payload"), dict) else {}
+        extract_info = detail.get("extract_info") if isinstance(detail.get("extract_info"), dict) else {}
+        profile = analysis_payload.get("candidate_profile") if isinstance(analysis_payload.get("candidate_profile"), dict) else {}
+
+        st.markdown("**3) AI 结构化画像**")
+        _render_ai_structured_profile(profile)
+
+        st.markdown("**4) 解析质量 / 置信度**")
+        _render_analysis_confidence_panel(analysis_payload, extract_info)
+
+        st.markdown("**5) 维度代表证据**")
         _render_dimension_evidence_summary(score_details, evidence_bridge)
 
-        st.markdown("**4) 关键证据片段摘要**")
+        st.markdown("**6) 正向证据 / 反证 / 缺失点**")
+        _render_grounding_evidence(analysis_payload)
+
+        st.markdown("**7) 关键证据片段摘要**")
         _render_evidence_snippets((detail.get("evidence_snippets", []) or [])[:5])
 
-        st.markdown("**5) 风险与建议动作**")
+        st.markdown("**8) 风险与建议动作**")
         st.write(f"风险等级：{_risk_level_label(risk_level)}")
         st.write(f"建议动作：{suggested_action}")
         for rp in risk_result.get("risk_points", []):
             st.markdown(f"- ⚠️ {rp}")
 
-        st.markdown("**6) 面试建议**")
+        st.markdown("**9) 面试建议**")
         interview_plan = detail.get("interview_plan", {})
         st.caption("建议追问问题")
         for q in interview_plan.get("interview_questions", []):
@@ -6662,7 +6762,20 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
             st.markdown(f"- {fp}")
         st.caption(f"面试总结：{interview_plan.get('interview_summary', '')}")
 
-        st.markdown("**7) 证据池调试面板（仅调试）**")
+        st.markdown("**10) AI 建议采纳状态**")
+        _render_ai_adoption_status(detail)
+
+        st.markdown("**11) 五维评分（辅助信息）**")
+        st.caption(
+            _score_brief_summary(
+                score_details=score_details,
+                timeline_summary=timeline_summary,
+            )
+        )
+        if "scores" in (detail.get("ai_applied_actions") or []):
+            st.caption("当前评分包含已人工确认的 AI 建议修正。")
+
+        st.markdown("**12) 证据池调试面板（仅调试）**")
         debug_flag = st.checkbox(
             "显示证据池重排调试信息",
             value=bool(os.getenv("HIREMATE_EVIDENCE_DEBUG", "0").strip() in {"1", "true", "yes", "on"}),
@@ -6677,7 +6790,13 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
                 debug_rows = meta.get("evidence_pool_debug") if isinstance(meta.get("evidence_pool_debug"), list) else []
                 if not debug_rows:
                     continue
-                dim_debug_rows.append({"dimension": dim_key, "rows": debug_rows, "thresholds": meta.get("evidence_pool_thresholds")})
+                dim_debug_rows.append(
+                    {
+                        "dimension": dim_key,
+                        "rows": debug_rows,
+                        "thresholds": meta.get("evidence_pool_thresholds"),
+                    }
+                )
 
             if not dim_debug_rows:
                 st.caption("当前没有证据池调试数据。请在环境变量中设置 HIREMATE_EVIDENCE_DEBUG=1 后重新生成报告。")
@@ -6687,16 +6806,6 @@ def _render_candidate_workspace_panel(rows: list[dict], details: dict[str, dict]
                     if item.get("thresholds"):
                         st.caption(f"阈值：{item.get('thresholds')}")
                     st.table(item.get("rows"))
-
-        st.markdown("**8) 五维评分（辅助信息）**")
-        st.caption(
-            _score_brief_summary(
-                score_details=score_details,
-                timeline_summary=timeline_summary,
-            )
-        )
-        if "scores" in (detail.get("ai_applied_actions") or []):
-            st.caption("当前评分包含已人工确认的 AI 建议修正。")
         with st.expander("展开查看五维评分详情", expanded=False):
             ordered_dims = ["教育背景匹配度", "相关经历匹配度", "技能匹配度", "表达完整度", "综合推荐度"]
             for dim_name in ordered_dims:

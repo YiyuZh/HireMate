@@ -9,8 +9,13 @@ from typing import Any
 from .metadata import extract_skill_tags_from_text, resolve_role_family, safe_identifier
 from .retriever import (
     retrieve_for_ai_reviewer,
+    retrieve_for_counter_evidence,
     retrieve_for_evidence_grounding,
+    retrieve_for_historical_grounding,
     retrieve_for_jd_alignment,
+    retrieve_for_missing_evidence,
+    retrieve_for_risk_grounding,
+    retrieve_for_semantic_anchors,
 )
 
 
@@ -101,6 +106,17 @@ def _pick_expected_terms(
     return _dedupe(selected)[:limit]
 
 
+def _pick_counter_terms(texts: list[str]) -> list[str]:
+    negatives = []
+    for text in texts:
+        clean = _clean_text(text)
+        if not clean:
+            continue
+        if any(token in clean for token in ["缺少", "不足", "未覆盖", "未体现"]):
+            negatives.append(clean)
+    return _pick_expected_terms(negatives, preferred_terms=_tokenize(" ".join(negatives)), limit=3)
+
+
 def _case_id(prefix: str, seed: str) -> str:
     return safe_identifier(seed, prefix).replace(prefix + "-", prefix + "_")
 
@@ -167,6 +183,19 @@ def build_cases_from_review_record(review_record: dict[str, Any]) -> list[dict[s
             )
         )
 
+        cases.append(
+            _build_case(
+                case_id=_case_id("review_anchor", f"{record.get('review_id')}|{jd_title}|anchor"),
+                task="semantic_anchors",
+                query=_build_query([jd_title, *reason_texts[:1]]),
+                expected_source_types=["jd", "role_profile", "rubric"],
+                expected_substrings=jd_terms,
+                job_id_safe=job_id_safe,
+                top_k=3,
+                created_from=f"review:{_clean_text(record.get('review_id'))}",
+            )
+        )
+
     if evidence_texts:
         cases.append(
             _build_case(
@@ -185,6 +214,35 @@ def build_cases_from_review_record(review_record: dict[str, Any]) -> list[dict[s
             )
         )
 
+        counter_terms = _pick_counter_terms(reason_texts)
+        if counter_terms:
+            cases.append(
+                _build_case(
+                    case_id=_case_id("review_counter", f"{record.get('review_id')}|{resume_name}|counter"),
+                    task="counter_evidence",
+                    query=_build_query([jd_title, *counter_terms, *evidence_texts[:1]]),
+                    expected_source_types=["evidence", "rubric", "resume_fragment"],
+                    expected_substrings=_pick_expected_terms(counter_terms),
+                    job_id_safe=job_id_safe,
+                    candidate_id_safe=candidate_id_safe,
+                    top_k=4,
+                    created_from=f"review:{_clean_text(record.get('review_id'))}",
+                )
+            )
+
+        cases.append(
+            _build_case(
+                case_id=_case_id("review_missing", f"{record.get('review_id')}|{resume_name}|missing"),
+                task="missing_evidence",
+                query=_build_query([jd_title, "缺少 未覆盖", *reason_texts[:2]]),
+                expected_source_types=["jd", "role_profile", "rubric"],
+                expected_substrings=_pick_expected_terms(reason_texts),
+                job_id_safe=job_id_safe,
+                top_k=3,
+                created_from=f"review:{_clean_text(record.get('review_id'))}",
+            )
+        )
+
     if evidence_texts or reason_texts:
         cases.append(
             _build_case(
@@ -199,6 +257,35 @@ def build_cases_from_review_record(review_record: dict[str, Any]) -> list[dict[s
                 created_from=f"review:{_clean_text(record.get('review_id'))}",
             )
         )
+
+        cases.append(
+            _build_case(
+                case_id=_case_id("review_history", f"{record.get('review_id')}|{resume_name}|history"),
+                task="historical_grounding",
+                query=_build_query([jd_title, *evidence_texts[:2], *reason_texts[:1]]),
+                expected_source_types=["evidence", "resume_fragment", "rubric"],
+                expected_substrings=_pick_expected_terms(evidence_texts),
+                job_id_safe=job_id_safe,
+                top_k=4,
+                created_from=f"review:{_clean_text(record.get('review_id'))}",
+            )
+        )
+
+        risk_terms = [text for text in reason_texts if "风险" in text]
+        if risk_terms:
+            cases.append(
+                _build_case(
+                    case_id=_case_id("review_risk", f"{record.get('review_id')}|{resume_name}|risk"),
+                    task="risk_grounding",
+                    query=_build_query([jd_title, *risk_terms[:2]]),
+                    expected_source_types=["evidence", "rubric"],
+                    expected_substrings=_pick_expected_terms(risk_terms),
+                    job_id_safe=job_id_safe,
+                    candidate_id_safe=candidate_id_safe,
+                    top_k=4,
+                    created_from=f"review:{_clean_text(record.get('review_id'))}",
+                )
+            )
 
     return [case for case in cases if case.get("query")]
 
@@ -280,6 +367,23 @@ def build_cases_from_batch_candidate(
             )
         )
 
+        cases.append(
+            _build_case(
+                case_id=_case_id("batch_anchor", base_seed + "|anchor"),
+                task="semantic_anchors",
+                query=_build_query([job_anchor, " ".join(required_skills[:4])]),
+                expected_source_types=["jd", "role_profile", "rubric"],
+                expected_substrings=_pick_expected_terms(
+                    required_skills + bonus_skills + [job_anchor],
+                    preferred_terms=required_skills + bonus_skills,
+                ),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                top_k=4,
+                created_from=f"batch:{batch_id}|candidate:{candidate_anchor}",
+            )
+        )
+
     evidence_expected_terms = _pick_expected_terms(
         evidence_texts + representative_texts + resume_skills,
         preferred_terms=resume_skills + required_skills,
@@ -305,6 +409,37 @@ def build_cases_from_batch_candidate(
                 job_id_safe=job_id_safe,
                 candidate_id_safe=candidate_id_safe,
                 top_k=4,
+                created_from=f"batch:{batch_id}|candidate:{candidate_anchor}",
+            )
+        )
+
+        counter_terms = _pick_counter_terms(reason_texts)
+        if counter_terms:
+            cases.append(
+                _build_case(
+                    case_id=_case_id("batch_counter", base_seed + "|counter"),
+                    task="counter_evidence",
+                    query=_build_query([job_anchor, *counter_terms, *evidence_texts[:1]]),
+                    expected_source_types=["resume_fragment", "evidence", "rubric"],
+                    expected_substrings=_pick_expected_terms(counter_terms),
+                    role_family=role_family,
+                    job_id_safe=job_id_safe,
+                    candidate_id_safe=candidate_id_safe,
+                    top_k=4,
+                    created_from=f"batch:{batch_id}|candidate:{candidate_anchor}",
+                )
+            )
+
+        cases.append(
+            _build_case(
+                case_id=_case_id("batch_missing", base_seed + "|missing"),
+                task="missing_evidence",
+                query=_build_query([job_anchor, "缺少 未覆盖", *reason_texts[:2]]),
+                expected_source_types=["jd", "role_profile", "rubric"],
+                expected_substrings=_pick_expected_terms(reason_texts),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                top_k=3,
                 created_from=f"batch:{batch_id}|candidate:{candidate_anchor}",
             )
         )
@@ -337,6 +472,37 @@ def build_cases_from_batch_candidate(
                 created_from=f"batch:{batch_id}|candidate:{candidate_anchor}",
             )
         )
+
+        cases.append(
+            _build_case(
+                case_id=_case_id("batch_history", base_seed + "|history"),
+                task="historical_grounding",
+                query=_build_query([job_anchor, *evidence_texts[:2], *reason_texts[:1]]),
+                expected_source_types=["evidence", "resume_fragment", "rubric"],
+                expected_substrings=_pick_expected_terms(evidence_texts),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                top_k=4,
+                created_from=f"batch:{batch_id}|candidate:{candidate_anchor}",
+            )
+        )
+
+        risk_terms = [text for text in reason_texts if "风险" in text]
+        if risk_terms:
+            cases.append(
+                _build_case(
+                    case_id=_case_id("batch_risk", base_seed + "|risk"),
+                    task="risk_grounding",
+                    query=_build_query([job_anchor, *risk_terms[:2]]),
+                    expected_source_types=["evidence", "rubric"],
+                    expected_substrings=_pick_expected_terms(risk_terms),
+                    role_family=role_family,
+                    job_id_safe=job_id_safe,
+                    candidate_id_safe=candidate_id_safe,
+                    top_k=4,
+                    created_from=f"batch:{batch_id}|candidate:{candidate_anchor}",
+                )
+            )
 
     return [case for case in cases if case.get("query")]
 
@@ -395,6 +561,16 @@ def run_benchmark_case(
             collection=collection,
             runtime_config=runtime_config,
         )
+    elif task == "semantic_anchors":
+        results = retrieve_for_semantic_anchors(
+            query,
+            top_k=top_k,
+            role_family=role_family,
+            job_id_safe=job_id_safe,
+            store_path=store_path,
+            collection=collection,
+            runtime_config=runtime_config,
+        )
     elif task == "evidence_grounding":
         results = retrieve_for_evidence_grounding(
             query,
@@ -406,8 +582,50 @@ def run_benchmark_case(
             collection=collection,
             runtime_config=runtime_config,
         )
+    elif task == "counter_evidence":
+        results = retrieve_for_counter_evidence(
+            query,
+            top_k=top_k,
+            role_family=role_family,
+            job_id_safe=job_id_safe,
+            candidate_id_safe=candidate_id_safe,
+            store_path=store_path,
+            collection=collection,
+            runtime_config=runtime_config,
+        )
+    elif task == "missing_evidence":
+        results = retrieve_for_missing_evidence(
+            query,
+            top_k=top_k,
+            role_family=role_family,
+            job_id_safe=job_id_safe,
+            store_path=store_path,
+            collection=collection,
+            runtime_config=runtime_config,
+        )
     elif task == "ai_reviewer":
         results = retrieve_for_ai_reviewer(
+            query,
+            top_k=top_k,
+            role_family=role_family,
+            job_id_safe=job_id_safe,
+            candidate_id_safe=candidate_id_safe,
+            store_path=store_path,
+            collection=collection,
+            runtime_config=runtime_config,
+        )
+    elif task == "historical_grounding":
+        results = retrieve_for_historical_grounding(
+            query,
+            top_k=top_k,
+            role_family=role_family,
+            job_id_safe=job_id_safe,
+            store_path=store_path,
+            collection=collection,
+            runtime_config=runtime_config,
+        )
+    elif task == "risk_grounding":
+        results = retrieve_for_risk_grounding(
             query,
             top_k=top_k,
             role_family=role_family,
@@ -450,6 +668,13 @@ def run_benchmark_case(
         + substring_rank * 0.2
         + label_rank * 0.1
     )
+    expected_blob = " ".join(expected_substrings).lower()
+    hit_blob = " ".join(_clean_text(item.get("text") or "") for item in results[:top_k]).lower()
+    expected_terms = [item for item in expected_substrings if item]
+    explanation_consistency = 0.0
+    if expected_terms:
+        hits = sum(1 for term in expected_terms if term.lower() in hit_blob)
+        explanation_consistency = hits / max(1, len(expected_terms))
 
     return {
         "case_id": _clean_text(case.get("case_id") or task),
@@ -464,6 +689,9 @@ def run_benchmark_case(
         "substring_rank": round(substring_rank, 6),
         "label_rank": round(label_rank, 6),
         "combined_score": round(combined_score, 6),
+        "grounding_recall": 1.0 if substring_hit else 0.0,
+        "counter_quality": round((substring_rank + source_rank) / 2.0, 6) if task in {"counter_evidence", "missing_evidence"} else 0.0,
+        "explanation_consistency": round(explanation_consistency, 6),
         "created_from": _clean_text(case.get("created_from")),
         "top_hits": [
             {
@@ -521,6 +749,18 @@ def run_benchmark(
         "pass_rate": round(sum(1 for item in results if item.get("success")) / max(1, len(results)), 6),
         "mean_combined_score": round(
             sum(float(item.get("combined_score") or 0.0) for item in results) / max(1, len(results)),
+            6,
+        ),
+        "mean_grounding_recall": round(
+            sum(float(item.get("grounding_recall") or 0.0) for item in results) / max(1, len(results)),
+            6,
+        ),
+        "mean_counter_quality": round(
+            sum(float(item.get("counter_quality") or 0.0) for item in results) / max(1, len(results)),
+            6,
+        ),
+        "mean_explanation_consistency": round(
+            sum(float(item.get("explanation_consistency") or 0.0) for item in results) / max(1, len(results)),
             6,
         ),
         "mean_source_rank": round(

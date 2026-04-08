@@ -59,11 +59,22 @@ DEFAULT_RAG_RUNTIME_CONFIG = {
         "jd_alignment": False,
         "evidence_grounding": False,
         "ai_reviewer_grounding": False,
+        "full_grounding": False,
+        "semantic_anchors": False,
+        "counter_evidence": False,
+        "missing_evidence": False,
+        "historical_grounding": False,
+        "risk_grounding": False,
     },
     "top_k": {
         "jd_alignment": 4,
         "evidence_grounding": 4,
         "ai_reviewer_grounding": 4,
+        "semantic_anchors": 4,
+        "counter_evidence": 4,
+        "missing_evidence": 4,
+        "historical_grounding": 4,
+        "risk_grounding": 4,
     },
     "auto_index": {
         "runtime_context": True,
@@ -124,6 +135,24 @@ def resolve_rag_runtime_config(config: dict[str, Any] | None = None) -> dict[str
         "ai_reviewer_grounding": bool(features_cfg.get("ai_reviewer_grounding"))
         if "ai_reviewer_grounding" in features_cfg
         else _env_flag("HIREMATE_RAG_ENABLE_AI_REVIEWER_GROUNDING", enabled),
+        "full_grounding": bool(features_cfg.get("full_grounding"))
+        if "full_grounding" in features_cfg
+        else _env_flag("HIREMATE_RAG_ENABLE_FULL_GROUNDING", enabled),
+        "semantic_anchors": bool(features_cfg.get("semantic_anchors"))
+        if "semantic_anchors" in features_cfg
+        else _env_flag("HIREMATE_RAG_ENABLE_SEMANTIC_ANCHORS", enabled),
+        "counter_evidence": bool(features_cfg.get("counter_evidence"))
+        if "counter_evidence" in features_cfg
+        else _env_flag("HIREMATE_RAG_ENABLE_COUNTER_EVIDENCE", enabled),
+        "missing_evidence": bool(features_cfg.get("missing_evidence"))
+        if "missing_evidence" in features_cfg
+        else _env_flag("HIREMATE_RAG_ENABLE_MISSING_EVIDENCE", enabled),
+        "historical_grounding": bool(features_cfg.get("historical_grounding"))
+        if "historical_grounding" in features_cfg
+        else _env_flag("HIREMATE_RAG_ENABLE_HISTORICAL_GROUNDING", enabled),
+        "risk_grounding": bool(features_cfg.get("risk_grounding"))
+        if "risk_grounding" in features_cfg
+        else _env_flag("HIREMATE_RAG_ENABLE_RISK_GROUNDING", enabled),
     }
 
     top_k = {}
@@ -439,6 +468,120 @@ def retrieve_for_ai_reviewer(
     )
 
 
+def retrieve_for_semantic_anchors(
+    query: str,
+    *,
+    top_k: int = 5,
+    role_family: str = "",
+    job_id_safe: str = "",
+    store_path: str | None = None,
+    collection: str = "default",
+    runtime_config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return _search(
+        query,
+        top_k=top_k,
+        source_types={"jd", "role_profile", "rubric"},
+        role_family=role_family,
+        job_id_safe=job_id_safe,
+        store_path=store_path,
+        collection=collection,
+        runtime_config=runtime_config,
+    )
+
+
+def retrieve_for_counter_evidence(
+    query: str,
+    *,
+    top_k: int = 5,
+    role_family: str = "",
+    job_id_safe: str = "",
+    candidate_id_safe: str = "",
+    store_path: str | None = None,
+    collection: str = "default",
+    runtime_config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return _search(
+        query,
+        top_k=top_k,
+        source_types={"resume_fragment", "evidence", "rubric"},
+        role_family=role_family,
+        job_id_safe=job_id_safe,
+        candidate_id_safe=candidate_id_safe,
+        store_path=store_path,
+        collection=collection,
+        runtime_config=runtime_config,
+    )
+
+
+def retrieve_for_missing_evidence(
+    query: str,
+    *,
+    top_k: int = 5,
+    role_family: str = "",
+    job_id_safe: str = "",
+    store_path: str | None = None,
+    collection: str = "default",
+    runtime_config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return _search(
+        query,
+        top_k=top_k,
+        source_types={"jd", "role_profile", "rubric"},
+        role_family=role_family,
+        job_id_safe=job_id_safe,
+        store_path=store_path,
+        collection=collection,
+        runtime_config=runtime_config,
+    )
+
+
+def retrieve_for_historical_grounding(
+    query: str,
+    *,
+    top_k: int = 5,
+    role_family: str = "",
+    job_id_safe: str = "",
+    store_path: str | None = None,
+    collection: str = "default",
+    runtime_config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return _search(
+        query,
+        top_k=top_k,
+        source_types={"evidence", "resume_fragment", "rubric"},
+        role_family=role_family,
+        job_id_safe=job_id_safe,
+        store_path=store_path,
+        collection=collection,
+        runtime_config=runtime_config,
+    )
+
+
+def retrieve_for_risk_grounding(
+    query: str,
+    *,
+    top_k: int = 5,
+    role_family: str = "",
+    job_id_safe: str = "",
+    candidate_id_safe: str = "",
+    store_path: str | None = None,
+    collection: str = "default",
+    runtime_config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return _search(
+        query,
+        top_k=top_k,
+        source_types={"evidence", "rubric"},
+        role_family=role_family,
+        job_id_safe=job_id_safe,
+        candidate_id_safe=candidate_id_safe,
+        store_path=store_path,
+        collection=collection,
+        runtime_config=runtime_config,
+    )
+
+
 def _dedupe(values: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
@@ -743,6 +886,144 @@ def build_ai_reviewer_grounding(
         "retrieved_count": len(results),
         "results": _summarize_hits(results),
         "query": query,
+    }
+
+
+def build_full_grounding(
+    *,
+    parsed_jd: dict[str, Any],
+    parsed_resume: dict[str, Any],
+    evidence_snippets: list[dict[str, Any]] | None = None,
+    screening_reasons: list[str] | None = None,
+    runtime_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = resolve_rag_runtime_config(runtime_config)
+    if not rag_feature_enabled("full_grounding", config):
+        return {
+            "enabled": False,
+            "reason": "full_grounding disabled",
+            "jd_semantic_anchors": [],
+            "positive_evidence": [],
+            "counter_evidence": [],
+            "missing_evidence": [],
+            "historical_case_grounding": [],
+            "risk_case_grounding": [],
+        }
+
+    role_family = resolve_role_family(parsed_jd)
+    job_id_safe = safe_identifier(str(parsed_jd.get("job_title") or ""), "job")
+    candidate_id_safe = safe_identifier(str(parsed_resume.get("name") or ""), "cand")
+    jd_skills = " ".join(parsed_jd.get("expanded_required_skills") or parsed_jd.get("required_skills") or [])
+    resume_skills = " ".join(parsed_resume.get("skills") or [])
+    snippet_text = " ".join(str((item or {}).get("text") or "") for item in (evidence_snippets or [])[:4] if isinstance(item, dict))
+    reason_text = " ".join(str(item or "") for item in (screening_reasons or [])[:4])
+
+    anchors_query = _build_query([parsed_jd.get("job_title"), jd_skills, reason_text])
+    positive_query = _build_query([parsed_jd.get("job_title"), jd_skills, resume_skills, snippet_text])
+    counter_query = _build_query([parsed_jd.get("job_title"), "缺少 证据 不足", reason_text, resume_skills])
+    missing_query = _build_query([parsed_jd.get("job_title"), jd_skills, "缺少 未覆盖", reason_text])
+    historical_query = _build_query([parsed_jd.get("job_title"), jd_skills, resume_skills, snippet_text])
+    risk_query = _build_query([parsed_jd.get("job_title"), "风险 核验 争议", reason_text])
+
+    anchors = []
+    counter = []
+    missing = []
+    positive = []
+    historical = []
+    risks = []
+
+    try:
+        if rag_feature_enabled("semantic_anchors", config):
+            anchors = retrieve_for_semantic_anchors(
+                anchors_query,
+                top_k=(config.get("top_k") or {}).get("semantic_anchors", 4),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                runtime_config=config,
+            )
+    except Exception:
+        anchors = []
+
+    try:
+        if rag_feature_enabled("counter_evidence", config):
+            counter = retrieve_for_counter_evidence(
+                counter_query,
+                top_k=(config.get("top_k") or {}).get("counter_evidence", 4),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                candidate_id_safe=candidate_id_safe,
+                runtime_config=config,
+            )
+    except Exception:
+        counter = []
+
+    try:
+        if rag_feature_enabled("missing_evidence", config):
+            missing = retrieve_for_missing_evidence(
+                missing_query,
+                top_k=(config.get("top_k") or {}).get("missing_evidence", 4),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                runtime_config=config,
+            )
+    except Exception:
+        missing = []
+
+    try:
+        if rag_feature_enabled("evidence_grounding", config):
+            positive = retrieve_for_evidence_grounding(
+                positive_query,
+                top_k=(config.get("top_k") or {}).get("evidence_grounding", 4),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                candidate_id_safe=candidate_id_safe,
+                runtime_config=config,
+            )
+    except Exception:
+        positive = []
+
+    try:
+        if rag_feature_enabled("historical_grounding", config):
+            historical = retrieve_for_historical_grounding(
+                historical_query,
+                top_k=(config.get("top_k") or {}).get("historical_grounding", 4),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                runtime_config=config,
+            )
+    except Exception:
+        historical = []
+
+    try:
+        if rag_feature_enabled("risk_grounding", config):
+            risks = retrieve_for_risk_grounding(
+                risk_query,
+                top_k=(config.get("top_k") or {}).get("risk_grounding", 4),
+                role_family=role_family,
+                job_id_safe=job_id_safe,
+                candidate_id_safe=candidate_id_safe,
+                runtime_config=config,
+            )
+    except Exception:
+        risks = []
+
+    return {
+        "enabled": True,
+        "reason": "vector_store retrieval applied",
+        "jd_semantic_anchors": _summarize_hits(anchors),
+        "positive_evidence": _summarize_hits(positive),
+        "counter_evidence": _summarize_hits(counter),
+        "missing_evidence": _summarize_hits(missing),
+        "historical_case_grounding": _summarize_hits(historical),
+        "risk_case_grounding": _summarize_hits(risks),
+        "queries": {
+            "anchors": anchors_query,
+            "positive": positive_query,
+            "counter": counter_query,
+            "missing": missing_query,
+            "historical": historical_query,
+            "risk": risk_query,
+        },
     }
 
 

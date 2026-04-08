@@ -31,13 +31,19 @@ from .metadata import (
 )
 from .retriever import (
     build_ai_reviewer_grounding,
+    build_full_grounding,
     build_evidence_grounding,
     expand_jd_with_rag,
     rag_feature_enabled,
     resolve_rag_runtime_config,
     retrieve_for_ai_reviewer,
+    retrieve_for_counter_evidence,
     retrieve_for_evidence_grounding,
+    retrieve_for_historical_grounding,
     retrieve_for_jd_alignment,
+    retrieve_for_missing_evidence,
+    retrieve_for_risk_grounding,
+    retrieve_for_semantic_anchors,
 )
 from .store import DEFAULT_VECTOR_STORE_PATH, LocalVectorStore, resolve_vector_store_path
 
@@ -47,6 +53,7 @@ __all__ = [
     "MockEmbeddingProvider",
     "RAG_CHUNK_VERSION",
     "build_ai_reviewer_grounding",
+    "build_full_grounding",
     "build_cases_from_batch_candidate",
     "build_cases_from_review_record",
     "build_embedding_provider",
@@ -74,8 +81,13 @@ __all__ = [
     "run_benchmark",
     "run_benchmark_case",
     "retrieve_for_ai_reviewer",
+    "retrieve_for_counter_evidence",
     "retrieve_for_evidence_grounding",
+    "retrieve_for_historical_grounding",
     "retrieve_for_jd_alignment",
+    "retrieve_for_missing_evidence",
+    "retrieve_for_risk_grounding",
+    "retrieve_for_semantic_anchors",
     "safe_identifier",
     "save_benchmark_cases",
 ]
