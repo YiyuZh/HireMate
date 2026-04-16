@@ -38,13 +38,26 @@
     }
 }
 
+(portal_messages_api_routes) {
+    @portal_messages_api path /api/messages* /api/admin/messages*
+    handle @portal_messages_api {
+        reverse_proxy portal-messages-api:8000
+    }
+}
+
 {$PRIMARY_DOMAIN} {
     import common_site
-    reverse_proxy portal-nginx:80
+    import portal_messages_api_routes
+
+    handle {
+        reverse_proxy portal-nginx:80
+    }
 }
 
 blog.zenithy.art {
     import common_site
+    import portal_messages_api_routes
+
     @blog_admin path /admin /admin/* 
     basicauth @blog_admin {
         autsky6666@gmail.com $2b$12$bM/k/LvfDRXIKywrhrLmh.wEa8v8N15cluiTcQStDUjMtBNReZbYm
