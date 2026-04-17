@@ -39,8 +39,16 @@
 }
 
 (portal_messages_api_routes) {
-    @portal_messages_api path /api/messages* /api/admin/messages*
-    handle @portal_messages_api {
+    @portal_messages_admin path /api/admin/messages*
+    handle @portal_messages_admin {
+        basicauth {
+            autsky6666@gmail.com $2b$12$bM/k/LvfDRXIKywrhrLmh.wEa8v8N15cluiTcQStDUjMtBNReZbYm
+        }
+        reverse_proxy portal-messages-api:8000
+    }
+
+    @portal_messages_public path /api/messages* /api/health
+    handle @portal_messages_public {
         reverse_proxy portal-messages-api:8000
     }
 }
