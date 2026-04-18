@@ -1,0 +1,17 @@
+[zenithy-caddy-admin-auth]
+enabled = true
+filter = zenithy-caddy-admin-auth
+logpath = /opt/apps/hiremate/logs/caddy/access.log
+backend = auto
+
+# Lightweight protection: tolerate a few mistakes, block obvious password spraying.
+maxretry = 6
+findtime = 10m
+bantime = 1h
+
+port = http,https
+protocol = tcp
+banaction = iptables-multiport
+
+# Add your stable office/home IP here only if needed.
+ignoreip = 127.0.0.1/8 ::1

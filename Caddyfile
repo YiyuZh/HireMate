@@ -19,6 +19,17 @@
     }
 }
 
+(admin_auth_access_log) {
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10MiB
+            roll_keep 5
+            roll_keep_for 168h
+        }
+        format json
+    }
+}
+
 (hiremate_cache_policy) {
     @hiremate_static path /static/*
     header @hiremate_static Cache-Control "public, max-age=31536000, immutable"
@@ -55,6 +66,7 @@
 
 {$PRIMARY_DOMAIN} {
     import common_site
+    import admin_auth_access_log
     import portal_messages_api_routes
 
     handle {
@@ -64,6 +76,7 @@
 
 blog.zenithy.art {
     import common_site
+    import admin_auth_access_log
     import portal_messages_api_routes
 
     @blog_admin path /admin /admin/* 
