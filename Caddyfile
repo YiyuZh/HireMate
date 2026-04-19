@@ -112,6 +112,19 @@ blog.zenithy.art {
     }
 }
 
+photo.zenithy.art {
+    import common_site
+
+    @backend path /api/* /uploads/* /exports/*
+    handle @backend {
+        reverse_proxy photography-app:8000
+    }
+
+    handle {
+        reverse_proxy photography-app:8000
+    }
+}
+
 {$ADMIN_DOMAIN} {
     import common_site
     import ai_backend_routes
