@@ -7740,6 +7740,934 @@ def _render_batch_screening() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def _render_job_library() -> None:
+    _cleanup_legacy_joblib_widget_state()
+
+    pending_selection = str(st.session_state.pop("joblib_selected_title_pending", "") or "").strip()
+    if pending_selection:
+        st.session_state["joblib_selected_title"] = pending_selection
+        _sync_job_management_drafts(pending_selection)
+
+    flash_msg = str(st.session_state.pop("joblib_flash_success", "") or "").strip()
+    records = list_jd_records()
+    in_use_titles = {
+        str(st.session_state.get("selected_jd_title") or "").strip(),
+        str(st.session_state.get("v2_selected_jd_prev") or "").strip(),
+        str(st.session_state.get("batch_selected_jd_prev") or "").strip(),
+        str(st.session_state.get("workspace_selected_jd_title") or "").strip(),
+    }
+    in_use_titles.discard("")
+
+    if not str(st.session_state.get("joblib_selected_title") or "").strip() and records:
+        fallback_title = next((title for title in in_use_titles if title), "") or str(records[0].get("title") or "").strip()
+        if fallback_title:
+            st.session_state["joblib_selected_title"] = fallback_title
+            _sync_job_management_drafts(fallback_title)
+
+    total_openings = sum(int(item.get("openings", 0) or 0) for item in records)
+    pass_total = sum(int(_latest_batch_snapshot(str(item.get("title") or "")).get("pass_count", 0) or 0) for item in records)
+    review_total = sum(int(_latest_batch_snapshot(str(item.get("title") or "")).get("review_count", 0) or 0) for item in records)
+
+    _render_app_topbar("Job Config")
+    _render_page_intro(
+        "Active Configurations",
+        "Keep requisitions, scoring thresholds, AI defaults, and downstream batch behavior aligned from one configuration cockpit.",
+        eyebrow="Job Config",
+        chips=[
+            f"{len(records)} Active Roles",
+            f"{total_openings} Open Seats",
+            f"{pass_total} Pass Candidates",
+            f"{review_total} Needs Review",
+        ],
+    )
+    _render_metric_strip(
+        [
+            {"label": "Requisitions", "value": len(records), "meta": "Current job library"},
+            {"label": "Open Seats", "value": total_openings, "meta": "Openings across all roles"},
+            {"label": "Pass Pool", "value": pass_total, "meta": "Latest batch summary"},
+            {"label": "Review Pool", "value": review_total, "meta": "Candidates awaiting review"},
+        ]
+    )
+    if flash_msg:
+        st.success(flash_msg)
+
+    library_col, editor_col = st.columns([0.4, 0.6], gap="large")
+
+    with library_col:
+        st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+        _render_surface_head(
+            "Job Library",
+            "Browse active requisitions, open the right-side editor, or jump directly into batch screening and the workbench.",
+            eyebrow="Left Rail",
+            chips=["Card-based overview", "Fast entry actions", "Current-context highlighting"],
+        )
+        if records:
+            active_title = str(st.session_state.get("joblib_selected_title") or "").strip()
+            for rec in records:
+                title = str(rec.get("title") or "").strip()
+                snapshot = _latest_batch_snapshot(title)
+                openings = int(rec.get("openings", 0) or 0)
+                creator_name = str(rec.get("created_by_name") or "").strip()
+                creator_email = str(rec.get("created_by_email") or "").strip()
+                creator_display = creator_name or creator_email or "Unknown"
+                is_active = title == active_title
+                chip_items = [
+                    f"Last Batch {snapshot.get('latest_time', '-')}",
+                    f"Openings {openings}",
+                    "In Context" if title in in_use_titles else "Available",
+                ]
+                st.markdown(
+                    "<div class='job-tile{active}'>"
+                    "<div class='job-tile__eyebrow'>Requisition</div>"
+                    f"<div class='job-tile__title'>{html.escape(title or 'Untitled Role')}</div>"
+                    f"<div class='job-tile__summary'>{html.escape(_jd_summary(str(rec.get('text', '') or ''), max_len=120))}</div>"
+                    "<div class='job-tile__meta'>"
+                    + "".join(f"<span class='ui-chip'>{html.escape(item)}</span>" for item in chip_items)
+                    + "</div>"
+                    "<div class='job-tile__stat-grid'>"
+                    f"<div class='ui-mini-stat'><span class='ui-mini-stat__label'>Pass</span><span class='ui-mini-stat__value'>{int(snapshot.get('pass_count', 0) or 0)}</span></div>"
+                    f"<div class='ui-mini-stat'><span class='ui-mini-stat__label'>Review</span><span class='ui-mini-stat__value'>{int(snapshot.get('review_count', 0) or 0)}</span></div>"
+                    f"<div class='ui-mini-stat'><span class='ui-mini-stat__label'>Reject</span><span class='ui-mini-stat__value'>{int(snapshot.get('reject_count', 0) or 0)}</span></div>"
+                    f"<div class='ui-mini-stat'><span class='ui-mini-stat__label'>Owner</span><span class='ui-mini-stat__value' style='font-size:.92rem'>{html.escape(_ui_initials(creator_display))}</span><span class='ui-mini-stat__meta'>{html.escape(_short_text(creator_display, max_len=18))}</span></div>"
+                    "</div>"
+                    "</div>".format(active=" is-active" if is_active else ""),
+                    unsafe_allow_html=True,
+                )
+                action_cols = st.columns([1.1, 1, 1])
+                with action_cols[0]:
+                    if st.button("编辑配置", key=f"joblib_pick_{title}", use_container_width=True):
+                        _queue_joblib_selection(title)
+                        st.rerun()
+                with action_cols[1]:
+                    if st.button("批量初筛", key=f"job_entry_batch_{title}", use_container_width=True):
+                        _apply_jd_to_workspace(title)
+                        _request_page_navigation("批量初筛")
+                        st.rerun()
+                with action_cols[2]:
+                    if st.button("候选人工作台", key=f"job_entry_workspace_{title}", use_container_width=True):
+                        _apply_jd_to_workspace(title)
+                        _request_page_navigation("候选人工作台")
+                        st.rerun()
+        else:
+            st.info("当前岗位库为空。先在下方创建岗位，再进入右侧详情面板继续配置。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with editor_col:
+        st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+        _render_surface_head(
+            "Configuration Detail",
+            "Open one role and edit its JD, scoring profile, AI defaults, and batch history without leaving the page.",
+            eyebrow="Right Pane",
+        )
+        selected_job = st.selectbox(
+            "选择岗位进行管理",
+            options=[""] + [str(r.get("title") or "") for r in records],
+            format_func=lambda value: value if value else "请选择岗位",
+            key="joblib_selected_title",
+            on_change=_on_joblib_selected_job_change,
+            label_visibility="collapsed",
+        )
+
+        if selected_job and st.session_state.get("joblib_selected_title_prev", "") != selected_job:
+            _sync_job_management_drafts(selected_job)
+
+        if selected_job:
+            selected_snapshot = _latest_batch_snapshot(selected_job)
+            st.markdown("<div class='ui-surface ui-surface--accent'>", unsafe_allow_html=True)
+            _render_surface_head(
+                selected_job,
+                "This configuration becomes the single source for batch screening defaults, scoring weights, and workbench inheritance.",
+                eyebrow="Active Config",
+                chips=[
+                    f"Last Batch {selected_snapshot.get('latest_time', '-')}",
+                    f"Pass {int(selected_snapshot.get('pass_count', 0) or 0)}",
+                    f"Review {int(selected_snapshot.get('review_count', 0) or 0)}",
+                    f"Reject {int(selected_snapshot.get('reject_count', 0) or 0)}",
+                ],
+            )
+            accent_stats = st.columns(4)
+            accent_stats[0].metric("Openings", int(st.session_state.get("joblib_draft_openings", 0) or 0))
+            accent_stats[1].metric("Pass", int(selected_snapshot.get("pass_count", 0) or 0))
+            accent_stats[2].metric("Review", int(selected_snapshot.get("review_count", 0) or 0))
+            accent_stats[3].metric("Reject", int(selected_snapshot.get("reject_count", 0) or 0))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            edit_upload = st.file_uploader(
+                "重新导入 JD 文档（txt / pdf / docx）",
+                type=["txt", "pdf", "docx"],
+                key=f"joblib_edit_jd_upload_{selected_job}",
+                help="上传后只会覆盖当前编辑草稿，不会自动落库。",
+            )
+            _handle_edit_jd_upload(selected_job, edit_upload)
+            edit_meta_map = st.session_state.get("joblib_edit_jd_upload_meta_by_job", {})
+            _render_jd_upload_feedback(
+                edit_meta_map.get(selected_job) if isinstance(edit_meta_map, dict) else None,
+                context_label="编辑区 JD ",
+            )
+
+            scoring_cfg = _normalize_scoring_config(
+                st.session_state.get("joblib_draft_scoring_config")
+                or build_default_scoring_config("AI产品经理 / 大模型产品经理")
+            )
+
+            tabs = st.tabs(["Core Setup", "AI Defaults", "Batch History"])
+
+            with tabs[0]:
+                basics_col, jd_col = st.columns([0.34, 0.66], gap="large")
+                with basics_col:
+                    st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+                    _render_surface_head(
+                        "Role Basics",
+                        "Maintain the hiring seat count and scoring profile before touching detailed thresholds.",
+                        eyebrow="Basics",
+                    )
+                    edited_openings = st.number_input(
+                        "当前空缺人数",
+                        min_value=0,
+                        step=1,
+                        value=int(st.session_state.get("joblib_draft_openings", 0) or 0),
+                        key=f"joblib_edit_openings_input_{selected_job}",
+                        help="用于岗位总览卡片展示，可按招聘进度手动维护。",
+                    )
+                    profile_options = get_profile_options()
+                    current_profile = str(scoring_cfg.get("profile_name") or profile_options[0])
+                    if current_profile not in profile_options:
+                        current_profile = profile_options[0]
+                    selected_profile = st.selectbox(
+                        "岗位评分模板",
+                        options=profile_options,
+                        index=profile_options.index(current_profile),
+                        key=f"joblib_scoring_profile_{selected_job}",
+                    )
+                    if selected_profile != current_profile:
+                        scoring_cfg = _normalize_scoring_config(build_default_scoring_config(selected_profile))
+                        st.session_state.joblib_draft_scoring_config = scoring_cfg
+                        _apply_scoring_widget_state(selected_job, scoring_cfg)
+                    st.caption("若不确定模板选择，建议先用最接近的岗位族默认值，再微调权重和门槛。")
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+                with jd_col:
+                    st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+                    _render_surface_head(
+                        "JD Draft",
+                        "This text feeds parsing, downstream batch defaults, and AI helper prompts. Keep it readable and current.",
+                        eyebrow="JD",
+                    )
+                    edited_text = st.text_area(
+                        "岗位 JD 内容（可查看/编辑）",
+                        value=st.session_state.get("joblib_draft_text", load_jd(selected_job)),
+                        height=280,
+                        key=f"joblib_edit_text_input_{selected_job}",
+                        label_visibility="collapsed",
+                    )
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+                st.session_state.joblib_draft_openings = int(edited_openings)
+                st.session_state.joblib_draft_text = edited_text
+
+                st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+                _render_surface_head(
+                    "Scoring Weights",
+                    "Keep the four foundational dimensions balanced. The total must remain exactly 1.00 before changes can be saved.",
+                    eyebrow="Scoring",
+                    chips=["Rule scorer remains primary", "Template defaults supported", "Real-time validation"],
+                )
+                weight_cfg = scoring_cfg.get("weights") or {}
+                weight_action_cols = st.columns([1, 1, 1.5])
+                with weight_action_cols[0]:
+                    if st.button("恢复模板默认值", key=f"joblib_restore_profile_defaults_{selected_job}", use_container_width=True):
+                        scoring_cfg = _normalize_scoring_config(build_default_scoring_config(selected_profile))
+                        st.session_state.joblib_draft_scoring_config = scoring_cfg
+                        _apply_scoring_widget_state(selected_job, scoring_cfg)
+                        st.rerun()
+                with weight_action_cols[1]:
+                    if st.button("自动归一化", key=f"joblib_normalize_weights_{selected_job}", use_container_width=True):
+                        normalized_weights = normalize_weights(
+                            _read_weight_widget_values(selected_job, weight_cfg),
+                            fallback=weight_cfg,
+                        )
+                        _apply_weight_widget_state(selected_job, normalized_weights)
+                        st.rerun()
+                with weight_action_cols[2]:
+                    with st.expander("权重说明", expanded=False):
+                        for wk in BASE_WEIGHT_KEYS:
+                            field_help = WEIGHT_FIELD_HELP.get(wk, {})
+                            st.markdown(
+                                f"**{wk}**\n\n"
+                                f"代表什么：{field_help.get('summary', '-')}\n\n"
+                                f"建议如何调：{field_help.get('guidance', '-')}\n\n"
+                                f"极端设置会带来什么偏差：{field_help.get('bias', '-')}"
+                            )
+
+                weight_cols = st.columns(2)
+                weight_values: dict[str, float] = {}
+                for idx, wk in enumerate(BASE_WEIGHT_KEYS):
+                    weight_values[wk] = weight_cols[idx % 2].slider(
+                        wk,
+                        min_value=0.0,
+                        max_value=1.0,
+                        step=0.01,
+                        value=float(weight_cfg.get(wk, 0.25) or 0.25),
+                        key=_weight_widget_key(selected_job, wk),
+                        help=WEIGHT_FIELD_HELP.get(wk, {}).get("summary"),
+                    )
+                current_weight_total = weight_total(weight_values)
+                weights_valid = is_weight_total_valid(weight_values, tolerance=WEIGHT_SUM_TOLERANCE)
+                if weights_valid:
+                    st.success(f"当前总和：{current_weight_total:.2f} / 1.00，已经满足保存条件。")
+                else:
+                    st.warning(f"当前总和：{current_weight_total:.2f} / 1.00。请手动调整，或点击“自动归一化”。")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+                _render_surface_head(
+                    "Thresholds & Hard Flags",
+                    "Use soft thresholds to control routing, and hard flags only for very explicit must-have requirements.",
+                    eyebrow="Routing",
+                )
+                thr_cfg = scoring_cfg.get("screening_thresholds") or scoring_cfg.get("thresholds") or {}
+                thr_cols = st.columns(5)
+                pass_line = thr_cols[0].number_input("通过线", min_value=1, max_value=5, value=int(thr_cfg.get("pass_line", 4) or 4), key=f"joblib_thr_pass_{selected_job}")
+                review_line = thr_cols[1].number_input("复核线", min_value=1, max_value=5, value=int(thr_cfg.get("review_line", 3) or 3), key=f"joblib_thr_review_{selected_job}")
+                min_exp = thr_cols[2].number_input("经历最低分", min_value=1, max_value=5, value=int(thr_cfg.get("min_experience", 2) or 2), key=f"joblib_thr_exp_{selected_job}")
+                min_skill = thr_cols[3].number_input("技能最低分", min_value=1, max_value=5, value=int(thr_cfg.get("min_skill", 2) or 2), key=f"joblib_thr_skill_{selected_job}")
+                min_expr = thr_cols[4].number_input("表达最低分", min_value=1, max_value=5, value=int(thr_cfg.get("min_expression", 2) or 2), key=f"joblib_thr_expr_{selected_job}")
+                hard_cfg = dict(scoring_cfg.get("hard_thresholds") or scoring_cfg.get("hard_flags") or {})
+                hard_opts = _profile_hard_flag_options(selected_profile)
+                if hard_opts:
+                    hard_cols = st.columns(2)
+                    for idx, (hard_key, hard_label) in enumerate(hard_opts):
+                        hard_cfg[hard_key] = hard_cols[idx % 2].checkbox(
+                            hard_label,
+                            value=bool(hard_cfg.get(hard_key, False)),
+                            key=f"joblib_hard_{selected_job}_{hard_key}",
+                        )
+                else:
+                    st.caption("当前模板没有额外硬门槛。")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with tabs[1]:
+                ai_rule_cfg = {**_default_ai_rule_suggester_config(), **(scoring_cfg.get("ai_rule_suggester") or {})}
+                st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+                _render_surface_head(
+                    "AI Rule Suggestion",
+                    "Use AI only as a configuration assistant. The rule scorer remains primary and AI suggestions must be manually applied.",
+                    eyebrow="AI Assist",
+                )
+                ai_cols = st.columns(2)
+                enable_ai_rule_suggester = ai_cols[0].toggle(
+                    "启用 AI 评分细则建议",
+                    value=bool(ai_rule_cfg.get("enable_ai_rule_suggester", False)),
+                    key=f"joblib_ai_enable_{selected_job}",
+                )
+                provider_options = get_ai_provider_options()
+                current_rule_provider = str(ai_rule_cfg.get("provider", "openai") or "openai")
+                provider = ai_cols[1].selectbox(
+                    "provider",
+                    options=provider_options,
+                    index=provider_options.index(current_rule_provider) if current_rule_provider in provider_options else 0,
+                    key=f"joblib_ai_rule_provider_{selected_job}",
+                )
+                rule_runtime_prefix = f"joblib_ai_rule_runtime_{selected_job}"
+                _sync_ai_config_defaults(
+                    rule_runtime_prefix,
+                    provider,
+                    model_fallback=str(ai_rule_cfg.get("model") or get_default_ai_model(provider)),
+                )
+                ai_cols2 = st.columns(2)
+                with ai_cols2[0]:
+                    model_name = _render_ai_model_selector(rule_runtime_prefix, provider, str(ai_rule_cfg.get("model") or get_default_ai_model(provider)), label="model")
+                with ai_cols2[1]:
+                    api_base = st.text_input(
+                        "api_base（可选）",
+                        value=st.session_state.get(f"{rule_runtime_prefix}_api_base", str(ai_rule_cfg.get("api_base") or get_default_ai_api_base(provider))),
+                        key=f"{rule_runtime_prefix}_api_base",
+                    ).strip()
+                key_cfg = _render_ai_api_key_config_inputs(rule_runtime_prefix, provider, ai_rule_cfg)
+                _render_ai_runtime_hint(provider, api_base, str(key_cfg.get("api_key_env_name") or ""), api_key_mode=str(key_cfg.get("api_key_mode") or "direct_input"), api_key_value=str(key_cfg.get("api_key_value") or ""))
+                _render_ai_runtime_warning(provider, api_base, str(key_cfg.get("api_key_env_name") or ""), api_key_mode=str(key_cfg.get("api_key_mode") or "direct_input"), api_key_value=str(key_cfg.get("api_key_value") or ""), enabled=bool(enable_ai_rule_suggester), feature_label="AI 评分细则建议")
+                rule_runtime_cfg = {"enable_ai_rule_suggester": bool(enable_ai_rule_suggester), "provider": provider, "model": model_name, "api_base": api_base, **key_cfg}
+                rule_connection_key = f"joblib_ai_rule_connection_test_{selected_job}"
+                rule_action_cols = st.columns(2)
+                with rule_action_cols[0]:
+                    if st.button("测试 AI 连接", key=f"joblib_ai_rule_test_btn_{selected_job}", use_container_width=True):
+                        st.session_state[rule_connection_key] = test_ai_connection(rule_runtime_cfg, purpose="ai_rule_suggester")
+                with rule_action_cols[1]:
+                    if st.button("生成评分细则建议", key=f"joblib_ai_suggest_btn_{selected_job}", use_container_width=True):
+                        suggestion = run_ai_rule_suggester(selected_profile, scoring_cfg, edited_text, rule_runtime_cfg)
+                        st.session_state[f"joblib_ai_suggestion_{selected_job}"] = suggestion
+                        st.session_state[f"joblib_ai_suggestion_text_{selected_job}"] = json.dumps(suggestion, ensure_ascii=False, indent=2)
+                        suggestion_meta = suggestion.get("meta") if isinstance(suggestion.get("meta"), dict) else {}
+                        if str(suggestion_meta.get("source") or "") == "stub":
+                            st.warning(f"当前返回为 stub fallback：{suggestion_meta.get('reason') or '未获取到真实模型结果'}")
+                        else:
+                            st.success("AI 评分细则建议生成成功。")
+                _render_ai_connection_result(st.session_state.get(rule_connection_key))
+
+                ai_suggestion = st.session_state.get(f"joblib_ai_suggestion_{selected_job}")
+                if ai_suggestion:
+                    ai_suggestion_meta = ai_suggestion.get("meta") if isinstance(ai_suggestion.get("meta"), dict) else {}
+                    st.caption(
+                        f"source：{ai_suggestion_meta.get('source') or '-'}  |  "
+                        f"provider：{ai_suggestion_meta.get('provider') or '-'}  |  "
+                        f"model：{ai_suggestion_meta.get('model') or '-'}"
+                    )
+                    if ai_suggestion_meta.get("reason"):
+                        st.caption(f"说明：{ai_suggestion_meta.get('reason')}")
+                    suggestion_text_default = json.dumps(ai_suggestion, ensure_ascii=False, indent=2)
+                    suggestion_text = st.text_area("可手动编辑建议后再应用", value=st.session_state.get(f"joblib_ai_suggestion_text_{selected_job}", suggestion_text_default), height=220, key=f"joblib_ai_suggestion_text_{selected_job}")
+                    st.json(ai_suggestion)
+                    if st.button("应用建议到当前草稿", key=f"joblib_apply_ai_suggestion_{selected_job}", use_container_width=True):
+                        try:
+                            parsed_suggestion = json.loads(suggestion_text)
+                            selected_profile = parsed_suggestion.get("role_template") or selected_profile
+                            weight_values = parsed_suggestion.get("weights") or weight_values
+                            hard_cfg = parsed_suggestion.get("hard_thresholds") or hard_cfg
+                            thr_override = parsed_suggestion.get("screening_thresholds") or {}
+                            pass_line = int(thr_override.get("pass_line", pass_line))
+                            review_line = int(thr_override.get("review_line", review_line))
+                            min_exp = int(thr_override.get("min_experience", min_exp))
+                            min_skill = int(thr_override.get("min_skill", min_skill))
+                            min_expr = int(thr_override.get("min_expression", min_expr))
+                            st.success("AI 建议已应用到当前草稿，请继续保存修改。")
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            st.warning("AI 建议 JSON 解析失败，请检查格式后重试。")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                reviewer_cfg = {
+                    **_default_ai_reviewer_config(),
+                    **(scoring_cfg.get("ai_reviewer") or {}),
+                    "capabilities": {
+                        **_default_ai_reviewer_config().get("capabilities", {}),
+                        **((scoring_cfg.get("ai_reviewer") or {}).get("capabilities") or {}),
+                    },
+                    "score_adjustment_limit": {
+                        **_default_ai_reviewer_config().get("score_adjustment_limit", {}),
+                        **((scoring_cfg.get("ai_reviewer") or {}).get("score_adjustment_limit") or {}),
+                    },
+                }
+                st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+                _render_surface_head("AI Reviewer Defaults", "JD 页面只保留默认 provider、model 和能力边界。运行期开关与 API 调试仍放在批量初筛页。", eyebrow="Reviewer Defaults")
+                st.info("AI reviewer 仍是建议层。候选人工作台中的人工最终决策与留痕逻辑保持不变。")
+                reviewer_default_cols = st.columns(2)
+                reviewer_provider_options = get_ai_provider_options()
+                current_reviewer_provider = str(reviewer_cfg.get("provider", "openai") or "openai")
+                reviewer_provider = reviewer_default_cols[0].selectbox(
+                    "默认 provider（审核员）",
+                    options=reviewer_provider_options,
+                    index=reviewer_provider_options.index(current_reviewer_provider) if current_reviewer_provider in reviewer_provider_options else 0,
+                    key=f"joblib_ai_reviewer_provider_{selected_job}",
+                )
+                reviewer_default_prefix = f"joblib_ai_reviewer_default_{selected_job}"
+                _sync_ai_config_defaults(reviewer_default_prefix, reviewer_provider, model_fallback=str(reviewer_cfg.get("model") or get_default_ai_model(reviewer_provider)))
+                with reviewer_default_cols[1]:
+                    reviewer_model = _render_ai_model_selector(reviewer_default_prefix, reviewer_provider, str(reviewer_cfg.get("model") or get_default_ai_model(reviewer_provider)), label="默认 model（审核员）")
+
+                cap_cfg = reviewer_cfg.get("capabilities") or {}
+                cap_cols = st.columns(3)
+                add_evidence_snippets = cap_cols[0].checkbox("可补充关键证据片段", value=bool(cap_cfg.get("add_evidence_snippets", True)), key=f"joblib_ai_reviewer_cap_evidence_{selected_job}")
+                organize_timeline = cap_cols[1].checkbox("可整理关键时间线", value=bool(cap_cfg.get("organize_timeline", True)), key=f"joblib_ai_reviewer_cap_timeline_{selected_job}")
+                suggest_risk_adjustment = cap_cols[2].checkbox("可建议调整风险等级", value=bool(cap_cfg.get("suggest_risk_adjustment", False)), key=f"joblib_ai_reviewer_cap_risk_{selected_job}")
+                cap_cols2 = st.columns(2)
+                suggest_score_adjustment = cap_cols2[0].checkbox("可建议调整分数", value=bool(cap_cfg.get("suggest_score_adjustment", False)), key=f"joblib_ai_reviewer_cap_score_{selected_job}")
+                generate_review_summary = cap_cols2[1].checkbox("可生成审核摘要", value=bool(cap_cfg.get("generate_review_summary", True)), key=f"joblib_ai_reviewer_cap_summary_{selected_job}")
+                limit_cfg = reviewer_cfg.get("score_adjustment_limit") or {}
+                limit_cols = st.columns(3)
+                max_delta_per_dimension = limit_cols[0].number_input("单维最大调整幅度", min_value=0, max_value=2, step=1, value=int(limit_cfg.get("max_delta_per_dimension", 1) or 1), key=f"joblib_ai_reviewer_max_delta_{selected_job}")
+                allow_break_hard_thresholds = limit_cols[1].checkbox("允许突破硬门槛", value=bool(limit_cfg.get("allow_break_hard_thresholds", False)), key=f"joblib_ai_reviewer_allow_break_hard_{selected_job}")
+                allow_direct_recommendation_change = limit_cols[2].checkbox("允许直接改变推荐结论", value=bool(limit_cfg.get("allow_direct_recommendation_change", False)), key=f"joblib_ai_reviewer_allow_change_decision_{selected_job}")
+                reviewer_api_base = str(reviewer_cfg.get("api_base") or get_default_ai_api_base(reviewer_provider)).strip()
+                reviewer_api_key_env_name = str(reviewer_cfg.get("api_key_env_name") or get_default_ai_api_key_env_name(reviewer_provider)).strip() or get_default_ai_api_key_env_name(reviewer_provider)
+                enable_ai_reviewer = bool(reviewer_cfg.get("enable_ai_reviewer", False))
+                ai_reviewer_mode = "suggest_only"
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with tabs[2]:
+                st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+                _render_surface_head("Batch History", "Open historical candidate pools for this role, or clean batches when you need to reset stale screening results.", eyebrow="History")
+                batch_history = list_candidate_batches_by_jd(selected_job)
+                is_admin_user = _current_user_is_admin()
+                if batch_history:
+                    st.warning("删除批次后不可恢复，请确认后再操作。")
+                    st.dataframe(
+                        [
+                            {
+                                "批次ID": str(item.get("batch_id", "") or "")[:12],
+                                "创建时间": item.get("created_at", "-"),
+                                "总简历": item.get("total_resumes", item.get("candidate_count", 0)),
+                                "通过": item.get("pass_count", 0),
+                                "待复核": item.get("review_count", 0),
+                                "淘汰": item.get("reject_count", 0),
+                            }
+                            for item in batch_history
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    batch_choice = st.selectbox("选择批次进入候选人工作台", options=[item.get("batch_id", "") for item in batch_history], format_func=lambda bid: f"{str(bid or '')[:12]}...", key="joblib_batch_choice")
+                    history_action_cols = st.columns(3)
+                    with history_action_cols[0]:
+                        if st.button("打开该批次到工作台", key="joblib_open_batch_btn", use_container_width=True):
+                            _apply_batch_to_workspace(selected_job, batch_choice)
+                            _request_page_navigation("候选人工作台")
+                            st.rerun()
+                    with history_action_cols[1]:
+                        if st.button("删除所选批次", key="joblib_delete_batch_btn", use_container_width=True, disabled=not is_admin_user):
+                            if delete_candidate_batch(batch_choice):
+                                _after_batch_deleted(selected_job, batch_choice)
+                                st.session_state.joblib_flash_success = f"已删除批次：{str(batch_choice or '')[:12]}..."
+                                st.rerun()
+                            else:
+                                st.warning("未找到可删除的批次，可能已被删除。")
+                    with history_action_cols[2]:
+                        if st.button("清空该岗位全部批次", key="joblib_delete_all_batches_btn", use_container_width=True, disabled=not is_admin_user):
+                            deleted_count = delete_batches_by_jd(selected_job)
+                            if deleted_count > 0:
+                                _after_batch_deleted(selected_job, batch_choice)
+                                st.session_state.joblib_flash_success = f"已清空岗位“{selected_job}”的 {deleted_count} 个批次。"
+                                st.rerun()
+                            else:
+                                st.warning("该岗位当前没有可清空的批次。")
+                else:
+                    st.caption("该岗位暂时没有批次记录。先到“批量初筛”页跑一次，再回到这里管理。")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            weights_valid = is_weight_total_valid(weight_values, tolerance=WEIGHT_SUM_TOLERANCE)
+            st.session_state.joblib_draft_scoring_config = {
+                "profile_name": selected_profile,
+                "role_template": selected_profile,
+                "weights": weight_values,
+                "thresholds": {"pass_line": int(pass_line), "review_line": int(review_line), "min_experience": int(min_exp), "min_skill": int(min_skill), "min_expression": int(min_expr)},
+                "screening_thresholds": {"pass_line": int(pass_line), "review_line": int(review_line), "min_experience": int(min_exp), "min_skill": int(min_skill), "min_expression": int(min_expr)},
+                "hard_flags": hard_cfg,
+                "hard_thresholds": hard_cfg,
+                "risk_focus": scoring_cfg.get("risk_focus") if isinstance(scoring_cfg.get("risk_focus"), list) else [],
+                "ai_rule_suggester": {**_default_ai_rule_suggester_config(), **_sanitize_ai_runtime_cfg_for_storage(rule_runtime_cfg)},
+                "ai_reviewer": {
+                    "enable_ai_reviewer": bool(enable_ai_reviewer),
+                    "ai_reviewer_mode": ai_reviewer_mode,
+                    "provider": reviewer_provider,
+                    "model": reviewer_model,
+                    "api_base": reviewer_api_base,
+                    "api_key_env_name": reviewer_api_key_env_name,
+                    "capabilities": {
+                        "add_evidence_snippets": bool(add_evidence_snippets),
+                        "organize_timeline": bool(organize_timeline),
+                        "suggest_risk_adjustment": bool(suggest_risk_adjustment),
+                        "suggest_score_adjustment": bool(suggest_score_adjustment),
+                        "generate_review_summary": bool(generate_review_summary),
+                    },
+                    "score_adjustment_limit": {
+                        "max_delta_per_dimension": int(max_delta_per_dimension),
+                        "allow_break_hard_thresholds": bool(allow_break_hard_thresholds),
+                        "allow_direct_recommendation_change": bool(allow_direct_recommendation_change),
+                    },
+                },
+            }
+
+            is_admin_user = _current_user_is_admin()
+            st.markdown("<div class='ui-divider'></div>", unsafe_allow_html=True)
+            st.markdown("**Action Dock**")
+            if not is_admin_user:
+                st.caption("删除类高风险操作仅管理员可执行。")
+            action_cols = st.columns(5)
+            with action_cols[0]:
+                if st.button("保存修改", use_container_width=True, key="joblib_update_btn", disabled=not weights_valid):
+                    try:
+                        operator = _current_operator()
+                        update_jd(
+                            selected_job,
+                            edited_text,
+                            openings=int(edited_openings),
+                            created_by_user_id=operator["user_id"],
+                            created_by_name=operator["name"],
+                            created_by_email=operator["email"],
+                            updated_by_user_id=operator["user_id"],
+                            updated_by_name=operator["name"],
+                            updated_by_email=operator["email"],
+                        )
+                        upsert_jd_scoring_config(selected_job, st.session_state.get("joblib_draft_scoring_config", {}))
+                        _apply_jd_to_workspace(selected_job)
+                        _sync_job_management_drafts(selected_job)
+                        st.session_state.joblib_flash_success = "岗位已更新。"
+                        st.rerun()
+                    except ValueError as err:
+                        st.warning(str(err))
+            with action_cols[1]:
+                if st.button("只更新空缺人数", use_container_width=True, key="joblib_update_openings_btn", disabled=not weights_valid):
+                    try:
+                        operator = _current_operator()
+                        upsert_jd_openings(
+                            selected_job,
+                            int(edited_openings),
+                            updated_by_user_id=operator["user_id"],
+                            updated_by_name=operator["name"],
+                            updated_by_email=operator["email"],
+                        )
+                        upsert_jd_scoring_config(selected_job, st.session_state.get("joblib_draft_scoring_config", {}))
+                        _sync_job_management_drafts(selected_job)
+                        st.session_state.joblib_flash_success = "空缺人数与评分设置已更新。"
+                        st.rerun()
+                    except ValueError as err:
+                        st.warning(str(err))
+            with action_cols[2]:
+                if st.button("删除岗位", use_container_width=True, key="joblib_delete_btn", disabled=not is_admin_user):
+                    try:
+                        delete_jd(selected_job)
+                        if st.session_state.get("selected_jd_title") == selected_job:
+                            st.session_state.selected_jd_title = ""
+                            st.session_state.v1_jd_title_draft = ""
+                        if st.session_state.get("v2_selected_jd_prev") == selected_job:
+                            st.session_state.v2_selected_jd_prev = ""
+                            st.session_state.v2_jd_text_area = ""
+                        if st.session_state.get("batch_selected_jd_prev") == selected_job:
+                            st.session_state.batch_selected_jd_prev = ""
+                            st.session_state.batch_jd_text_area = ""
+                            st.session_state.batch_jd_text_area_pending = ""
+                        _sync_job_management_drafts("")
+                        st.session_state.joblib_flash_success = "岗位已删除。"
+                        st.rerun()
+                    except ValueError as err:
+                        st.warning(str(err))
+            with action_cols[3]:
+                if st.button("进入批量初筛", use_container_width=True, key="joblib_use_v1_btn"):
+                    _apply_jd_to_workspace(selected_job)
+                    _request_page_navigation("批量初筛")
+                    st.rerun()
+            with action_cols[4]:
+                if st.button("进入候选人工作台", use_container_width=True, key="joblib_use_v2_btn"):
+                    _apply_jd_to_workspace(selected_job)
+                    _request_page_navigation("候选人工作台")
+                    st.rerun()
+        else:
+            st.info("先从左侧选择一个岗位，右侧才会展开完整配置面板。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+    _render_surface_head("Create New Requisition", "Start a new role from scratch or import a JD file, then the new configuration will immediately sync to batch screening.", eyebrow="New Role")
+    new_title = st.text_input("岗位名称", placeholder="例如：AI 产品经理实习生（2026 校招）", key="joblib_new_title")
+    new_role_cols = st.columns([0.22, 0.78], gap="large")
+    with new_role_cols[0]:
+        new_openings = st.number_input("初始空缺人数", min_value=0, step=1, value=1, key="joblib_new_openings")
+        new_upload = st.file_uploader("上传 JD 文档（txt / pdf / docx）", type=["txt", "pdf", "docx"], key="joblib_new_jd_upload", help="上传后会自动提取文本并填入下方 JD 草稿。")
+        _handle_new_jd_upload(new_upload)
+        _render_jd_upload_feedback(st.session_state.get("joblib_new_jd_upload_meta"), context_label="新建岗位 JD ")
+    with new_role_cols[1]:
+        new_text = st.text_area("JD 内容", height=220, key="joblib_new_text")
+    if st.button("创建岗位", type="primary", key="joblib_create_btn"):
+        try:
+            operator = _current_operator()
+            save_jd(
+                new_title,
+                new_text,
+                openings=int(new_openings),
+                created_by_user_id=operator["user_id"],
+                created_by_name=operator["name"],
+                created_by_email=operator["email"],
+                updated_by_user_id=operator["user_id"],
+                updated_by_name=operator["name"],
+                updated_by_email=operator["email"],
+            )
+            _apply_jd_to_workspace((new_title or "").strip())
+            _sync_job_management_drafts((new_title or "").strip())
+            st.session_state.joblib_flash_success = "岗位创建成功，已同步到批量初筛。"
+            st.rerun()
+        except ValueError as err:
+            st.warning(str(err))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.expander("Admin Utilities", expanded=False):
+        _render_admin_account_management()
+        _render_environment_health_panel()
+        _render_system_health_panel()
+
+
+def _render_batch_screening() -> None:
+    jd_titles = list_jds()
+    if "batch_selected_jd_prev" not in st.session_state:
+        st.session_state.batch_selected_jd_prev = ""
+    if "batch_jd_text_area" not in st.session_state:
+        st.session_state.batch_jd_text_area = st.session_state.get("v2_jd_text_area") or st.session_state.get("jd_text", "")
+
+    current_jd = _sync_batch_screening_jd_context(jd_titles)
+    latest = _latest_batch_snapshot(current_jd) if current_jd else {"latest_time": "-", "pass_count": 0, "review_count": 0, "reject_count": 0}
+    recent_batches = list_candidate_batches_by_jd(current_jd)[:4] if current_jd else []
+
+    _render_app_topbar("Batch Screening")
+    _render_page_intro(
+        "New Batch Screen",
+        "Configure reviewer runtime settings, verify OCR readiness, preview extraction quality, and launch a new batch from one operational canvas.",
+        eyebrow="Batch Screening",
+        chips=[
+            f"Current JD: {current_jd or 'Not Selected'}",
+            f"Last Batch: {latest.get('latest_time', '-')}",
+            f"Needs Review: {int(latest.get('review_count', 0) or 0)}",
+        ],
+    )
+    _render_metric_strip(
+        [
+            {"label": "Pass", "value": int(latest.get("pass_count", 0) or 0), "meta": "Latest batch"},
+            {"label": "Review", "value": int(latest.get("review_count", 0) or 0), "meta": "Latest batch"},
+            {"label": "Reject", "value": int(latest.get("reject_count", 0) or 0), "meta": "Latest batch"},
+            {"label": "History", "value": len(recent_batches), "meta": "Recent batches in rail"},
+        ]
+    )
+
+    _apply_pending_batch_jd_text_area()
+    _sync_batch_ai_reviewer_widget_state(current_jd)
+    _apply_pending_batch_ai_reviewer_widget_state()
+
+    main_col, rail_col = st.columns([0.72, 0.28], gap="large")
+
+    with main_col:
+        if current_jd:
+            st.markdown("<div class='ui-surface ui-surface--accent'>", unsafe_allow_html=True)
+            _render_surface_head(
+                current_jd,
+                "The current batch will inherit this JD context. Candidate workbench state will follow the batch after creation.",
+                eyebrow="Target Requisition",
+                chips=[
+                    f"Latest Batch {latest.get('latest_time', '-')}",
+                    f"Pass {int(latest.get('pass_count', 0) or 0)}",
+                    f"Review {int(latest.get('review_count', 0) or 0)}",
+                    f"Reject {int(latest.get('reject_count', 0) or 0)}",
+                ],
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.warning("当前尚未选择岗位。请先在岗位配置页创建或选择岗位，再回来进行批量初筛。")
+
+        st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+        _render_surface_head("Batch Context", "Switch the active JD here. The page will sync the pending JD text before the editor widgets instantiate.", eyebrow="Context")
+        selected_jd = st.selectbox(
+            "选择岗位（JD）",
+            options=[""] + jd_titles,
+            index=([""] + jd_titles).index(current_jd) if current_jd in ([""] + jd_titles) else 0,
+            format_func=lambda value: value if value else "请选择岗位",
+            key="batch_saved_jd_select",
+        )
+        if selected_jd and selected_jd != st.session_state.batch_selected_jd_prev:
+            _apply_jd_to_workspace(selected_jd)
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+        _render_surface_head("Reviewer Configuration", "These settings belong to the current batch. The AI reviewer stays in suggestion mode and never replaces the manual final decision.", eyebrow="Runtime AI")
+        batch_ai_enable_cols = st.columns(2)
+        batch_ai_enable_cols[0].toggle("启用 AI reviewer", value=bool(st.session_state.get("batch_ai_reviewer_enable", False)), key="batch_ai_reviewer_enable")
+        batch_ai_enable_cols[1].checkbox("对新批次自动生成 AI 建议", value=bool(st.session_state.get("batch_ai_reviewer_auto_generate", False)), key="batch_ai_reviewer_auto_generate")
+
+        batch_ai_provider_options = get_ai_provider_options()
+        current_batch_ai_provider = str(st.session_state.get("batch_ai_reviewer_provider") or "openai")
+        batch_ai_cols = st.columns(4)
+        batch_ai_provider = batch_ai_cols[0].selectbox(
+            "provider（本批次）",
+            options=batch_ai_provider_options,
+            index=batch_ai_provider_options.index(current_batch_ai_provider) if current_batch_ai_provider in batch_ai_provider_options else 0,
+            key="batch_ai_reviewer_provider",
+        )
+        batch_ai_runtime_prefix = "batch_ai_reviewer_runtime"
+        _sync_ai_config_defaults(
+            batch_ai_runtime_prefix,
+            batch_ai_provider,
+            model_fallback=str(st.session_state.get(f"{batch_ai_runtime_prefix}_model") or get_default_ai_model(batch_ai_provider)),
+        )
+        with batch_ai_cols[1]:
+            _render_ai_model_selector(batch_ai_runtime_prefix, batch_ai_provider, str(st.session_state.get(f"{batch_ai_runtime_prefix}_model") or get_default_ai_model(batch_ai_provider)), label="model（本批次）")
+        with batch_ai_cols[2]:
+            st.text_input("api_base（可选）", value=st.session_state.get(f"{batch_ai_runtime_prefix}_api_base", get_default_ai_api_base(batch_ai_provider)), key=f"{batch_ai_runtime_prefix}_api_base")
+        with batch_ai_cols[3]:
+            st.markdown("<div class='ui-rail-item'><strong>DeepSeek 默认</strong><br><span class='subtle'>Provider=deepseek 时，优先使用 deepseek-chat / deepseek-reasoner 与官方 base。</span></div>", unsafe_allow_html=True)
+
+        _render_ai_api_key_config_inputs(batch_ai_runtime_prefix, batch_ai_provider, _current_batch_ai_reviewer_runtime(current_jd))
+        batch_ai_runtime_cfg = _current_batch_ai_reviewer_runtime(current_jd)
+        _render_ai_runtime_hint(str(batch_ai_runtime_cfg.get("provider") or ""), str(batch_ai_runtime_cfg.get("api_base") or ""), str(batch_ai_runtime_cfg.get("api_key_env_name") or ""), api_key_mode=str(batch_ai_runtime_cfg.get("api_key_mode") or "direct_input"), api_key_value=str(batch_ai_runtime_cfg.get("api_key_value") or ""))
+        _render_ai_runtime_warning(str(batch_ai_runtime_cfg.get("provider") or ""), str(batch_ai_runtime_cfg.get("api_base") or ""), str(batch_ai_runtime_cfg.get("api_key_env_name") or ""), api_key_mode=str(batch_ai_runtime_cfg.get("api_key_mode") or "direct_input"), api_key_value=str(batch_ai_runtime_cfg.get("api_key_value") or ""), enabled=bool(batch_ai_runtime_cfg.get("enable_ai_reviewer", False)), feature_label="本批次 AI reviewer")
+        batch_connection_key = "batch_ai_reviewer_connection_test_result"
+        batch_default_save_feedback = st.session_state.pop("batch_ai_reviewer_default_save_feedback", None)
+        if isinstance(batch_default_save_feedback, dict):
+            feedback_kind = str(batch_default_save_feedback.get("kind") or "success")
+            feedback_message = str(batch_default_save_feedback.get("message") or "").strip()
+            if feedback_message:
+                if feedback_kind == "warning":
+                    st.warning(feedback_message)
+                else:
+                    st.success(feedback_message)
+        batch_action_cols = st.columns(2)
+        with batch_action_cols[0]:
+            if st.button("测试 AI 连接", key="batch_ai_reviewer_test_btn", use_container_width=True):
+                st.session_state[batch_connection_key] = test_ai_connection(batch_ai_runtime_cfg, purpose="ai_reviewer")
+        with batch_action_cols[1]:
+            if st.button("保存为当前岗位默认设置", key="batch_ai_reviewer_save_defaults_btn", use_container_width=True):
+                try:
+                    ok, message = _save_batch_ai_reviewer_defaults_for_jd(current_jd, batch_ai_runtime_cfg)
+                    st.session_state["batch_ai_reviewer_default_save_feedback"] = {"kind": "success" if ok else "warning", "message": message}
+                    st.rerun()
+                except ValueError as err:
+                    st.session_state["batch_ai_reviewer_default_save_feedback"] = {"kind": "warning", "message": str(err)}
+                    st.rerun()
+        _render_ai_connection_result(st.session_state.get(batch_connection_key))
+        st.caption("保存默认设置后，下次切换到该岗位会自动带出当前 reviewer 配置；直接输入的 API Key 仍不会明文展示。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        ocr_caps = check_ocr_capabilities()
+        st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+        _render_surface_head("OCR & Upload", "Check OCR readiness, edit the batch JD, and upload a new set of resumes before screening.", eyebrow="Input")
+        _render_batch_ocr_health_panel(ocr_caps)
+        batch_input_cols = st.columns([0.58, 0.42], gap="large")
+        with batch_input_cols[0]:
+            batch_jd_text = st.text_area("岗位 JD", height=220, key="batch_jd_text_area")
+        with batch_input_cols[1]:
+            uploaded_files = st.file_uploader("批量上传简历（txt / pdf / docx / png / jpg / jpeg，可多选）", type=["txt", "pdf", "docx", "png", "jpg", "jpeg"], accept_multiple_files=True, key="batch_uploader")
+            st.caption("建议先做提取质量预检查，再执行真正的批量初筛。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if uploaded_files:
+            has_image = any(str(getattr(f, "name", "")).lower().endswith((".png", ".jpg", ".jpeg")) for f in uploaded_files)
+            has_pdf = any(str(getattr(f, "name", "")).lower().endswith(".pdf") for f in uploaded_files)
+            if has_image and not ocr_caps.get("image_ocr_available", False):
+                missing = ", ".join((ocr_caps.get("missing_deps") or []) + (ocr_caps.get("missing_runtime") or []))
+                suffix = f"（缺失：{missing}）" if missing else ""
+                st.warning(f"当前环境未启用图片 OCR{suffix}，图片简历可能无法稳定识别。")
+            if has_pdf and not ocr_caps.get("pdf_ocr_available", False):
+                missing = ", ".join((ocr_caps.get("missing_deps") or []) + (ocr_caps.get("missing_runtime") or []))
+                suffix = f"（缺失：{missing}）" if missing else ""
+                st.warning(f"当前环境未启用 PDF OCR fallback{suffix}，扫描版 PDF 可能无法稳定识别。")
+
+        st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+        _render_surface_head("Extraction Preview", "Run a lightweight preflight check first so we know which resumes can safely enter stable screening.", eyebrow="Preflight")
+        preview_action_cols = st.columns([0.45, 0.55])
+        with preview_action_cols[0]:
+            if st.button("检查提取方式 / 提取质量", key="batch_preview_btn", use_container_width=True):
+                if not uploaded_files:
+                    st.warning("请先上传简历文件。")
+                else:
+                    preview_rows: list[dict] = []
+                    with st.spinner(f"正在检查 {len(uploaded_files)} 份简历的提取方式与提取质量..."):
+                        for file_obj in uploaded_files:
+                            try:
+                                extract_result = load_resume_file(file_obj)
+                                preview_rows.append(_build_batch_preview_row(file_obj, extract_result))
+                            except Exception as err:  # noqa: BLE001
+                                preview_rows.append({"文件名": file_obj.name, "提取方式": "-", "提取质量": "较弱", "提取说明": _friendly_upload_error(err), "解析状态": "读取失败", "是否可进入批量初筛": "否（读取失败）"})
+                    st.session_state.batch_extract_preview = preview_rows
+        with preview_action_cols[1]:
+            force_allow_weak = st.checkbox("允许弱文本 / 空文本进入初筛（仅在 OCR 无法识别时使用）", value=False, key="batch_force_allow_weak")
+
+        preview_rows = st.session_state.get("batch_extract_preview", [])
+        if preview_rows:
+            preview_success = sum(1 for row in preview_rows if str(row.get("是否可进入批量初筛") or "").startswith("是"))
+            preview_blocked = sum(1 for row in preview_rows if str(row.get("是否可进入批量初筛") or "").startswith("否"))
+            preview_weak = sum(1 for row in preview_rows if row.get("提取质量") == "较弱")
+            preview_ocr_missing = sum(1 for row in preview_rows if row.get("解析状态") == "OCR能力缺失")
+            preview_cols = st.columns(4)
+            preview_cols[0].metric("可进入初筛", preview_success)
+            preview_cols[1].metric("建议拦截", preview_blocked)
+            preview_cols[2].metric("弱质量识别", preview_weak)
+            preview_cols[3].metric("OCR 缺失", preview_ocr_missing)
+            st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+        else:
+            force_allow_weak = bool(st.session_state.get("batch_force_allow_weak", False))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+        _render_surface_head("Run Screening", "When the JD and files are ready, start the batch. The resulting batch can then be opened directly in the candidate workbench.", eyebrow="Execute")
+        if st.button("开始批量初筛", type="primary", key="batch_run_btn", use_container_width=True):
+            if not batch_jd_text.strip():
+                st.warning("请先填写 JD。")
+            elif not uploaded_files:
+                st.warning("请至少上传一份简历文件。")
+            else:
+                effective_jd_title = (st.session_state.get("batch_selected_jd_prev") or "").strip() or "未命名岗位"
+                with st.spinner(f"正在执行批量初筛，共 {len(uploaded_files)} 份文件..."):
+                    _run_batch_screening(jd_title=effective_jd_title, jd_text=batch_jd_text, uploaded_files=uploaded_files, batch_ai_runtime_cfg=batch_ai_runtime_cfg, force_allow_weak=bool(force_allow_weak))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        rows = st.session_state.get("v2_rows", [])
+        if rows:
+            pass_count = sum(1 for row in rows if row.get("候选池") == "通过候选人")
+            review_count = sum(1 for row in rows if row.get("候选池") == "待复核候选人")
+            reject_count = sum(1 for row in rows if row.get("候选池") == "淘汰候选人")
+
+            active_jd = (st.session_state.get("batch_selected_jd_prev") or "").strip() or "未命名岗位"
+            active_batch_id = st.session_state.get("v2_current_batch_id", "")
+            batch_created_at = "-"
+            batch_total_resumes = len(rows)
+            if active_batch_id:
+                current_batch = load_candidate_batch(active_batch_id)
+                if current_batch:
+                    batch_created_at = current_batch.get("created_at", "-")
+                    batch_total_resumes = int(current_batch.get("total_resumes", len(rows)) or len(rows))
+
+            st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+            _render_surface_head("Batch Result Summary", "The batch is ready. Open it in the workbench for manual review and final decisions.", eyebrow="Result", chips=[f"Batch {str(active_batch_id or '')[:12] + '...' if active_batch_id else '-'}", f"Created {batch_created_at}", f"Total {batch_total_resumes}"])
+            result_cols = st.columns(3)
+            result_cols[0].metric("通过", pass_count)
+            result_cols[1].metric("待复核", review_count)
+            result_cols[2].metric("淘汰", reject_count)
+            if st.button("进入该批次候选池", type="primary", key="go_workspace_from_batch", use_container_width=True):
+                preferred_pool = "待复核候选人" if review_count > 0 else "通过候选人"
+                _apply_batch_to_workspace(active_jd, active_batch_id, preferred_pool=preferred_pool)
+                _request_page_navigation("候选人工作台")
+                st.rerun()
+            pool_display_order = ["通过候选人", "待复核候选人", "淘汰候选人"]
+            for pool_name in pool_display_order:
+                pool_rows = [row for row in rows if row.get("候选池") == pool_name]
+                st.markdown(f"**{pool_name}（{len(pool_rows)}）**")
+                if not pool_rows:
+                    st.caption("暂无候选人。")
+                    continue
+                st.dataframe(
+                    [
+                        {"姓名": row.get("姓名", ""), "初筛结论": row.get("初筛结论", ""), "风险等级": _risk_level_label(row.get("风险等级", "unknown")), "审核摘要": row.get("审核摘要", ""), "提取质量": _extract_quality_label(row.get("提取质量", "weak"))}
+                        for row in pool_rows
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        if st.session_state.get("dev_debug_mode", False):
+            st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+            _render_surface_head("开发辅助", "保留单份审核调试入口，方便在不影响主流程的前提下观察单份简历行为。", eyebrow="Debug")
+            _render_v1()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    with rail_col:
+        st.markdown("<div class='ui-surface ui-surface--accent'>", unsafe_allow_html=True)
+        _render_surface_head("Current Batch Status", "A quick rail for the current target role, latest batch outcome, and what should happen next.", eyebrow="Status Rail")
+        rail_stats = st.columns(3)
+        rail_stats[0].metric("Pass", int(latest.get("pass_count", 0) or 0))
+        rail_stats[1].metric("Review", int(latest.get("review_count", 0) or 0))
+        rail_stats[2].metric("Reject", int(latest.get("reject_count", 0) or 0))
+        st.markdown("<div class='ui-note'>" f"当前岗位：{html.escape(current_jd or '未选择')}<br>" f"最近批次：{html.escape(str(latest.get('latest_time', '-')))}" "</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='ui-surface ui-surface--soft'>", unsafe_allow_html=True)
+        _render_surface_head("Recent Batches", "A compact batch rail so you can quickly see whether this role already has recent activity.", eyebrow="History Rail")
+        if recent_batches:
+            for item in recent_batches:
+                st.markdown(
+                    "<div class='ui-rail-item'>"
+                    f"<strong>{html.escape(current_jd or '岗位')}</strong><br>"
+                    f"<span class='subtle'>{html.escape(str(item.get('created_at', '-')))}</span><br>"
+                    f"<span class='subtle'>总数 {int(item.get('total_resumes', item.get('candidate_count', 0)) or 0)}  |  "
+                    f"通过 {int(item.get('pass_count', 0) or 0)}  |  "
+                    f"复核 {int(item.get('review_count', 0) or 0)}  |  "
+                    f"淘汰 {int(item.get('reject_count', 0) or 0)}</span>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("当前岗位暂时没有历史批次。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='ui-surface'>", unsafe_allow_html=True)
+        _render_surface_head("Operator Notes", "Suggested flow: 1) switch role, 2) verify OCR readiness, 3) preview extraction, 4) run batch, 5) open workbench.", eyebrow="Guide")
+        st.caption("如果 OCR / 提取质量偏弱，先做人工复核或补齐 OCR 环境，再决定是否强制进入初筛。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
 def _render_candidate_workspace() -> None:
     st.subheader("候选人工作台")
     st.caption("当前岗位 + 当前批次的候选池审核台。")
@@ -7883,6 +8811,917 @@ def _render_candidate_workspace() -> None:
         return
 
     _render_candidate_workspace_panel(rows, details)
+
+
+_inject_page_style_base = _inject_page_style
+_render_hero_base = _render_hero
+_render_login_page_base = _render_login_page
+_render_sidebar_user_panel_base = _render_sidebar_user_panel
+_render_job_library_base = _render_job_library
+_render_batch_screening_base = _render_batch_screening
+_render_candidate_workspace_base = _render_candidate_workspace
+
+
+def _inject_page_style() -> None:
+    _inject_page_style_base()
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+
+        :root {
+            --hm-primary: #002046;
+            --hm-primary-soft: #1b365d;
+            --hm-surface-low: #f0f4f8;
+            --hm-ink: #171c1f;
+            --hm-muted: #54647a;
+            --hm-outline-soft: rgba(196, 198, 207, 0.18);
+            --hm-shadow: 0 12px 40px rgba(23, 28, 31, 0.06);
+        }
+
+        html, body, [class*="css"] {
+            font-family: "Inter", sans-serif;
+            color: var(--hm-ink);
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            font-family: "Manrope", sans-serif;
+            letter-spacing: -0.02em;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(214, 227, 255, 0.65), transparent 28%),
+                linear-gradient(180deg, #f8fbff 0%, #eef4fa 100%);
+            color: var(--hm-ink);
+        }
+
+        .block-container {
+            max-width: 1480px;
+            padding-top: 1rem;
+            padding-bottom: 3rem;
+        }
+
+        div[data-testid="stSidebar"] {
+            background: var(--hm-surface-low);
+            border-right: none;
+        }
+
+        div[data-testid="stSidebar"] > div:first-child {
+            background: var(--hm-surface-low);
+        }
+
+        div[data-testid="stSidebar"] .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1.25rem;
+        }
+
+        div[data-testid="stSidebar"] div[role="radiogroup"] label {
+            background: transparent;
+            border-radius: 16px;
+            padding: .45rem .65rem;
+            margin-bottom: .35rem;
+            transition: all .18s ease;
+        }
+
+        div[data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+            background: rgba(255, 255, 255, 0.55);
+        }
+
+        div[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
+            background: rgba(255, 255, 255, 0.72);
+            box-shadow: inset -4px 0 0 var(--hm-primary);
+        }
+
+        .panel {
+            border: none;
+            background: transparent;
+            padding: 0;
+            border-radius: 0;
+            box-shadow: none;
+        }
+
+        .workspace-list,
+        .workspace-detail {
+            background: rgba(255, 255, 255, 0.86);
+            border-radius: 22px;
+            padding: 1rem 1.05rem;
+            min-height: 0;
+            border: 1px solid var(--hm-outline-soft);
+            box-shadow: var(--hm-shadow);
+            backdrop-filter: blur(8px);
+        }
+
+        .workspace-list {
+            background: rgba(240, 244, 248, 0.9);
+        }
+
+        .section-title {
+            font-family: "Manrope", sans-serif;
+            font-size: 1.05rem;
+            font-weight: 800;
+            margin: .15rem 0 .65rem;
+            color: var(--hm-primary);
+            letter-spacing: -0.02em;
+        }
+
+        .subtle {
+            color: var(--hm-muted);
+            font-size: .84rem;
+            line-height: 1.5;
+        }
+
+        .hero { display: none; }
+
+        .app-topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            margin: 0 0 1.2rem;
+            padding: 1rem 1.35rem;
+            background: rgba(255, 255, 255, 0.75);
+            border: 1px solid var(--hm-outline-soft);
+            border-radius: 20px;
+            box-shadow: var(--hm-shadow);
+            backdrop-filter: blur(10px);
+        }
+
+        .app-topbar__nav,
+        .app-topbar__actions {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .app-topbar__link {
+            color: var(--hm-muted);
+            font-family: "Manrope", sans-serif;
+            font-weight: 700;
+            font-size: 1rem;
+        }
+
+        .app-topbar__link.is-active {
+            color: var(--hm-primary);
+        }
+
+        .app-topbar__invite {
+            padding: .7rem 1rem;
+            border-radius: 14px;
+            background: rgba(240, 244, 248, 0.9);
+            color: var(--hm-primary);
+            font-family: "Manrope", sans-serif;
+            font-weight: 700;
+        }
+
+        .app-topbar__avatar {
+            width: 2.25rem;
+            height: 2.25rem;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, var(--hm-primary) 0%, var(--hm-primary-soft) 100%);
+            color: #fff;
+            font-weight: 700;
+            font-size: .85rem;
+        }
+
+        .page-intro {
+            margin: 0 0 1.4rem;
+        }
+
+        .page-intro__eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: .45rem;
+            border-radius: 999px;
+            background: rgba(214, 227, 255, 0.85);
+            color: var(--hm-primary);
+            padding: .3rem .7rem;
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            margin-bottom: .65rem;
+        }
+
+        .page-intro__title {
+            margin: 0;
+            font-size: clamp(2rem, 4vw, 3rem);
+            line-height: 1.02;
+            color: var(--hm-ink);
+        }
+
+        .page-intro__subtitle {
+            margin: .55rem 0 0;
+            font-size: 1rem;
+            line-height: 1.65;
+            color: var(--hm-muted);
+            max-width: 68rem;
+        }
+
+        .page-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: .65rem;
+            margin-top: .9rem;
+        }
+
+        .page-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: .4rem;
+            padding: .42rem .8rem;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid var(--hm-outline-soft);
+            color: var(--hm-muted);
+            font-size: .82rem;
+            font-weight: 600;
+        }
+
+        .metric-strip {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: .85rem;
+            margin: 1rem 0 1.2rem;
+        }
+
+        .metric-card {
+            background: rgba(255, 255, 255, 0.78);
+            border: 1px solid var(--hm-outline-soft);
+            border-radius: 18px;
+            padding: .9rem 1rem;
+            box-shadow: var(--hm-shadow);
+        }
+
+        .metric-card__label {
+            font-size: .72rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: var(--hm-muted);
+            font-weight: 700;
+        }
+
+        .metric-card__value {
+            display: block;
+            margin-top: .35rem;
+            font-family: "Manrope", sans-serif;
+            font-size: 1.6rem;
+            font-weight: 800;
+            color: var(--hm-primary);
+        }
+
+        .metric-card__meta {
+            margin-top: .25rem;
+            color: var(--hm-muted);
+            font-size: .8rem;
+        }
+
+        .login-brand-panel {
+            min-height: 640px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 2rem 2rem 1.5rem;
+            border-radius: 28px;
+            background:
+                radial-gradient(circle at 52% 45%, rgba(255, 255, 255, 0.78), rgba(255, 255, 255, 0) 16%),
+                radial-gradient(circle at 50% 52%, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 34%),
+                linear-gradient(180deg, rgba(10, 24, 48, 0.58), rgba(10, 24, 48, 0.72)),
+                linear-gradient(135deg, #bcc9d9, #8595aa);
+            box-shadow: var(--hm-shadow);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .login-brand-panel::after {
+            content: "";
+            position: absolute;
+            left: 12%;
+            right: 12%;
+            bottom: 18%;
+            height: 7px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.5);
+            filter: blur(2px);
+        }
+
+        .login-brand-panel__title {
+            color: #d7e5ff;
+            font-family: "Manrope", sans-serif;
+            font-size: 3rem;
+            font-weight: 800;
+            margin: 0;
+        }
+
+        .login-brand-panel__copy {
+            margin-top: 1rem;
+            max-width: 22rem;
+            color: rgba(255, 255, 255, 0.74);
+            font-size: 1.05rem;
+            line-height: 1.75;
+        }
+
+        .login-brand-panel__tag {
+            display: inline-flex;
+            align-items: center;
+            gap: .5rem;
+            width: fit-content;
+            padding: .68rem .9rem;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.88);
+            color: var(--hm-primary);
+            font-size: .86rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            font-weight: 700;
+        }
+
+        .login-form-shell {
+            background: rgba(255, 255, 255, 0.94);
+            border-radius: 28px;
+            padding: 2rem 2rem 1.6rem;
+            box-shadow: var(--hm-shadow);
+            border: 1px solid var(--hm-outline-soft);
+            min-height: 640px;
+        }
+
+        .login-form-shell [data-testid="stForm"] {
+            border: none;
+            padding: 0;
+        }
+
+        .login-status-line {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: .55rem;
+            margin-top: 1.4rem;
+            color: var(--hm-muted);
+            font-size: .9rem;
+        }
+
+        .login-status-line__dot {
+            width: .7rem;
+            height: .7rem;
+            border-radius: 999px;
+            background: #10b981;
+            box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.14);
+        }
+
+        .stTextInput input,
+        .stNumberInput input,
+        .stTextArea textarea,
+        .stSelectbox [data-baseweb="select"] > div,
+        .stMultiSelect [data-baseweb="select"] > div {
+            background: rgba(228, 233, 237, 0.72) !important;
+            border: 1px solid transparent !important;
+            border-radius: 14px !important;
+            color: var(--hm-ink) !important;
+            box-shadow: none !important;
+        }
+
+        .stTextInput input:focus,
+        .stNumberInput input:focus,
+        .stTextArea textarea:focus,
+        .stSelectbox [data-baseweb="select"] > div:focus-within,
+        .stMultiSelect [data-baseweb="select"] > div:focus-within {
+            background: rgba(255, 255, 255, 0.92) !important;
+            border: 1px solid rgba(0, 32, 70, 0.38) !important;
+            box-shadow: 0 0 0 2px rgba(0, 32, 70, 0.08) !important;
+        }
+
+        .stButton button,
+        .stDownloadButton button,
+        .stFormSubmitButton button {
+            border-radius: 14px !important;
+            border: 1px solid transparent !important;
+            background: linear-gradient(135deg, var(--hm-primary) 0%, var(--hm-primary-soft) 100%) !important;
+            color: #fff !important;
+            font-family: "Manrope", sans-serif !important;
+            font-weight: 800 !important;
+            min-height: 44px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 10px 20px rgba(0, 32, 70, 0.12);
+        }
+
+        .stButton button[kind="secondary"],
+        .stDownloadButton button[kind="secondary"] {
+            background: rgba(255, 255, 255, 0.92) !important;
+            color: var(--hm-primary) !important;
+            border: 1px solid rgba(0, 32, 70, 0.12) !important;
+            box-shadow: none;
+        }
+
+        .stAlert {
+            border-radius: 16px;
+            border: 1px solid var(--hm-outline-soft);
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: .5rem;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            height: 42px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.65);
+            padding-left: 1rem;
+            padding-right: 1rem;
+            color: var(--hm-muted);
+            font-weight: 700;
+        }
+
+        .stTabs [aria-selected="true"] {
+            background: rgba(214, 227, 255, 0.85) !important;
+            color: var(--hm-primary) !important;
+        }
+
+        .stExpander {
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid var(--hm-outline-soft);
+            border-radius: 18px;
+            box-shadow: var(--hm-shadow);
+        }
+
+        .ui-surface {
+            background: rgba(255, 255, 255, 0.86);
+            border: 1px solid var(--hm-outline-soft);
+            border-radius: 24px;
+            padding: 1.15rem 1.2rem;
+            box-shadow: var(--hm-shadow);
+            backdrop-filter: blur(8px);
+            margin-bottom: 1rem;
+        }
+
+        .ui-surface--soft {
+            background: rgba(240, 244, 248, 0.9);
+        }
+
+        .ui-surface--accent {
+            background:
+                linear-gradient(135deg, rgba(0, 32, 70, 0.94) 0%, rgba(27, 54, 93, 0.92) 100%),
+                linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0));
+            color: rgba(255, 255, 255, 0.92);
+            border: 1px solid rgba(174, 199, 247, 0.22);
+        }
+
+        .ui-surface--accent .ui-kicker,
+        .ui-surface--accent .ui-surface__title,
+        .ui-surface--accent .ui-surface__subtitle,
+        .ui-surface--accent .ui-mini-stat__value,
+        .ui-surface--accent .ui-mini-stat__label,
+        .ui-surface--accent .ui-mini-stat__meta {
+            color: rgba(255, 255, 255, 0.94);
+        }
+
+        .ui-kicker {
+            display: inline-flex;
+            align-items: center;
+            gap: .4rem;
+            padding: .28rem .68rem;
+            border-radius: 999px;
+            background: rgba(214, 227, 255, 0.75);
+            color: var(--hm-primary);
+            font-size: .72rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            font-weight: 800;
+            margin-bottom: .55rem;
+        }
+
+        .ui-surface__title {
+            margin: 0;
+            color: var(--hm-ink);
+            font-family: "Manrope", sans-serif;
+            font-size: 1.3rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+        }
+
+        .ui-surface__subtitle {
+            margin: .28rem 0 0;
+            color: var(--hm-muted);
+            font-size: .9rem;
+            line-height: 1.6;
+        }
+
+        .ui-chip-stack {
+            display: flex;
+            flex-wrap: wrap;
+            gap: .45rem;
+            margin-top: .85rem;
+        }
+
+        .ui-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: .35rem;
+            padding: .34rem .72rem;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.78);
+            border: 1px solid rgba(0, 32, 70, 0.08);
+            color: var(--hm-muted);
+            font-size: .78rem;
+            font-weight: 700;
+        }
+
+        .job-tile {
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(0, 32, 70, 0.08);
+            border-radius: 22px;
+            padding: 1rem;
+            margin-bottom: .85rem;
+            box-shadow: 0 10px 28px rgba(18, 31, 53, 0.06);
+        }
+
+        .job-tile.is-active {
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid rgba(0, 32, 70, 0.22);
+            box-shadow: 0 18px 38px rgba(0, 32, 70, 0.12);
+        }
+
+        .job-tile__eyebrow {
+            font-size: .72rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: var(--hm-primary);
+            font-weight: 800;
+        }
+
+        .job-tile__title {
+            margin: .35rem 0 0;
+            color: var(--hm-ink);
+            font-family: "Manrope", sans-serif;
+            font-size: 1.05rem;
+            font-weight: 800;
+        }
+
+        .job-tile__summary {
+            margin: .45rem 0 0;
+            color: var(--hm-muted);
+            font-size: .84rem;
+            line-height: 1.55;
+        }
+
+        .job-tile__meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: .45rem;
+            margin-top: .75rem;
+        }
+
+        .job-tile__stat-grid,
+        .ui-mini-stat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(86px, 1fr));
+            gap: .65rem;
+            margin-top: .9rem;
+        }
+
+        .ui-mini-stat {
+            padding: .72rem .78rem;
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.68);
+            border: 1px solid rgba(0, 32, 70, 0.08);
+        }
+
+        .ui-mini-stat__label {
+            display: block;
+            font-size: .72rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: var(--hm-muted);
+            font-weight: 800;
+        }
+
+        .ui-mini-stat__value {
+            display: block;
+            margin-top: .32rem;
+            color: var(--hm-primary);
+            font-family: "Manrope", sans-serif;
+            font-size: 1.1rem;
+            font-weight: 800;
+        }
+
+        .ui-mini-stat__meta {
+            display: block;
+            margin-top: .2rem;
+            color: var(--hm-muted);
+            font-size: .76rem;
+        }
+
+        .ui-divider {
+            height: 1px;
+            background: rgba(0, 32, 70, 0.08);
+            margin: 1rem 0;
+            border-radius: 999px;
+        }
+
+        .ui-note {
+            margin-top: .7rem;
+            color: var(--hm-muted);
+            font-size: .84rem;
+            line-height: 1.55;
+        }
+
+        .ui-rail-item {
+            padding: .8rem .85rem;
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.68);
+            border: 1px solid rgba(0, 32, 70, 0.08);
+            margin-top: .75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_hero() -> None:
+    return
+
+
+def _ui_initials(name: str) -> str:
+    clean = re.sub(r"\s+", " ", str(name or "").strip())
+    if not clean:
+        return "HM"
+    if re.search(r"[\u4e00-\u9fff]", clean):
+        chars = [char for char in clean if re.search(r"[\u4e00-\u9fff]", char)]
+        return "".join(chars[-2:]) if chars else clean[:2].upper()
+    parts = [part for part in clean.split(" ") if part]
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[-1][0]).upper()
+    return clean[:2].upper()
+
+
+def _render_app_topbar(active_label: str) -> None:
+    current_user = _session_user() or {}
+    display_name = str(current_user.get("name") or current_user.get("email") or "HireMate").strip()
+    avatar = html.escape(_ui_initials(display_name))
+    page_text = html.escape(str(active_label or "工作台"))
+    st.markdown(
+        (
+            "<div class='app-topbar'>"
+            "<div class='app-topbar__nav'>"
+            "<span class='app-topbar__link is-active'>Pipeline</span>"
+            "<span class='app-topbar__link'>Analytics</span>"
+            "<span class='app-topbar__link'>Archive</span>"
+            "</div>"
+            "<div class='app-topbar__actions'>"
+            f"<span class='page-chip'>{page_text}</span>"
+            "<span class='app-topbar__invite'>Invite Team</span>"
+            f"<span class='app-topbar__avatar'>{avatar}</span>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_page_intro(title: str, subtitle: str, *, eyebrow: str = "HireMate", chips: list[str] | None = None) -> None:
+    chip_html = ""
+    clean_chips = [str(item).strip() for item in (chips or []) if str(item).strip()]
+    if clean_chips:
+        chip_html = "<div class='page-chip-row'>" + "".join(
+            f"<span class='page-chip'>{html.escape(item)}</span>" for item in clean_chips
+        ) + "</div>"
+    st.markdown(
+        (
+            "<div class='page-intro'>"
+            f"<div class='page-intro__eyebrow'>{html.escape(eyebrow)}</div>"
+            f"<h1 class='page-intro__title'>{html.escape(title)}</h1>"
+            f"<p class='page-intro__subtitle'>{html.escape(subtitle)}</p>"
+            f"{chip_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_metric_strip(metrics: list[dict[str, str | int]]) -> None:
+    cards: list[str] = []
+    for item in metrics:
+        label = html.escape(str(item.get("label") or "").strip())
+        value = html.escape(str(item.get("value") or "").strip())
+        meta = html.escape(str(item.get("meta") or "").strip())
+        cards.append(
+            "<div class='metric-card'>"
+            f"<span class='metric-card__label'>{label}</span>"
+            f"<span class='metric-card__value'>{value}</span>"
+            f"<div class='metric-card__meta'>{meta}</div>"
+            "</div>"
+        )
+    if cards:
+        st.markdown("<div class='metric-strip'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+
+def _render_surface_head(
+    title: str,
+    subtitle: str = "",
+    *,
+    eyebrow: str = "",
+    chips: list[str] | None = None,
+) -> None:
+    chip_html = ""
+    clean_chips = [str(item).strip() for item in (chips or []) if str(item).strip()]
+    if clean_chips:
+        chip_html = "<div class='ui-chip-stack'>" + "".join(
+            f"<span class='ui-chip'>{html.escape(item)}</span>" for item in clean_chips
+        ) + "</div>"
+    eyebrow_html = f"<div class='ui-kicker'>{html.escape(eyebrow)}</div>" if eyebrow else ""
+    subtitle_html = f"<p class='ui-surface__subtitle'>{html.escape(subtitle)}</p>" if subtitle else ""
+    st.markdown(
+        (
+            eyebrow_html
+            + f"<h3 class='ui-surface__title'>{html.escape(title)}</h3>"
+            + subtitle_html
+            + chip_html
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _queue_joblib_selection(title: str) -> None:
+    st.session_state["joblib_selected_title_pending"] = str(title or "").strip()
+
+
+def _render_sidebar_user_panel() -> None:
+    current_user = _session_user() or {}
+    role_label = "管理员" if bool(current_user.get("is_admin")) else "招聘成员"
+    display_name = str(current_user.get("name") or current_user.get("email") or "HireMate").strip()
+    st.sidebar.markdown(
+        (
+            "<div style='margin-bottom:1rem'>"
+            "<h1 style='font-family:Manrope,sans-serif;font-size:2rem;font-weight:800;color:#002046;margin:0'>HireMate</h1>"
+            f"<div style='margin-top:.55rem;font-size:1rem;font-weight:700;color:#171c1f'>{html.escape(display_name)}</div>"
+            f"<div style='margin-top:.15rem;font-size:.88rem;color:#54647a'>{html.escape(role_label)}</div>"
+            f"<div style='margin-top:.2rem;font-size:.82rem;color:#54647a'>{html.escape(str(current_user.get('email') or '-'))}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    if st.sidebar.button("＋ New Job Requisition", key="sidebar_new_job_requisition", use_container_width=True):
+        _request_page_navigation("岗位配置页")
+        st.rerun()
+    if st.sidebar.button("退出登录", key="auth_logout_btn", use_container_width=True):
+        logout_user(st.session_state)
+        st.session_state.auth_flash_message = "你已退出登录。"
+        st.rerun()
+
+
+def _render_login_page() -> None:
+    flash_message = str(st.session_state.pop("auth_flash_message", "") or "").strip()
+    total_users = count_users()
+    left_col, right_col = st.columns([1.05, 0.95], gap="large")
+
+    with left_col:
+        st.markdown(
+            """
+            <div class='login-brand-panel'>
+              <div>
+                <h1 class='login-brand-panel__title'>HireMate</h1>
+                <div class='login-brand-panel__copy'>
+                  Recruitment Screening &amp;<br/>Candidate Review Workbench
+                </div>
+              </div>
+              <div class='login-brand-panel__tag'>Secure Environment</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with right_col:
+        st.markdown("<div class='login-form-shell'>", unsafe_allow_html=True)
+        st.markdown("## Access Workbench")
+        st.caption("Enter your credentials to continue.")
+        if flash_message:
+            st.info(flash_message)
+
+        if total_users <= 0:
+            st.warning("当前系统尚未初始化管理员账号，请先在服务器或容器内执行管理员初始化命令。")
+            st.code(
+                'uv run -- python scripts/bootstrap_admin.py --email admin@example.com --name "管理员" --password "StrongPass123!"',
+                language="bash",
+            )
+            st.caption("公开注册默认关闭。请由部署人员完成首次管理员初始化。")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        with st.form("hiremate_login_form", clear_on_submit=False):
+            email = st.text_input("Corporate Email", placeholder="name@example.com")
+            password = st.text_input("Password", type="password", placeholder="请输入密码")
+            submitted = st.form_submit_button("Initialize Session", type="primary", use_container_width=True)
+
+        if submitted:
+            user, error_message = authenticate_user(email, password)
+            if user is None:
+                st.error(error_message or "登录失败，请稍后重试。")
+            else:
+                mark_login_success(str(user.get("user_id") or ""))
+                fresh_user = get_user_by_id(str(user.get("user_id") or "")) or user
+                login_user(st.session_state, fresh_user)
+                st.session_state.auth_flash_message = f"欢迎回来，{fresh_user.get('name') or fresh_user.get('email')}"
+                st.rerun()
+
+        st.markdown(
+            "<div class='login-status-line'><span class='login-status-line__dot'></span>"
+            "<span>System Status: Mainline Connected</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("公开注册默认关闭。账号请由管理员统一初始化。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_job_library() -> None:
+    records = list_jd_records()
+    total_openings = sum(int(item.get("openings", 0) or 0) for item in records)
+    pass_total = sum(_latest_batch_snapshot(item.get("title", "")).get("pass_count", 0) for item in records)
+    review_total = sum(_latest_batch_snapshot(item.get("title", "")).get("review_count", 0) for item in records)
+    _render_app_topbar("Job Config")
+    _render_page_intro(
+        "Active Configurations",
+        "Select a requisition to edit scoring models, maintain hiring thresholds, and keep the JD library aligned with batch screening defaults.",
+        eyebrow="Job Config",
+        chips=[f"{len(records)} 个岗位", f"{total_openings} 个空缺", f"{pass_total} 位通过候选", f"{review_total} 位待复核"],
+    )
+    _render_metric_strip(
+        [
+            {"label": "岗位总数", "value": len(records), "meta": "当前岗位库"},
+            {"label": "招聘空缺", "value": total_openings, "meta": "所有岗位 openings"},
+            {"label": "通过候选", "value": pass_total, "meta": "最近批次累计"},
+            {"label": "待复核", "value": review_total, "meta": "需要继续处理"},
+        ]
+    )
+    _render_job_library_base()
+
+
+def _render_batch_screening() -> None:
+    jd_titles = list_jds()
+    current_jd = str(st.session_state.get("batch_selected_jd_prev") or st.session_state.get("workspace_selected_jd_title") or "").strip()
+    latest = _latest_batch_snapshot(current_jd) if current_jd else {"latest_time": "-", "pass_count": 0, "review_count": 0, "reject_count": 0}
+    recent_batches = list_candidate_batches_by_jd(current_jd)[:2] if current_jd else []
+    _render_app_topbar("Batch Screening")
+    _render_page_intro(
+        "New Batch Screen",
+        "Configure AI reviewer runtime settings, inspect OCR readiness, and upload resumes for structured extraction and initial routing.",
+        eyebrow="Batch Screening",
+        chips=[
+            f"当前岗位：{current_jd or '未选择'}",
+            f"最近批次：{latest.get('latest_time', '-')}",
+            f"待复核：{latest.get('review_count', 0)}",
+        ],
+    )
+    main_col, rail_col = st.columns([0.74, 0.26], gap="large")
+    with main_col:
+        _render_batch_screening_base()
+    with rail_col:
+        st.markdown(
+            "<div class='module-box'><div class='section-title'>Current Batch Status</div>"
+            f"<div class='subtle'>Processing target job: {html.escape(current_jd or '未命名岗位')}</div>"
+            f"<div style='margin-top:.8rem'><strong>最近批次时间：</strong>{html.escape(str(latest.get('latest_time', '-')))}</div>"
+            f"<div style='margin-top:.3rem'><strong>通过：</strong>{int(latest.get('pass_count', 0) or 0)} ｜ "
+            f"<strong>待复核：</strong>{int(latest.get('review_count', 0) or 0)} ｜ "
+            f"<strong>淘汰：</strong>{int(latest.get('reject_count', 0) or 0)}</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='module-box'><div class='section-title'>Recent Batches</div>", unsafe_allow_html=True)
+        if recent_batches:
+            for item in recent_batches:
+                st.markdown(
+                    f"**{current_jd or '岗位'}**<br><span class='subtle'>{html.escape(str(item.get('created_at', '-')))}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    f"总数 {int(item.get('total_resumes', item.get('candidate_count', 0)) or 0)} ｜ "
+                    f"通过 {int(item.get('pass_count', 0) or 0)} ｜ "
+                    f"待复核 {int(item.get('review_count', 0) or 0)} ｜ "
+                    f"淘汰 {int(item.get('reject_count', 0) or 0)}"
+                )
+                st.divider()
+        else:
+            st.caption("当前岗位暂无历史批次。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_candidate_workspace() -> None:
+    selected_jd = str(st.session_state.get("workspace_selected_jd_title") or "").strip()
+    batch_id = str(st.session_state.get("workspace_preferred_batch_id") or "").strip()
+    _render_app_topbar("Workbench")
+    _render_page_intro(
+        "Candidate Review Workbench",
+        "Review routed candidates with evidence, risks, AI suggestions, and manual final decisions in one operational cockpit.",
+        eyebrow="Workbench",
+        chips=[
+            f"岗位：{selected_jd or '未选择'}",
+            f"批次：{batch_id[:12] + '…' if batch_id else '未选择'}",
+            f"当前候选池：{str(st.session_state.get('workspace_pool_top_radio') or '待复核候选人')}",
+        ],
+    )
+    _render_candidate_workspace_base()
 
 st.set_page_config(page_title="HireMate", page_icon="🧠", layout="wide")
 _inject_page_style()

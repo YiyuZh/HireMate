@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Batch Screening - HireMate</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "on-primary-fixed": "#001b3d",
+                        "outline": "#74777f",
+                        "on-secondary-fixed": "#0b1c30",
+                        "surface-tint": "#465f88",
+                        "on-error-container": "#93000a",
+                        "secondary-fixed": "#d3e4fe",
+                        "primary": "#002046",
+                        "on-secondary-container": "#54647a",
+                        "surface": "#f6fafe",
+                        "surface-container-high": "#e4e9ed",
+                        "tertiary-fixed-dim": "#89ceff",
+                        "surface-container-low": "#f0f4f8",
+                        "on-secondary": "#ffffff",
+                        "secondary": "#505f76",
+                        "secondary-container": "#d0e1fb",
+                        "outline-variant": "#c4c6cf",
+                        "surface-container-lowest": "#ffffff",
+                        "on-error": "#ffffff",
+                        "on-tertiary": "#ffffff",
+                        "background": "#f6fafe",
+                        "error": "#ba1a1a",
+                        "on-surface-variant": "#44474e",
+                        "primary-fixed": "#d6e3ff",
+                        "on-tertiary-container": "#1ba9ed",
+                        "inverse-primary": "#aec7f7",
+                        "tertiary": "#002336",
+                        "surface-container-highest": "#dfe3e7",
+                        "on-surface": "#171c1f",
+                        "surface-bright": "#f6fafe",
+                        "on-background": "#171c1f",
+                        "surface-container": "#eaeef2",
+                        "surface-dim": "#d6dade",
+                        "inverse-on-surface": "#edf1f5",
+                        "surface-variant": "#dfe3e7",
+                        "on-tertiary-fixed-variant": "#004c6e",
+                        "on-tertiary-fixed": "#001e2f",
+                        "error-container": "#ffdad6",
+                        "primary-container": "#1b365d",
+                        "tertiary-fixed": "#c9e6ff",
+                        "on-primary-container": "#87a0cd",
+                        "primary-fixed-dim": "#aec7f7",
+                        "on-primary": "#ffffff",
+                        "secondary-fixed-dim": "#b7c8e1",
+                        "on-primary-fixed-variant": "#2e476f",
+                        "inverse-surface": "#2c3134",
+                        "on-secondary-fixed-variant": "#38485d",
+                        "tertiary-container": "#003a55"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "fontFamily": {
+                        "headline": ["Manrope", "sans-serif"],
+                        "body": ["Inter", "sans-serif"],
+                        "label": ["Inter", "sans-serif"]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface font-body antialiased selection:bg-primary-container selection:text-on-primary-container min-h-screen flex">
+<!-- SideNavBar (Shared Component) -->
+<nav class="h-screen w-64 fixed left-0 top-0 bg-[#f0f4f8] shadow-none flex flex-col border-r-0 z-50">
+<!-- Header -->
+<div class="p-6 flex flex-col gap-4">
+<div class="flex items-center gap-3">
+<div class="w-10 h-10 rounded-full overflow-hidden bg-surface-container-high shrink-0">
+<img alt="Recruiter Profile Picture" class="w-full h-full object-cover" data-alt="Professional headshot of a confident senior recruiter in modern corporate attire against a neutral background" src="https://lh3.googleusercontent.com/aida-public/AB6AXuAdQ-3R2LQRb7lu2H4CIHvkrIu7y0hDCQXIe5MDz5qNvlXMbMudm_hNWOZhrtF0OJQzCJtzRJvG6bhsn4E1aoLpUjpsoinbKxdzLr6J4LKiLjmErlWJk_I_O9EWDMa7f6dGwpJ0TpVa0_F1H7vF47Qy5Q_fNtybqpa9Oi_8eLOBVLWFKXzsLs24Bd9ttbEc-P15LRQmYTBt13PehRZlE7yXK6zSi0L7a74NC90upkCXDvk-WTg85NRc9zLxaOmVUh1rlqjwKqMBStA"/>
+</div>
+<div>
+<h1 class="font-headline font-extrabold text-[#002046] text-xl tracking-tight">HireMate</h1>
+<p class="font-body text-sm tracking-tight text-slate-500">Senior Recruiter</p>
+</div>
+</div>
+<button class="w-full bg-primary text-on-primary rounded-md py-2.5 px-4 font-label font-medium text-sm flex items-center justify-center gap-2 hover:bg-primary-container transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]">
+<span class="material-symbols-outlined text-[20px]">add</span>
+                New Job Requisition
+            </button>
+</div>
+<!-- Main Navigation -->
+<div class="flex-1 overflow-y-auto py-4">
+<ul class="flex flex-col gap-1 px-3">
+<!-- Workbench (Inactive) -->
+<li>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-slate-500 hover:text-[#002046] hover:bg-[#e2e8f0] transition-colors duration-200 scale-[0.98] active:scale-95" href="#">
+<span class="material-symbols-outlined">dashboard_customize</span>
+<span class="font-body text-sm tracking-tight font-medium">Workbench</span>
+</a>
+</li>
+<!-- Batch Screening (Active) -->
+<li>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-[#002046] font-bold border-r-4 border-[#002046] bg-[#ffffff]/50 scale-[0.98] active:scale-95 transition-transform" href="#">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">layers</span>
+<span class="font-body text-sm tracking-tight">Batch Screening</span>
+</a>
+</li>
+<!-- Job Config (Inactive) -->
+<li>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-slate-500 hover:text-[#002046] hover:bg-[#e2e8f0] transition-colors duration-200 scale-[0.98] active:scale-95" href="#">
+<span class="material-symbols-outlined">settings_input_component</span>
+<span class="font-body text-sm tracking-tight font-medium">Job Config</span>
+</a>
+</li>
+</ul>
+</div>
+<!-- Footer Navigation -->
+<div class="p-4 mt-auto">
+<ul class="flex flex-col gap-1 px-3 border-t border-outline-variant/15 pt-4">
+<li>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-slate-500 hover:text-[#002046] hover:bg-[#e2e8f0] transition-colors duration-200 scale-[0.98] active:scale-95" href="#">
+<span class="material-symbols-outlined">shield_person</span>
+<span class="font-body text-sm tracking-tight font-medium">Admin Panel</span>
+</a>
+</li>
+<li>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-slate-500 hover:text-[#002046] hover:bg-[#e2e8f0] transition-colors duration-200 scale-[0.98] active:scale-95" href="#">
+<span class="material-symbols-outlined">help_outline</span>
+<span class="font-body text-sm tracking-tight font-medium">Support</span>
+</a>
+</li>
+</ul>
+</div>
+</nav>
+<!-- Main Content Area -->
+<div class="flex-1 ml-64 flex flex-col min-h-screen bg-surface">
+<!-- TopAppBar (Shared Component) -->
+<header class="sticky top-0 z-40 w-[calc(100%-16rem)] h-20 bg-[#f6fafe] border-b-0 shadow-none flex items-center justify-between px-8 w-full">
+<!-- Navigation Links -->
+<nav class="flex items-center gap-8 h-full">
+<a class="font-headline font-semibold text-slate-500 hover:text-[#002046] transition-all h-full flex items-center" href="#">Pipeline</a>
+<a class="font-headline font-semibold text-slate-500 hover:text-[#002046] transition-all h-full flex items-center" href="#">Analytics</a>
+<a class="font-headline font-semibold text-slate-500 hover:text-[#002046] transition-all h-full flex items-center" href="#">Archive</a>
+</nav>
+<!-- Trailing Actions -->
+<div class="flex items-center gap-6">
+<div class="flex items-center gap-4 text-slate-500">
+<button class="hover:text-[#002046] transition-all focus-within:ring-2 focus-within:ring-[#1B365D] rounded-full p-1">
+<span class="material-symbols-outlined">notifications</span>
+</button>
+<button class="hover:text-[#002046] transition-all focus-within:ring-2 focus-within:ring-[#1B365D] rounded-full p-1">
+<span class="material-symbols-outlined">history_edu</span>
+</button>
+</div>
+<button class="bg-surface-container text-primary font-headline font-semibold px-4 py-2 rounded-md hover:bg-surface-container-high transition-colors text-sm">
+                    Invite Team
+                </button>
+</div>
+</header>
+<!-- Page Canvas -->
+<main class="flex-1 p-8 grid grid-cols-1 xl:grid-cols-12 gap-8 items-start max-w-screen-2xl mx-auto w-full">
+<!-- Left Column: Configuration & Upload (Workspace) -->
+<div class="xl:col-span-8 flex flex-col gap-6">
+<!-- Header -->
+<div>
+<h2 class="font-headline text-3xl font-bold text-on-surface tracking-tight mb-2">New Batch Screen</h2>
+<p class="font-body text-on-surface-variant text-sm max-w-2xl">Configure your AI reviewer settings and upload candidate resumes for automated extraction and evaluation against job requirements.</p>
+</div>
+<!-- Config Card -->
+<div class="bg-surface-container-low rounded-xl p-6 flex flex-col gap-6">
+<h3 class="font-headline text-xl font-semibold text-primary flex items-center gap-2">
+<span class="material-symbols-outlined text-primary">settings_applications</span>
+                        Reviewer Configuration
+                    </h3>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+<!-- Job Select -->
+<div class="flex flex-col gap-2">
+<label class="font-label text-xs uppercase tracking-widest text-on-surface-variant font-semibold">Target Job Requisition</label>
+<div class="relative">
+<select class="w-full bg-surface-container-high text-on-surface font-body text-sm rounded-md border-0 border-b-2 border-transparent focus:border-primary focus:bg-surface-container-lowest focus:ring-0 transition-colors py-3 pl-4 pr-10 appearance-none">
+<option disabled="" selected="" value="">Select Job...</option>
+<option value="req-01">Senior Frontend Engineer (React)</option>
+<option value="req-02">Product Manager - Enterprise</option>
+<option value="req-03">Lead UX Designer</option>
+</select>
+<span class="material-symbols-outlined absolute right-3 top-1/2 -translate-y-1/2 text-on-surface-variant pointer-events-none">arrow_drop_down</span>
+</div>
+</div>
+<!-- Provider Select -->
+<div class="flex flex-col gap-2">
+<label class="font-label text-xs uppercase tracking-widest text-on-surface-variant font-semibold">AI Provider</label>
+<div class="relative">
+<select class="w-full bg-surface-container-high text-on-surface font-body text-sm rounded-md border-0 border-b-2 border-transparent focus:border-primary focus:bg-surface-container-lowest focus:ring-0 transition-colors py-3 pl-4 pr-10 appearance-none">
+<option value="openai">OpenAI</option>
+<option value="anthropic">Anthropic</option>
+<option value="custom">Custom Endpoint</option>
+</select>
+<span class="material-symbols-outlined absolute right-3 top-1/2 -translate-y-1/2 text-on-surface-variant pointer-events-none">arrow_drop_down</span>
+</div>
+</div>
+<!-- Model Select -->
+<div class="flex flex-col gap-2">
+<label class="font-label text-xs uppercase tracking-widest text-on-surface-variant font-semibold">Model Selection</label>
+<div class="relative">
+<select class="w-full bg-surface-container-high text-on-surface font-body text-sm rounded-md border-0 border-b-2 border-transparent focus:border-primary focus:bg-surface-container-lowest focus:ring-0 transition-colors py-3 pl-4 pr-10 appearance-none">
+<option value="gpt4">GPT-4o (High Accuracy)</option>
+<option value="gpt35">GPT-3.5 Turbo (Fast)</option>
+</select>
+<span class="material-symbols-outlined absolute right-3 top-1/2 -translate-y-1/2 text-on-surface-variant pointer-events-none">arrow_drop_down</span>
+</div>
+</div>
+<!-- API Key -->
+<div class="flex flex-col gap-2">
+<label class="font-label text-xs uppercase tracking-widest text-on-surface-variant font-semibold">API Key Override (Optional)</label>
+<input class="w-full bg-surface-container-high text-on-surface font-body text-sm rounded-md border-0 border-b-2 border-transparent focus:border-primary focus:bg-surface-container-lowest focus:ring-0 transition-colors py-3 px-4" placeholder="sk-..." type="password"/>
+</div>
+</div>
+</div>
+<!-- Upload Area Card -->
+<div class="bg-surface-container-low rounded-xl p-6 flex flex-col gap-6">
+<div class="flex items-center justify-between">
+<h3 class="font-headline text-xl font-semibold text-primary flex items-center gap-2">
+<span class="material-symbols-outlined text-primary">upload_file</span>
+                            Resume Intake
+                        </h3>
+<span class="font-body text-xs text-on-surface-variant bg-surface-container px-2 py-1 rounded-sm">PDF, DOCX, JPG (Max 50MB total)</span>
+</div>
+<!-- Drag & Drop Zone -->
+<div class="border-2 border-dashed border-outline-variant/50 rounded-xl bg-surface-container-highest/30 hover:bg-surface-container-highest/60 transition-colors flex flex-col items-center justify-center py-12 cursor-pointer group">
+<div class="w-16 h-16 rounded-full bg-primary-container text-on-primary-container flex items-center justify-center mb-4 group-hover:scale-105 transition-transform">
+<span class="material-symbols-outlined text-3xl">cloud_upload</span>
+</div>
+<p class="font-headline font-semibold text-on-surface mb-1">Drag and drop files here</p>
+<p class="font-body text-sm text-on-surface-variant mb-4">or click to browse from your computer</p>
+<button class="bg-surface text-primary font-label font-medium text-sm px-4 py-2 rounded-md hover:bg-surface-container transition-colors shadow-sm">
+                            Browse Files
+                        </button>
+</div>
+<!-- Staged Files List (Simulated) -->
+<div class="flex flex-col gap-2">
+<h4 class="font-label text-xs uppercase tracking-widest text-on-surface-variant font-semibold mb-2">Staged for Extraction (3)</h4>
+<!-- File Item -->
+<div class="bg-surface-container-lowest rounded-md p-3 flex items-center justify-between group hover:shadow-[0_4px_12px_rgba(23,28,31,0.06)] transition-shadow">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-secondary">description</span>
+<div>
+<p class="font-body text-sm font-medium text-on-surface">jdoe_resume_2024.pdf</p>
+<p class="font-body text-xs text-on-surface-variant">1.2 MB • Scanned</p>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<span class="text-emerald-700 bg-emerald-100/50 px-2 py-0.5 rounded-sm font-label text-xs font-medium flex items-center gap-1">
+<span class="material-symbols-outlined text-[14px]">check_circle</span>
+                                    High Confidence
+                                </span>
+<button class="text-outline hover:text-error transition-colors">
+<span class="material-symbols-outlined text-[20px]">close</span>
+</button>
+</div>
+</div>
+<!-- File Item (Warning) -->
+<div class="bg-surface-container-lowest rounded-md p-3 flex items-center justify-between group hover:shadow-[0_4px_12px_rgba(23,28,31,0.06)] transition-shadow">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-secondary">image</span>
+<div>
+<p class="font-body text-sm font-medium text-on-surface">scan_001_mobile.jpg</p>
+<p class="font-body text-xs text-on-surface-variant">3.4 MB • Processing OCR</p>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<span class="text-[#93000a] bg-[#ffdad6]/50 px-2 py-0.5 rounded-sm font-label text-xs font-medium flex items-center gap-1">
+<span class="material-symbols-outlined text-[14px]">warning</span>
+                                    Low Res Warning
+                                </span>
+<button class="text-outline hover:text-error transition-colors">
+<span class="material-symbols-outlined text-[20px]">close</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<!-- Action Bar -->
+<div class="flex items-center justify-between bg-surface-container-low rounded-xl p-4 mt-2">
+<div class="flex items-center gap-3 text-sm text-on-surface-variant font-body">
+<span class="material-symbols-outlined text-primary">info</span>
+                        Estimated processing time: <strong class="text-on-surface">~45 seconds</strong> per resume.
+                    </div>
+<button class="bg-gradient-to-r from-primary to-primary-container text-on-primary rounded-md py-3 px-8 font-label font-bold text-sm flex items-center gap-2 hover:opacity-90 transition-opacity shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]">
+<span class="material-symbols-outlined">play_circle</span>
+                        Start Batch Screening
+                    </button>
+</div>
+</div>
+<!-- Right Column: Active Progress & Summary (Contextual) -->
+<div class="xl:col-span-4 flex flex-col gap-6">
+<!-- Active Batch Progress -->
+<div class="bg-surface-container-lowest rounded-xl p-6 shadow-[0_8px_40px_-12px_rgba(23,28,31,0.08)] border border-outline-variant/10 relative overflow-hidden">
+<!-- Glassmorphism AI treatment background -->
+<div class="absolute inset-0 bg-tertiary-fixed-dim opacity-5 pointer-events-none"></div>
+<h3 class="font-headline text-lg font-bold text-on-surface mb-6 relative z-10">Current Batch Status</h3>
+<div class="flex flex-col gap-4 relative z-10">
+<div class="flex justify-between items-end mb-1">
+<span class="font-body text-sm font-medium text-on-surface">Processing "Frontend Eng"</span>
+<span class="font-label text-xs font-bold text-primary">68%</span>
+</div>
+<!-- Progress Bar -->
+<div class="h-2 w-full bg-surface-container-high rounded-full overflow-hidden">
+<div class="h-full bg-primary w-[68%] rounded-full relative">
+<div class="absolute inset-0 bg-white/20 animate-pulse"></div>
+</div>
+</div>
+<div class="flex justify-between font-body text-xs text-on-surface-variant mt-1">
+<span>17 processed</span>
+<span>8 remaining</span>
+</div>
+<div class="mt-4 bg-tertiary-fixed/30 p-3 rounded-md backdrop-blur-md flex items-start gap-3 border border-tertiary-fixed-dim/20">
+<span class="material-symbols-outlined text-tertiary-container text-[18px] mt-0.5" style="font-variation-settings: 'FILL' 1;">magic_button</span>
+<p class="font-body text-xs text-on-tertiary-container leading-relaxed">
+                                AI extraction is prioritizing "React Native" experience as flagged in the recent requisition update.
+                            </p>
+</div>
+</div>
+</div>
+<!-- Historical Summary Card -->
+<div class="bg-surface-container-low rounded-xl p-6">
+<h3 class="font-headline text-lg font-bold text-on-surface mb-4">Recent Batches</h3>
+<div class="flex flex-col gap-4">
+<!-- Summary Item -->
+<div class="bg-surface-container-lowest p-4 rounded-lg hover:shadow-[0_4px_12px_rgba(23,28,31,0.06)] transition-shadow">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h4 class="font-body text-sm font-semibold text-on-surface">Product Manager</h4>
+<p class="font-body text-xs text-on-surface-variant">Batch #402 • Yesterday, 2:30 PM</p>
+</div>
+<span class="bg-surface-container text-secondary font-label text-[10px] uppercase px-2 py-1 rounded-sm font-bold">Completed</span>
+</div>
+<!-- Distribution Bar -->
+<div class="flex h-1.5 w-full rounded-full overflow-hidden gap-0.5">
+<div class="bg-emerald-500 w-[45%]" title="Pass"></div>
+<div class="bg-amber-400 w-[30%]" title="Review"></div>
+<div class="bg-rose-500 w-[25%]" title="Reject"></div>
+</div>
+<div class="flex justify-between mt-2 font-body text-[10px] text-on-surface-variant">
+<span>22 Pass</span>
+<span>15 Review</span>
+<span>12 Reject</span>
+</div>
+</div>
+<!-- Summary Item -->
+<div class="bg-surface-container-lowest p-4 rounded-lg hover:shadow-[0_4px_12px_rgba(23,28,31,0.06)] transition-shadow">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h4 class="font-body text-sm font-semibold text-on-surface">Lead UX Designer</h4>
+<p class="font-body text-xs text-on-surface-variant">Batch #401 • Oct 12, 9:15 AM</p>
+</div>
+<span class="bg-surface-container text-secondary font-label text-[10px] uppercase px-2 py-1 rounded-sm font-bold">Completed</span>
+</div>
+<!-- Distribution Bar -->
+<div class="flex h-1.5 w-full rounded-full overflow-hidden gap-0.5">
+<div class="bg-emerald-500 w-[15%]" title="Pass"></div>
+<div class="bg-amber-400 w-[40%]" title="Review"></div>
+<div class="bg-rose-500 w-[45%]" title="Reject"></div>
+</div>
+<div class="flex justify-between mt-2 font-body text-[10px] text-on-surface-variant">
+<span>5 Pass</span>
+<span>14 Review</span>
+<span>16 Reject</span>
+</div>
+</div>
+</div>
+<button class="w-full mt-4 text-primary font-label text-sm font-medium hover:text-primary-container transition-colors py-2 flex items-center justify-center gap-1">
+                        View All History
+                        <span class="material-symbols-outlined text-[18px]">arrow_forward</span>
+</button>
+</div>
+</div>
+</main>
+</div>
+</body></html>
