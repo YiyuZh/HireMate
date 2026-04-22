@@ -17,3 +17,10 @@ data/hiremate.db-wal
 src/__pycache__/
 ai_recruiting_screener/
 hiremate-ai-screening/
+frontend/node_modules/
+frontend/dist/
+backend/__pycache__/
+backend/api/__pycache__/
+backend/api/routes/__pycache__/
+backend/core/__pycache__/
+backend/services/__pycache__/

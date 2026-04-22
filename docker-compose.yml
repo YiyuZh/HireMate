@@ -19,7 +19,7 @@ services:
       timeout: 5s
       retries: 12
 
-  hiremate:
+  hiremate-legacy:
     build:
       context: .
       args:
@@ -27,7 +27,7 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
         PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
-    container_name: hiremate
+    container_name: hiremate-legacy
     restart: unless-stopped
     volumes:
       - hiremate_data:/app/data
@@ -48,6 +48,51 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+
+  hiremate-api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        APT_MIRROR_HOST: ${APT_MIRROR_HOST:-mirrors.tuna.tsinghua.edu.cn}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+    container_name: hiremate-api
+    restart: unless-stopped
+    volumes:
+      - hiremate_data:/app/data
+    expose:
+      - "8000"
+    environment:
+      HIREMATE_DB_BACKEND: mysql
+      HIREMATE_MYSQL_HOST: mysql
+      HIREMATE_MYSQL_PORT: 3306
+      HIREMATE_MYSQL_USER: ${HIREMATE_MYSQL_USER:-hiremate}
+      HIREMATE_MYSQL_PASSWORD: ${HIREMATE_MYSQL_PASSWORD:-hiremate_pwd}
+      HIREMATE_MYSQL_DATABASE: ${HIREMATE_MYSQL_DATABASE:-hiremate}
+      HIREMATE_MYSQL_CHARSET: utf8mb4
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      MODEL_NAME: ${MODEL_NAME:-gpt-4o-mini}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      HIREMATE_JWT_SECRET: ${HIREMATE_JWT_SECRET:-change-this-secret}
+      HIREMATE_SECURE_COOKIES: ${HIREMATE_SECURE_COOKIES:-1}
+      HIREMATE_DEV_ORIGINS: ${HIREMATE_DEV_ORIGINS:-http://127.0.0.1:5173,http://localhost:5173}
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  hiremate-web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    container_name: hiremate-web
+    restart: unless-stopped
+    expose:
+      - "80"
 
   caddy:
     image: caddy:2
@@ -76,7 +121,8 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - hiremate
+      - hiremate-api
+      - hiremate-web
     networks:
       - default
       - shared_gateway

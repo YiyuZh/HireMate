@@ -31,11 +31,11 @@
 }
 
 (hiremate_cache_policy) {
-    @hiremate_static path /static/*
-    header @hiremate_static Cache-Control "public, max-age=31536000, immutable"
+    @hiremate_assets path /assets/* /static/* /favicon.ico /favicon.png
+    header @hiremate_assets Cache-Control "public, max-age=31536000, immutable"
 
     @hiremate_dynamic {
-        not path /static/* /_stcore/* /favicon.ico /favicon.png /robots.txt
+        not path /assets/* /static/* /api/* /favicon.ico /favicon.png /robots.txt
     }
     header @hiremate_dynamic Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
     header @hiremate_dynamic Pragma "no-cache"
@@ -100,7 +100,15 @@ blog.zenithy.art {
 {$HIREMATE_DOMAIN} {
     import common_site
     import hiremate_cache_policy
-    reverse_proxy hiremate:8501
+
+    @hiremate_api path /api/*
+    handle @hiremate_api {
+        reverse_proxy hiremate-api:8000
+    }
+
+    handle {
+        reverse_proxy hiremate-web:80
+    }
 }
 
 {$INTERVIEW_DOMAIN} {

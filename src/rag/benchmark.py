@@ -536,6 +536,13 @@ def _reciprocal_rank(results: list[dict[str, Any]], predicate) -> float:
     return 0.0
 
 
+def _mean_metric(results: list[dict[str, Any]], key: str) -> float:
+    values = [float(item.get(key) or 0.0) for item in results if item.get(key) is not None]
+    if not values:
+        return 0.0
+    return round(sum(values) / max(1, len(values)), 6)
+
+
 def run_benchmark_case(
     case: dict[str, Any],
     *,
@@ -676,6 +683,57 @@ def run_benchmark_case(
         hits = sum(1 for term in expected_terms if term.lower() in hit_blob)
         explanation_consistency = hits / max(1, len(expected_terms))
 
+    top_hits = results[:top_k]
+
+    def _source_type(item: dict[str, Any]) -> str:
+        return str((item.get("metadata") or {}).get("source_type") or "")
+
+    def _label(item: dict[str, Any]) -> str:
+        return str((item.get("metadata") or {}).get("chunk_label") or "").lower()
+
+    def _matches_expected(item: dict[str, Any]) -> bool:
+        source_type = _source_type(item)
+        text = _clean_text(item.get("text") or "").lower()
+        label = _label(item)
+        source_match = bool(expected_source_types) and source_type in expected_source_types
+        substring_match = bool(expected_substrings) and any(expected.lower() in text for expected in expected_substrings)
+        label_match = bool(expected_chunk_labels) and any(expected.lower() in label for expected in expected_chunk_labels)
+        if not expected_source_types and not expected_substrings and not expected_chunk_labels:
+            return bool(item)
+        return source_match or substring_match or label_match
+
+    matched_top_hits = sum(1 for item in top_hits if _matches_expected(item))
+    unsupported_claim_rate = 0.0 if not top_hits else max(0.0, 1.0 - (matched_top_hits / len(top_hits)))
+    evidence_coverage_rate = explanation_consistency
+
+    expects_counter_evidence = bool(case.get("expects_counter_evidence")) or task in {"counter_evidence", "risk_grounding"}
+    expects_missing_evidence = bool(case.get("expects_missing_evidence")) or task == "missing_evidence"
+    expects_manual_first = bool(case.get("expects_manual_first")) or expects_missing_evidence
+
+    contradiction_handling_accuracy = None
+    if expects_counter_evidence:
+        counter_checks: list[float] = []
+        if expected_source_types:
+            counter_checks.append(1.0 if source_hit else 0.0)
+        if expected_substrings:
+            counter_checks.append(1.0 if substring_hit else 0.0)
+        if expected_chunk_labels:
+            counter_checks.append(1.0 if label_hit else 0.0)
+        if not counter_checks:
+            counter_checks.append(1.0 if results else 0.0)
+        contradiction_handling_accuracy = sum(counter_checks) / max(1, len(counter_checks))
+
+    abstention_quality = None
+    if expects_missing_evidence or expects_manual_first:
+        safe_source_types = expected_source_types or {"jd", "role_profile", "rubric"}
+        safe_hits = sum(1 for item in top_hits if _source_type(item) in safe_source_types)
+        abstention_quality = 1.0 if not top_hits else safe_hits / max(1, len(top_hits))
+
+    manual_first_trigger_precision = None
+    if expects_manual_first:
+        abstention_score = float(abstention_quality or 0.0)
+        manual_first_trigger_precision = 1.0 if abstention_score >= 0.5 and unsupported_claim_rate <= 0.5 else 0.0
+
     return {
         "case_id": _clean_text(case.get("case_id") or task),
         "task": task,
@@ -692,6 +750,11 @@ def run_benchmark_case(
         "grounding_recall": 1.0 if substring_hit else 0.0,
         "counter_quality": round((substring_rank + source_rank) / 2.0, 6) if task in {"counter_evidence", "missing_evidence"} else 0.0,
         "explanation_consistency": round(explanation_consistency, 6),
+        "unsupported_claim_rate": round(unsupported_claim_rate, 6),
+        "evidence_coverage_rate": round(evidence_coverage_rate, 6),
+        "contradiction_handling_accuracy": round(contradiction_handling_accuracy, 6) if contradiction_handling_accuracy is not None else None,
+        "abstention_quality": round(abstention_quality, 6) if abstention_quality is not None else None,
+        "manual_first_trigger_precision": round(manual_first_trigger_precision, 6) if manual_first_trigger_precision is not None else None,
         "created_from": _clean_text(case.get("created_from")),
         "top_hits": [
             {
@@ -740,6 +803,14 @@ def run_benchmark(
                 sum(float(item.get("combined_score") or 0.0) for item in task_results) / max(1, len(task_results)),
                 6,
             ),
+            "mean_grounding_recall": _mean_metric(task_results, "grounding_recall"),
+            "mean_counter_quality": _mean_metric(task_results, "counter_quality"),
+            "mean_explanation_consistency": _mean_metric(task_results, "explanation_consistency"),
+            "mean_unsupported_claim_rate": _mean_metric(task_results, "unsupported_claim_rate"),
+            "mean_evidence_coverage_rate": _mean_metric(task_results, "evidence_coverage_rate"),
+            "mean_contradiction_handling_accuracy": _mean_metric(task_results, "contradiction_handling_accuracy"),
+            "mean_abstention_quality": _mean_metric(task_results, "abstention_quality"),
+            "mean_manual_first_trigger_precision": _mean_metric(task_results, "manual_first_trigger_precision"),
         }
 
     return {
@@ -763,6 +834,11 @@ def run_benchmark(
             sum(float(item.get("explanation_consistency") or 0.0) for item in results) / max(1, len(results)),
             6,
         ),
+        "mean_unsupported_claim_rate": _mean_metric(results, "unsupported_claim_rate"),
+        "mean_evidence_coverage_rate": _mean_metric(results, "evidence_coverage_rate"),
+        "mean_contradiction_handling_accuracy": _mean_metric(results, "contradiction_handling_accuracy"),
+        "mean_abstention_quality": _mean_metric(results, "abstention_quality"),
+        "mean_manual_first_trigger_precision": _mean_metric(results, "manual_first_trigger_precision"),
         "mean_source_rank": round(
             sum(float(item.get("source_rank") or 0.0) for item in results) / max(1, len(results)),
             6,

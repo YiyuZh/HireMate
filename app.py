@@ -1612,6 +1612,7 @@ def _generate_ai_review_for_batch_detail(
             risk_result=payload.get("risk_result") if isinstance(payload.get("risk_result"), dict) else {},
             screening_result=payload.get("screening_result") if isinstance(payload.get("screening_result"), dict) else {},
             evidence_snippets=payload.get("evidence_snippets") if isinstance(payload.get("evidence_snippets"), list) else [],
+            analysis_payload=payload.get("analysis_payload") if isinstance(payload.get("analysis_payload"), dict) else {},
         )
         elapsed_ms = max(0, int((perf_counter() - started_at) * 1000))
         ai_suggestion = ai_suggestion if isinstance(ai_suggestion, dict) else {}
@@ -1727,6 +1728,7 @@ def _generate_ai_review_for_candidate(
             risk_result=detail.get("risk_result") if isinstance(detail.get("risk_result"), dict) else {},
             screening_result=detail.get("screening_result") if isinstance(detail.get("screening_result"), dict) else {},
             evidence_snippets=detail.get("evidence_snippets") if isinstance(detail.get("evidence_snippets"), list) else [],
+            analysis_payload=detail.get("analysis_payload") if isinstance(detail.get("analysis_payload"), dict) else {},
         )
         elapsed_ms = max(0, int((perf_counter() - started_at) * 1000))
         ai_suggestion = ai_suggestion if isinstance(ai_suggestion, dict) else {}
@@ -4164,6 +4166,9 @@ def _run_pipeline(jd_text: str, resume_text: str, jd_title: str = "") -> dict:
         normalized_text=normalized_resume_text,
         raw_text=resume_text,
         evidence_snippets=evidence_snippets,
+        score_details=score_details,
+        risk_result=risk_result,
+        screening_result=screening_result,
     )
     evidence_bridge = build_evidence_bridge(score_details, evidence_snippets)
     if isinstance(evidence_bridge.get("score_details"), dict):
@@ -9146,7 +9151,8 @@ def _inject_page_style() -> None:
             padding: 2rem 2rem 1.6rem;
             box-shadow: var(--hm-shadow);
             border: 1px solid var(--hm-outline-soft);
-            min-height: 640px;
+            min-height: auto;
+            margin-bottom: 1rem;
         }
 
         .login-form-shell [data-testid="stForm"] {
@@ -9594,45 +9600,51 @@ def _render_login_page() -> None:
         )
 
     with right_col:
-        st.markdown("<div class='login-form-shell'>", unsafe_allow_html=True)
-        st.markdown("## Access Workbench")
-        st.caption("Enter your credentials to continue.")
-        if flash_message:
-            st.info(flash_message)
-
-        if total_users <= 0:
-            st.warning("当前系统尚未初始化管理员账号，请先在服务器或容器内执行管理员初始化命令。")
-            st.code(
-                'uv run -- python scripts/bootstrap_admin.py --email admin@example.com --name "管理员" --password "StrongPass123!"',
-                language="bash",
+        shell = st.container()
+        with shell:
+            st.markdown(
+                """
+                <div class="login-form-shell">
+                  <h2 class="ui-surface__title" style="margin-bottom:.35rem;">Access Workbench</h2>
+                  <p class="ui-surface__subtitle" style="margin-bottom:0;">Enter your credentials to continue.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            st.caption("公开注册默认关闭。请由部署人员完成首次管理员初始化。")
-            st.markdown("</div>", unsafe_allow_html=True)
-            return
+            if flash_message:
+                st.info(flash_message)
 
-        with st.form("hiremate_login_form", clear_on_submit=False):
-            email = st.text_input("Corporate Email", placeholder="name@example.com")
-            password = st.text_input("Password", type="password", placeholder="请输入密码")
-            submitted = st.form_submit_button("Initialize Session", type="primary", use_container_width=True)
+            if total_users <= 0:
+                st.warning("当前系统尚未初始化管理员账号，请先在服务器或容器内执行管理员初始化命令。")
+                st.code(
+                    'uv run -- python scripts/bootstrap_admin.py --email admin@example.com --name "管理员" --password "StrongPass123!"',
+                    language="bash",
+                )
+                st.caption("公开注册默认关闭。请由部署人员完成首次管理员初始化。")
+                return
 
-        if submitted:
-            user, error_message = authenticate_user(email, password)
-            if user is None:
-                st.error(error_message or "登录失败，请稍后重试。")
-            else:
-                mark_login_success(str(user.get("user_id") or ""))
-                fresh_user = get_user_by_id(str(user.get("user_id") or "")) or user
-                login_user(st.session_state, fresh_user)
-                st.session_state.auth_flash_message = f"欢迎回来，{fresh_user.get('name') or fresh_user.get('email')}"
-                st.rerun()
+            with st.form("hiremate_login_form", clear_on_submit=False):
+                email = st.text_input("Corporate Email", placeholder="name@example.com")
+                password = st.text_input("Password", type="password", placeholder="请输入密码")
+                submitted = st.form_submit_button("Initialize Session", type="primary", use_container_width=True)
 
-        st.markdown(
-            "<div class='login-status-line'><span class='login-status-line__dot'></span>"
-            "<span>System Status: Mainline Connected</span></div>",
-            unsafe_allow_html=True,
-        )
-        st.caption("公开注册默认关闭。账号请由管理员统一初始化。")
-        st.markdown("</div>", unsafe_allow_html=True)
+            if submitted:
+                user, error_message = authenticate_user(email, password)
+                if user is None:
+                    st.error(error_message or "登录失败，请稍后重试。")
+                else:
+                    mark_login_success(str(user.get("user_id") or ""))
+                    fresh_user = get_user_by_id(str(user.get("user_id") or "")) or user
+                    login_user(st.session_state, fresh_user)
+                    st.session_state.auth_flash_message = f"欢迎回来，{fresh_user.get('name') or fresh_user.get('email')}"
+                    st.rerun()
+
+            st.markdown(
+                "<div class='login-status-line'><span class='login-status-line__dot'></span>"
+                "<span>System Status: Mainline Connected</span></div>",
+                unsafe_allow_html=True,
+            )
+            st.caption("公开注册默认关闭。账号请由管理员统一初始化。")
 
 
 def _render_job_library() -> None:

@@ -11,7 +11,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from src.rag import build_ai_reviewer_grounding
+from src.rag import build_ai_reviewer_grounding, build_full_grounding
 
 OPENAI_DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEEPSEEK_DEFAULT_API_BASE = "https://api.deepseek.com/v1"
@@ -19,6 +19,7 @@ AI_REVIEWER_PROMPT_VERSION = "v1"
 AI_RULE_SUGGESTER_PROMPT_VERSION = "v1"
 ALLOWED_RISK_LEVELS = {"low", "medium", "high", "unknown"}
 ALLOWED_ACTIONS = {"proceed", "manual_review", "hold", "no_action"}
+ALLOWED_SUPPORT_STATUS = {"supported", "weakly_supported", "contradicted", "missing_evidence"}
 AI_PROVIDER_OPTIONS = ["openai", "openai_compatible", "deepseek", "azure_openai", "anthropic", "mock"]
 OPENAI_COMPATIBLE_PROVIDERS = {"openai", "openai_compatible", "deepseek"}
 OPENAI_JSON_SCHEMA_PROVIDERS = {"openai"}
@@ -365,6 +366,14 @@ def get_ai_reviewer_output_schema(mode: str = "suggest_only") -> dict[str, Any]:
         "human_approve": "仅输出待人工确认建议，应用动作必须由人工触发。",
     }.get(mode_norm, "默认建议模式。")
 
+    grounded_annotation = {
+        "support_status": {"type": "string", "enum": sorted(ALLOWED_SUPPORT_STATUS)},
+        "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "opposing_evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "grounded_confidence": {"type": "number"},
+        "needs_manual_check": {"type": "boolean"},
+    }
+
     return {
         "type": "object",
         "additionalProperties": False,
@@ -375,6 +384,8 @@ def get_ai_reviewer_output_schema(mode: str = "suggest_only") -> dict[str, Any]:
             "score_adjustments",
             "risk_adjustment",
             "recommended_action",
+            "recommended_action_detail",
+            "abstain_reasons",
         ],
         "mode_note": mode_note,
         "properties": {
@@ -384,11 +395,12 @@ def get_ai_reviewer_output_schema(mode: str = "suggest_only") -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["source", "text"],
+                    "required": ["source", "text", "support_status", "supporting_evidence_ids", "opposing_evidence_ids", "grounded_confidence", "needs_manual_check"],
                     "properties": {
                         "source": {"type": "string"},
                         "text": {"type": "string"},
                         "note": {"type": "string"},
+                        **grounded_annotation,
                     },
                 },
             },
@@ -397,11 +409,12 @@ def get_ai_reviewer_output_schema(mode: str = "suggest_only") -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["label", "value"],
+                    "required": ["label", "value", "support_status", "supporting_evidence_ids", "opposing_evidence_ids", "grounded_confidence", "needs_manual_check"],
                     "properties": {
                         "label": {"type": "string"},
                         "value": {"type": "string"},
                         "note": {"type": "string"},
+                        **grounded_annotation,
                     },
                 },
             },
@@ -410,29 +423,54 @@ def get_ai_reviewer_output_schema(mode: str = "suggest_only") -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["dimension", "suggested_delta", "reason"],
+                    "required": [
+                        "dimension",
+                        "suggested_delta",
+                        "reason",
+                        "support_status",
+                        "supporting_evidence_ids",
+                        "opposing_evidence_ids",
+                        "grounded_confidence",
+                        "needs_manual_check",
+                    ],
                     "properties": {
                         "dimension": {"type": "string"},
                         "suggested_delta": {"type": "integer"},
                         "max_delta": {"type": "integer"},
                         "reason": {"type": "string"},
+                        **grounded_annotation,
                     },
                 },
             },
             "risk_adjustment": {
                 "type": "object",
                 "additionalProperties": False,
+                "required": ["support_status", "supporting_evidence_ids", "opposing_evidence_ids", "grounded_confidence", "needs_manual_check"],
                 "properties": {
                     "suggested_risk_level": {
                         "type": "string",
                         "enum": ["low", "medium", "high", "unknown"],
                     },
                     "reason": {"type": "string"},
+                    **grounded_annotation,
                 },
             },
             "recommended_action": {
                 "type": "string",
                 "enum": ["proceed", "manual_review", "hold", "no_action"],
+            },
+            "recommended_action_detail": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["reason", "support_status", "supporting_evidence_ids", "opposing_evidence_ids", "grounded_confidence", "needs_manual_check"],
+                "properties": {
+                    "reason": {"type": "string"},
+                    **grounded_annotation,
+                },
+            },
+            "abstain_reasons": {
+                "type": "array",
+                "items": {"type": "string"},
             },
         },
     }
@@ -464,6 +502,7 @@ def build_ai_reviewer_prompt(
     risk_result: dict[str, Any],
     screening_result: dict[str, Any],
     evidence_snippets: list[dict[str, Any]] | None,
+    analysis_payload: dict[str, Any] | None = None,
 ) -> str:
     """Build the reviewer prompt payload for API or debug preview."""
     ai_cfg = _normalize_ai_reviewer_config(scoring_config)
@@ -471,6 +510,15 @@ def build_ai_reviewer_prompt(
     schema = get_ai_reviewer_output_schema(mode)
     caps = ai_cfg.get("capabilities") or {}
     limits = ai_cfg.get("score_adjustment_limit") or {}
+    analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
+    grounding_summary = analysis.get("grounding_summary") if isinstance(analysis.get("grounding_summary"), dict) else {}
+    if not grounding_summary:
+        grounding_summary = build_full_grounding(
+            parsed_jd=parsed_jd,
+            parsed_resume=parsed_resume,
+            evidence_snippets=evidence_snippets,
+            screening_reasons=screening_result.get("screening_reasons") if isinstance(screening_result.get("screening_reasons"), list) else [],
+        )
     rag_grounding = build_ai_reviewer_grounding(
         parsed_jd,
         parsed_resume,
@@ -490,24 +538,33 @@ def build_ai_reviewer_prompt(
         "risk_result": risk_result,
         "screening_result": screening_result,
         "evidence_snippets": evidence_snippets or [],
+        "analysis_payload": {
+            "analysis_mode": str(analysis.get("analysis_mode") or "normal"),
+            "ocr_confidence": analysis.get("ocr_confidence") or 0.0,
+            "structure_confidence": analysis.get("structure_confidence") or 0.0,
+            "parse_confidence": analysis.get("parse_confidence") or 0.0,
+            "candidate_profile": analysis.get("candidate_profile") or {},
+            "evidence_trace": analysis.get("evidence_trace") or [],
+            "evidence_for": analysis.get("evidence_for") or [],
+            "evidence_against": analysis.get("evidence_against") or [],
+            "missing_info_points": analysis.get("missing_info_points") or [],
+            "timeline_risks": analysis.get("timeline_risks") or [],
+            "claim_candidates": analysis.get("claim_candidates") or [],
+            "abstain_reasons": analysis.get("abstain_reasons") or [],
+        },
+        "grounding_summary": grounding_summary if grounding_summary.get("enabled") else {},
         "rag_grounding": rag_grounding if rag_grounding.get("enabled") else {},
     }
 
-    mode_rules = {
-        "suggest_only": "你只能给出建议，不得要求系统自动改分或改结论。",
-        "bounded_override": (
-            "你可给出修正建议，但必须受 max_delta_per_dimension 约束，"
-            "且当 allow_break_hard_thresholds=false 时不得建议突破硬门槛。"
-        ),
-        "human_approve": "你可以给出完整建议，但必须标记为“待人工确认”后才可生效。",
-    }
-
     return (
-        "你是招聘流程中的 AI 二次审核员，不是主评分器。\n"
-        "规则评分器仍然是主评分器；你只能基于已有规则结果给出二次审核建议。\n"
-        "你不得输出人工最终结论，不得替代人工“通过 / 待复核 / 淘汰”按钮。\n"
-        "你可以建议补充证据、补充时间线、调整风险、建议改分，但任何建议都必须先人工点击应用。\n"
-        f"当前审核模式：{mode}。{mode_rules.get(mode, mode_rules['suggest_only'])}\n"
+        "你是招聘流程中的 AI reviewer，规则评分器仍然是主评分器，人工仍保留最终决定权。\n"
+        "你只能输出建议，不得替代人工“通过 / 待复核 / 淘汰”按钮。\n"
+        "你的所有建议都必须证据优先，且只能引用 analysis_payload.evidence_trace 中已经存在的 evidence_id。\n"
+        "如果证据不足、存在反证、或 OCR/解析质量偏弱，必须保守输出：support_status=missing_evidence 或 contradicted，"
+        "同时设置 needs_manual_check=true，并在 abstain_reasons 中说明原因。\n"
+        "禁止虚构项目、技能、时间、产出、量化结果或风险结论。\n"
+        "如果无法支撑改分、改风险或推进动作，应该保持 no_change / no_action，并建议人工复核。\n"
+        f"当前审核模式：{mode}。\n"
         "请严格输出 JSON，不要输出额外解释文本。\n"
         "输出 JSON 必须满足以下 schema：\n"
         f"{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
@@ -794,6 +851,15 @@ def _empty_ai_review_output(reason: str = "AI reviewer disabled") -> dict[str, A
         "score_adjustments": [],
         "risk_adjustment": {},
         "recommended_action": "no_action",
+        "recommended_action_detail": {
+            "reason": reason,
+            "support_status": "missing_evidence",
+            "supporting_evidence_ids": [],
+            "opposing_evidence_ids": [],
+            "grounded_confidence": 0.0,
+            "needs_manual_check": True,
+        },
+        "abstain_reasons": [reason] if reason else [],
         "meta": {
             "source": "stub",
             "reason": reason,
@@ -955,6 +1021,201 @@ def _attach_runtime_meta(result: dict[str, Any], latency_ms: int, *, prompt_vers
     return result
 
 
+def _normalize_support_status(value: Any, default: str = "missing_evidence") -> str:
+    clean = str(value or "").strip().lower()
+    return clean if clean in ALLOWED_SUPPORT_STATUS else default
+
+
+def _normalize_evidence_ids(items: Any) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    normalized: list[str] = []
+    for item in items:
+        clean = str(item or "").strip()
+        if clean and clean not in normalized:
+            normalized.append(clean)
+    return normalized
+
+
+def _normalize_grounded_annotation(item: dict[str, Any], *, default_status: str = "missing_evidence") -> dict[str, Any]:
+    grounded_confidence = item.get("grounded_confidence", 0.0)
+    try:
+        grounded_confidence_value = max(0.0, min(1.0, float(grounded_confidence or 0.0)))
+    except (TypeError, ValueError):
+        grounded_confidence_value = 0.0
+    return {
+        "support_status": _normalize_support_status(item.get("support_status"), default=default_status),
+        "supporting_evidence_ids": _normalize_evidence_ids(item.get("supporting_evidence_ids")),
+        "opposing_evidence_ids": _normalize_evidence_ids(item.get("opposing_evidence_ids")),
+        "grounded_confidence": grounded_confidence_value,
+        "needs_manual_check": bool(item.get("needs_manual_check", False)),
+    }
+
+
+def _collect_evidence_catalog(analysis_payload: dict[str, Any] | None, evidence_snippets: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    catalog: dict[str, dict[str, Any]] = {}
+    analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
+    trace_items = analysis.get("evidence_trace") if isinstance(analysis.get("evidence_trace"), list) else []
+    for index, item in enumerate(trace_items):
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("evidence_id") or "").strip() or f"trace_{index + 1}"
+        catalog[evidence_id] = dict(item)
+    for index, item in enumerate(evidence_snippets or []):
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("evidence_id") or "").strip() or f"snippet_{index + 1}"
+        catalog.setdefault(
+            evidence_id,
+            {
+                "evidence_id": evidence_id,
+                "source": str(item.get("source") or "snippet"),
+                "text": str(item.get("text") or ""),
+                "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],
+            },
+        )
+    return catalog
+
+
+def _sanitize_grounded_item(
+    item: dict[str, Any],
+    *,
+    catalog: dict[str, dict[str, Any]],
+    suggestion_kind: str,
+) -> dict[str, Any] | None:
+    annotation = _normalize_grounded_annotation(item)
+    supporting_ids = [evidence_id for evidence_id in annotation["supporting_evidence_ids"] if evidence_id in catalog]
+    opposing_ids = [evidence_id for evidence_id in annotation["opposing_evidence_ids"] if evidence_id in catalog]
+    support_status = annotation["support_status"]
+    needs_manual_check = bool(annotation["needs_manual_check"])
+
+    if not supporting_ids and support_status not in {"contradicted", "missing_evidence"}:
+        support_status = "missing_evidence"
+        needs_manual_check = True
+    if opposing_ids and support_status == "supported":
+        support_status = "contradicted"
+        needs_manual_check = True
+
+    sanitized = dict(item)
+    sanitized["support_status"] = support_status
+    sanitized["supporting_evidence_ids"] = supporting_ids
+    sanitized["opposing_evidence_ids"] = opposing_ids
+    sanitized["grounded_confidence"] = annotation["grounded_confidence"]
+    sanitized["needs_manual_check"] = needs_manual_check
+
+    if suggestion_kind == "score_adjustment" and support_status in {"contradicted", "missing_evidence"}:
+        sanitized["suggested_delta"] = 0
+    if suggestion_kind == "risk_adjustment" and support_status in {"contradicted", "missing_evidence"}:
+        sanitized.pop("suggested_risk_level", None)
+    if suggestion_kind == "timeline_update" and support_status in {"contradicted", "missing_evidence"}:
+        return None
+    if suggestion_kind == "evidence_update" and support_status in {"contradicted", "missing_evidence"}:
+        return None
+
+    return sanitized
+
+
+def _validate_grounded_output(
+    output: dict[str, Any],
+    *,
+    analysis_payload: dict[str, Any] | None,
+    evidence_snippets: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
+    analysis_mode = str(analysis.get("analysis_mode") or "normal")
+    abstain_reasons = [str(item).strip() for item in (output.get("abstain_reasons") or []) if str(item).strip()]
+    catalog = _collect_evidence_catalog(analysis, evidence_snippets)
+
+    if analysis_mode == "manual_first":
+        if "manual_first" not in abstain_reasons:
+            abstain_reasons.append("manual_first")
+        output["review_summary"] = "当前 OCR / 解析质量偏弱，建议人工优先复核，AI 仅保留保守提示。"
+        output["evidence_updates"] = []
+        output["timeline_updates"] = []
+        output["score_adjustments"] = []
+        output["risk_adjustment"] = {
+            "reason": "当前为 manual_first 模式，不建议自动给出积极改分或风险结论。",
+            "support_status": "missing_evidence",
+            "supporting_evidence_ids": [],
+            "opposing_evidence_ids": [],
+            "grounded_confidence": 0.0,
+            "needs_manual_check": True,
+        }
+        output["recommended_action"] = "manual_review"
+        output["recommended_action_detail"] = {
+            "reason": "当前为 manual_first 模式，建议人工优先复核。",
+            "support_status": "missing_evidence",
+            "supporting_evidence_ids": [],
+            "opposing_evidence_ids": [],
+            "grounded_confidence": 0.0,
+            "needs_manual_check": True,
+        }
+        output["abstain_reasons"] = abstain_reasons
+        return output
+
+    output["evidence_updates"] = [
+        item
+        for item in (
+            _sanitize_grounded_item(item, catalog=catalog, suggestion_kind="evidence_update")
+            for item in (output.get("evidence_updates") or [])
+            if isinstance(item, dict)
+        )
+        if item
+    ]
+    output["timeline_updates"] = [
+        item
+        for item in (
+            _sanitize_grounded_item(item, catalog=catalog, suggestion_kind="timeline_update")
+            for item in (output.get("timeline_updates") or [])
+            if isinstance(item, dict)
+        )
+        if item
+    ]
+    output["score_adjustments"] = [
+        _sanitize_grounded_item(item, catalog=catalog, suggestion_kind="score_adjustment")
+        for item in (output.get("score_adjustments") or [])
+        if isinstance(item, dict)
+    ]
+    output["score_adjustments"] = [item for item in output["score_adjustments"] if item]
+
+    risk_adjustment = output.get("risk_adjustment") if isinstance(output.get("risk_adjustment"), dict) else {}
+    output["risk_adjustment"] = _sanitize_grounded_item(risk_adjustment, catalog=catalog, suggestion_kind="risk_adjustment") or {
+        "reason": "",
+        "support_status": "missing_evidence",
+        "supporting_evidence_ids": [],
+        "opposing_evidence_ids": [],
+        "grounded_confidence": 0.0,
+        "needs_manual_check": True,
+    }
+
+    action_detail = output.get("recommended_action_detail") if isinstance(output.get("recommended_action_detail"), dict) else {}
+    output["recommended_action_detail"] = _sanitize_grounded_item(
+        action_detail,
+        catalog=catalog,
+        suggestion_kind="recommended_action",
+    ) or {
+        "reason": "缺少足够证据支撑推荐动作。",
+        "support_status": "missing_evidence",
+        "supporting_evidence_ids": [],
+        "opposing_evidence_ids": [],
+        "grounded_confidence": 0.0,
+        "needs_manual_check": True,
+    }
+    if output["recommended_action_detail"]["support_status"] in {"contradicted", "missing_evidence"}:
+        output["recommended_action"] = "manual_review" if output.get("recommended_action") != "no_action" else "no_action"
+        if output["recommended_action_detail"]["support_status"] == "contradicted" and "counter_evidence_present" not in abstain_reasons:
+            abstain_reasons.append("counter_evidence_present")
+        if output["recommended_action_detail"]["support_status"] == "missing_evidence" and "missing_evidence" not in abstain_reasons:
+            abstain_reasons.append("missing_evidence")
+
+    if not output["evidence_updates"] and not output["timeline_updates"] and not output["score_adjustments"]:
+        if "no_grounded_change" not in abstain_reasons:
+            abstain_reasons.append("no_grounded_change")
+
+    output["abstain_reasons"] = abstain_reasons
+    return output
+
+
 def _normalize_success_output(
     raw_output: dict[str, Any],
     ai_cfg: dict[str, Any],
@@ -963,6 +1224,8 @@ def _normalize_success_output(
     source: str,
     reason: str,
     request_id: str = "",
+    analysis_payload: dict[str, Any] | None = None,
+    evidence_snippets: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(raw_output, dict):
         raise ValueError("AI reviewer response is not an object")
@@ -985,7 +1248,14 @@ def _normalize_success_output(
         note = item.get("note", "")
         if note is not None and not isinstance(note, str):
             raise ValueError("evidence_updates.note must be a string")
-        evidence_updates.append({"source": source_name, "text": text, "note": str(note or "")})
+        evidence_updates.append(
+            {
+                "source": source_name,
+                "text": text,
+                "note": str(note or ""),
+                **_normalize_grounded_annotation(item),
+            }
+        )
 
     timeline_updates_raw = raw_output.get("timeline_updates")
     if not isinstance(timeline_updates_raw, list):
@@ -1001,7 +1271,14 @@ def _normalize_success_output(
         note = item.get("note", "")
         if note is not None and not isinstance(note, str):
             raise ValueError("timeline_updates.note must be a string")
-        timeline_updates.append({"label": label, "value": value, "note": str(note or "")})
+        timeline_updates.append(
+            {
+                "label": label,
+                "value": value,
+                "note": str(note or ""),
+                **_normalize_grounded_annotation(item),
+            }
+        )
 
     limit_cfg = ai_cfg.get("score_adjustment_limit") or {}
     default_max_delta = int(limit_cfg.get("max_delta_per_dimension", 1) or 1)
@@ -1026,6 +1303,7 @@ def _normalize_success_output(
                 "suggested_delta": suggested_delta,
                 "max_delta": max_delta,
                 "reason": reason_text,
+                **_normalize_grounded_annotation(item),
             }
         )
 
@@ -1043,13 +1321,30 @@ def _normalize_success_output(
         risk_adjustment = {
             "suggested_risk_level": risk_level,
             "reason": str(risk_reason or ""),
+            **_normalize_grounded_annotation(risk_adjustment_raw),
+        }
+    else:
+        risk_adjustment = {
+            "reason": "",
+            **_normalize_grounded_annotation({}, default_status="missing_evidence"),
         }
 
     recommended_action = raw_output.get("recommended_action")
     if not isinstance(recommended_action, str) or recommended_action not in ALLOWED_ACTIONS:
         raise ValueError("recommended_action is invalid")
+    recommended_action_detail_raw = raw_output.get("recommended_action_detail")
+    if not isinstance(recommended_action_detail_raw, dict):
+        raise ValueError("recommended_action_detail must be an object")
+    recommended_action_detail = {
+        "reason": str(recommended_action_detail_raw.get("reason") or ""),
+        **_normalize_grounded_annotation(recommended_action_detail_raw),
+    }
+    abstain_reasons_raw = raw_output.get("abstain_reasons")
+    if not isinstance(abstain_reasons_raw, list):
+        raise ValueError("abstain_reasons must be a list")
+    abstain_reasons = [str(item).strip() for item in abstain_reasons_raw if str(item).strip()]
 
-    return {
+    normalized = {
         "enabled": True,
         "mode": ai_cfg.get("ai_reviewer_mode", "suggest_only"),
         "review_summary": review_summary,
@@ -1058,6 +1353,8 @@ def _normalize_success_output(
         "score_adjustments": score_adjustments,
         "risk_adjustment": risk_adjustment,
         "recommended_action": recommended_action,
+        "recommended_action_detail": recommended_action_detail,
+        "abstain_reasons": abstain_reasons,
         "meta": {
             "source": source,
             "reason": reason,
@@ -1075,6 +1372,11 @@ def _normalize_success_output(
             "request_id": request_id,
         },
     }
+    return _validate_grounded_output(
+        normalized,
+        analysis_payload=analysis_payload,
+        evidence_snippets=evidence_snippets,
+    )
 
 
 def _call_openai_reviewer_api(
@@ -1107,9 +1409,15 @@ def _build_stub_ai_review_output(
     evidence_snippets: list[dict[str, Any]] | None,
     prompt_preview: str,
     reason: str,
+    analysis_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     caps = ai_cfg.get("capabilities") or {}
     limit_cfg = ai_cfg.get("score_adjustment_limit") or {}
+    analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
+    catalog = _collect_evidence_catalog(analysis, evidence_snippets)
+    positive_ids = list(catalog.keys())[:2]
+    has_support = bool(positive_ids)
+    abstain_reasons = [str(item).strip() for item in (analysis.get("abstain_reasons") or []) if str(item).strip()]
 
     name = str(parsed_resume.get("name") or "候选人").strip() or "候选人"
     result_text = str(screening_result.get("screening_result") or "")
@@ -1127,25 +1435,49 @@ def _build_stub_ai_review_output(
         review_summary = (
             f"AI二次审阅（{ai_cfg.get('ai_reviewer_mode')}）："
             f"{name} 当前规则结论为「{result_text or '未知'}」，"
-            f"风险等级 {risk_level}，建议动作：{action}。"
+            f"风险等级 {risk_level}。"
         )
+        if not has_support:
+            review_summary += " 当前缺少足够证据支撑新增建议，默认保守输出并建议人工复核。"
 
-    evidence_updates: list[dict[str, str]] = []
-    if caps.get("add_evidence_snippets", False):
+    evidence_updates: list[dict[str, Any]] = []
+    if caps.get("add_evidence_snippets", False) and has_support:
         for item in (evidence_snippets or [])[:2]:
             source_name = str(item.get("source") or "未知来源")
             text = str(item.get("text") or "").strip()
             if text:
-                evidence_updates.append({"source": source_name, "text": text, "note": "AI建议补充引用"})
+                evidence_updates.append(
+                    {
+                        "source": source_name,
+                        "text": text,
+                        "note": "AI建议补充引用",
+                        "support_status": "supported",
+                        "supporting_evidence_ids": positive_ids[:1],
+                        "opposing_evidence_ids": [],
+                        "grounded_confidence": 0.72,
+                        "needs_manual_check": True,
+                    }
+                )
 
-    timeline_updates: list[dict[str, str]] = []
-    if caps.get("organize_timeline", False):
+    timeline_updates: list[dict[str, Any]] = []
+    if caps.get("organize_timeline", False) and has_support:
         graduation_date = str(parsed_resume.get("graduation_date") or "").strip()
         if graduation_date:
-            timeline_updates.append({"label": "毕业时间", "value": graduation_date, "note": ""})
+            timeline_updates.append(
+                {
+                    "label": "毕业时间",
+                    "value": graduation_date,
+                    "note": "",
+                    "support_status": "weakly_supported",
+                    "supporting_evidence_ids": positive_ids[:1],
+                    "opposing_evidence_ids": [],
+                    "grounded_confidence": 0.58,
+                    "needs_manual_check": True,
+                }
+            )
 
     score_adjustments: list[dict[str, Any]] = []
-    if caps.get("suggest_score_adjustment", False):
+    if caps.get("suggest_score_adjustment", False) and has_support:
         max_delta = int(limit_cfg.get("max_delta_per_dimension", 1) or 1)
         expression_score = (score_details.get("表达完整度") or {}).get("score")
         try:
@@ -1159,15 +1491,45 @@ def _build_stub_ai_review_output(
                     "suggested_delta": min(1, max_delta),
                     "max_delta": max_delta,
                     "reason": "检测到可补充证据片段，建议人工确认后小幅上调表达完整度。",
+                    "support_status": "weakly_supported",
+                    "supporting_evidence_ids": positive_ids,
+                    "opposing_evidence_ids": [],
+                    "grounded_confidence": 0.56,
+                    "needs_manual_check": True,
                 }
             )
 
-    risk_adjustment: dict[str, str] = {}
-    if caps.get("suggest_risk_adjustment", False):
+    risk_adjustment: dict[str, Any] = {
+        "reason": "当前为结构化 stub fallback，仅保留保守建议。",
+        "support_status": "missing_evidence" if not has_support else "weakly_supported",
+        "supporting_evidence_ids": positive_ids[:1] if has_support else [],
+        "opposing_evidence_ids": [],
+        "grounded_confidence": 0.35 if has_support else 0.0,
+        "needs_manual_check": True,
+    }
+    if caps.get("suggest_risk_adjustment", False) and has_support:
         risk_adjustment = {
             "suggested_risk_level": risk_level if risk_level in ALLOWED_RISK_LEVELS else "unknown",
             "reason": "当前为 stub fallback，默认保持规则风控判断，仅提供结构化占位建议。",
+            "support_status": "weakly_supported",
+            "supporting_evidence_ids": positive_ids[:1],
+            "opposing_evidence_ids": [],
+            "grounded_confidence": 0.42,
+            "needs_manual_check": True,
         }
+
+    recommended_action_detail = {
+        "reason": "当前建议仅作为保守参考，最终仍需人工确认。",
+        "support_status": "weakly_supported" if has_support else "missing_evidence",
+        "supporting_evidence_ids": positive_ids[:1] if has_support else [],
+        "opposing_evidence_ids": [],
+        "grounded_confidence": 0.42 if has_support else 0.0,
+        "needs_manual_check": True,
+    }
+    if not has_support:
+        action = "manual_review"
+        if "missing_evidence" not in abstain_reasons:
+            abstain_reasons.append("missing_evidence")
 
     return {
         "enabled": True,
@@ -1178,6 +1540,8 @@ def _build_stub_ai_review_output(
         "score_adjustments": score_adjustments,
         "risk_adjustment": risk_adjustment,
         "recommended_action": action,
+        "recommended_action_detail": recommended_action_detail,
+        "abstain_reasons": abstain_reasons,
         "meta": {
             "source": "stub",
             "reason": reason,
@@ -1190,6 +1554,51 @@ def _build_stub_ai_review_output(
             "allow_direct_recommendation_change": bool(
                 limit_cfg.get("allow_direct_recommendation_change", False)
             ),
+            "prompt_preview": prompt_preview,
+            "schema": get_ai_reviewer_output_schema(ai_cfg.get("ai_reviewer_mode", "suggest_only")),
+        },
+    }
+
+
+def _build_manual_first_ai_review_output(
+    ai_cfg: dict[str, Any],
+    role_profile: dict[str, Any],
+    prompt_preview: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "mode": ai_cfg.get("ai_reviewer_mode", "suggest_only"),
+        "review_summary": "当前 OCR / 解析质量偏弱，建议人工优先复核，AI 不主动给出激进改分或推进建议。",
+        "evidence_updates": [],
+        "timeline_updates": [],
+        "score_adjustments": [],
+        "risk_adjustment": {
+            "reason": "manual_first 模式下，风险建议只保留人工复核提示。",
+            "support_status": "missing_evidence",
+            "supporting_evidence_ids": [],
+            "opposing_evidence_ids": [],
+            "grounded_confidence": 0.0,
+            "needs_manual_check": True,
+        },
+        "recommended_action": "manual_review",
+        "recommended_action_detail": {
+            "reason": "当前为 manual_first 模式，应优先人工复核。",
+            "support_status": "missing_evidence",
+            "supporting_evidence_ids": [],
+            "opposing_evidence_ids": [],
+            "grounded_confidence": 0.0,
+            "needs_manual_check": True,
+        },
+        "abstain_reasons": ["manual_first", reason],
+        "meta": {
+            "source": "guardrail",
+            "reason": reason,
+            "provider": ai_cfg.get("provider"),
+            "model": ai_cfg.get("model"),
+            "api_base": ai_cfg.get("api_base"),
+            "api_key_env_name": ai_cfg.get("api_key_env_name"),
+            "role_template": role_profile.get("profile_name", "通用岗位模板"),
             "prompt_preview": prompt_preview,
             "schema": get_ai_reviewer_output_schema(ai_cfg.get("ai_reviewer_mode", "suggest_only")),
         },
@@ -1275,6 +1684,7 @@ def run_ai_reviewer(
     risk_result: dict[str, Any],
     screening_result: dict[str, Any],
     evidence_snippets: list[dict[str, Any]] | None,
+    analysis_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate structured AI reviewer suggestions."""
     ai_cfg = resolve_ai_runtime_config(_normalize_ai_reviewer_config(scoring_config))
@@ -1289,6 +1699,8 @@ def run_ai_reviewer(
         )
         return output
 
+    analysis = analysis_payload if isinstance(analysis_payload, dict) else {}
+    analysis_mode = str(analysis.get("analysis_mode") or "normal")
     prompt_preview = build_ai_reviewer_prompt(
         parsed_jd=parsed_jd,
         parsed_resume=parsed_resume,
@@ -1298,7 +1710,27 @@ def run_ai_reviewer(
         risk_result=risk_result,
         screening_result=screening_result,
         evidence_snippets=evidence_snippets,
+        analysis_payload=analysis_payload,
     )
+
+    if analysis_mode == "manual_first":
+        output = _attach_runtime_meta(
+            _build_manual_first_ai_review_output(
+                ai_cfg=ai_cfg,
+                role_profile=role_profile,
+                prompt_preview=prompt_preview,
+                reason="analysis_payload manual_first gate",
+            ),
+            0,
+        )
+        _record_latest_ai_call_status(
+            purpose="ai_reviewer",
+            runtime_cfg=ai_cfg,
+            source="guardrail",
+            success=False,
+            reason="analysis_payload manual_first gate",
+        )
+        return output
 
     provider = str(ai_cfg.get("provider") or "openai").strip().lower()
     started_at = perf_counter()
@@ -1316,6 +1748,8 @@ def run_ai_reviewer(
                     source="api",
                     reason=f"{provider} chat completions json output",
                     request_id=request_id,
+                    analysis_payload=analysis_payload,
+                    evidence_snippets=evidence_snippets,
                 ),
                 int(round((perf_counter() - started_at) * 1000)),
             )
@@ -1344,6 +1778,7 @@ def run_ai_reviewer(
             evidence_snippets=evidence_snippets,
             prompt_preview=prompt_preview,
             reason=fallback_reason,
+            analysis_payload=analysis_payload,
         ),
         int(round((perf_counter() - started_at) * 1000)),
     )

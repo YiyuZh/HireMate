@@ -79,6 +79,11 @@ def main() -> int:
     print(f"mean_grounding_recall: {summary['mean_grounding_recall']:.4f}")
     print(f"mean_counter_quality: {summary['mean_counter_quality']:.4f}")
     print(f"mean_explanation_consistency: {summary['mean_explanation_consistency']:.4f}")
+    print(f"mean_unsupported_claim_rate: {summary['mean_unsupported_claim_rate']:.4f}")
+    print(f"mean_evidence_coverage_rate: {summary['mean_evidence_coverage_rate']:.4f}")
+    print(f"mean_contradiction_handling_accuracy: {summary['mean_contradiction_handling_accuracy']:.4f}")
+    print(f"mean_abstention_quality: {summary['mean_abstention_quality']:.4f}")
+    print(f"mean_manual_first_trigger_precision: {summary['mean_manual_first_trigger_precision']:.4f}")
     print(f"mean_source_rank: {summary['mean_source_rank']:.4f}")
     print(f"mean_substring_rank: {summary['mean_substring_rank']:.4f}")
     print(f"task_distribution: {summary['task_distribution']}")
@@ -87,7 +92,9 @@ def main() -> int:
     for task, metrics in (summary.get("task_metrics") or {}).items():
         print(
             f"[task={task}] count={metrics['count']} passed={metrics['passed']} "
-            f"pass_rate={metrics['pass_rate']:.4f} mean_combined={metrics['mean_combined_score']:.4f}"
+            f"pass_rate={metrics['pass_rate']:.4f} mean_combined={metrics['mean_combined_score']:.4f} "
+            f"unsupported={metrics['mean_unsupported_claim_rate']:.4f} "
+            f"coverage={metrics['mean_evidence_coverage_rate']:.4f}"
         )
     print()
 

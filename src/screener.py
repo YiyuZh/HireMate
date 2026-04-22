@@ -999,6 +999,7 @@ def run_screening(jd_text: str, resume_text: str, risk_level: str | None = None)
         risk_result=risk_result,
         screening_result=decision_bundle,
         evidence_snippets=evidence_snippets,
+        analysis_payload={},
     )
 
     result = {
