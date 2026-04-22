@@ -21,7 +21,7 @@ export const priorityLabels = {
 export const parseStatusLabels = {
   ok: "正常识别",
   weak: "弱质量识别",
-  ocr_missing: "OCR能力缺失",
+  ocr_missing: "OCR 能力缺失",
   read_failed: "读取失败",
   unknown: "未知"
 };
@@ -107,7 +107,7 @@ export function normalizeAdminHealth(payload) {
       apiBase: payload?.latest_ai_call?.api_base || "",
       source: payload?.latest_ai_call?.source || "",
       reason: payload?.latest_ai_call?.reason || "",
-      envDetected: Boolean(payload?.latest_ai_call?.env_detected)
+      envDetected: Boolean(payload?.latest_ai_call?.env_detected || payload?.latest_ai_call?.api_key_env_detected)
     }
   };
 }
@@ -257,13 +257,25 @@ function normalizeAiReview(item) {
           needsManualCheck: Boolean(entry?.needs_manual_check)
         }))
       : [],
-    riskAdjustment: item?.risk_adjustment || {},
+    riskAdjustment: normalizeGroundedDetail(item?.risk_adjustment),
     recommendedAction: item?.recommended_action || "no_action",
-    recommendedActionDetail: item?.recommended_action_detail || {},
+    recommendedActionDetail: normalizeGroundedDetail(item?.recommended_action_detail),
     abstainReasons: Array.isArray(item?.abstain_reasons) ? item.abstain_reasons : [],
     interviewQuestions: Array.isArray(item?.interview_questions) ? item.interview_questions : [],
     focusPoints: Array.isArray(item?.focus_points) ? item.focus_points : [],
     appliedActions: Array.isArray(item?.applied_actions) ? item.applied_actions : []
+  };
+}
+
+function normalizeGroundedDetail(item) {
+  return {
+    reason: item?.reason || "",
+    supportStatus: item?.support_status || "",
+    supportingEvidenceIds: Array.isArray(item?.supporting_evidence_ids) ? item.supporting_evidence_ids : [],
+    opposingEvidenceIds: Array.isArray(item?.opposing_evidence_ids) ? item.opposing_evidence_ids : [],
+    groundedConfidence: Number(item?.grounded_confidence || 0),
+    needsManualCheck: Boolean(item?.needs_manual_check),
+    suggestedRiskLevel: item?.suggested_risk_level || ""
   };
 }
 

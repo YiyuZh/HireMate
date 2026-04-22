@@ -49,6 +49,28 @@ class RuntimeConnectionRequest(BaseModel):
     purpose: str = "generic"
 
 
+class RuntimeConnectionResponse(BaseModel):
+    provider: str = ""
+    model: str = ""
+    api_base: str = ""
+    api_key_env_name: str = "-"
+    api_key_mode: str = "env_name"
+    api_key_mode_label: str = ""
+    api_key_present: bool = False
+    api_key_env_detected: bool = False
+    success: bool = False
+    reason: str = ""
+    message: str = ""
+    request_id: str = ""
+    purpose: str = "generic"
+    phase: str = "local_validation"
+    category: str = "unknown"
+    source: str = "validation"
+    validation_ms: int = 0
+    network_ms: int = 0
+    latency_ms: int = 0
+
+
 class ManualNoteRequest(BaseModel):
     note: str = ""
 

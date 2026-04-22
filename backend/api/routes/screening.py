@@ -4,7 +4,13 @@ import json
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
-from backend.api.schemas import BatchCreateResponse, BatchSummaryResponse, PrecheckItemResponse, RuntimeConnectionRequest
+from backend.api.schemas import (
+    BatchCreateResponse,
+    BatchSummaryResponse,
+    PrecheckItemResponse,
+    RuntimeConnectionRequest,
+    RuntimeConnectionResponse,
+)
 from backend.api.viewmodels import build_batch_create_response, build_batch_summary, build_precheck_item
 from backend.core.deps import get_current_user, verify_csrf
 from backend.services import screening_service
@@ -30,7 +36,7 @@ async def screening_precheck(
     return [build_precheck_item(item) for item in screening_service.preview_files(uploads)]
 
 
-@router.post("/screening/ai/test-connection", dependencies=[Depends(verify_csrf)])
+@router.post("/screening/ai/test-connection", dependencies=[Depends(verify_csrf)], response_model=RuntimeConnectionResponse)
 def screening_ai_test_connection(payload: RuntimeConnectionRequest, user: dict = Depends(get_current_user)) -> dict:
     return test_runtime_connection(payload.runtime_config, purpose=payload.purpose or "batch_runtime")
 
@@ -76,7 +82,7 @@ def delete_batch(batch_id: str, user: dict = Depends(get_current_user)) -> dict[
     return {"ok": True}
 
 
-@router.post("/batches/{batch_id}/ai/test-connection", dependencies=[Depends(verify_csrf)])
+@router.post("/batches/{batch_id}/ai/test-connection", dependencies=[Depends(verify_csrf)], response_model=RuntimeConnectionResponse)
 def batch_ai_test_connection(
     batch_id: str,
     payload: RuntimeConnectionRequest,

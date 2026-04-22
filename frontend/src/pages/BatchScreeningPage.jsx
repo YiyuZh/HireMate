@@ -36,6 +36,7 @@ export default function BatchScreeningPage() {
   const [runtime, setRuntime] = useState(initialRuntime);
   const [files, setFiles] = useState([]);
   const [banner, setBanner] = useState(null);
+  const [connectionStage, setConnectionStage] = useState("idle");
 
   const jobsQuery = useQuery({
     queryKey: ["jobs"],
@@ -59,7 +60,7 @@ export default function BatchScreeningPage() {
       setBanner({
         tone: "error",
         title: "提取预检失败",
-        detail: error.message || "请检查文件后重试。"
+        detail: error.message || "请检查文件内容后重试。"
       });
     }
   });
@@ -70,11 +71,18 @@ export default function BatchScreeningPage() {
         runtime_config: runtime,
         purpose: "batch_runtime"
       }),
+    onSuccess: (payload) => {
+      setBanner({
+        tone: payload?.success ? "success" : "warning",
+        title: payload?.success ? "AI 连接测试通过" : "AI 连接测试未通过",
+        detail: payload?.reason || payload?.message || "请检查当前 API 配置。"
+      });
+    },
     onError: (error) => {
       setBanner({
         tone: "error",
         title: "AI 连接测试失败",
-        detail: error.message || "请检查 API 配置。"
+        detail: error.message || "请检查当前 API 配置。"
       });
     }
   });
@@ -97,15 +105,13 @@ export default function BatchScreeningPage() {
         title: "批量初筛已创建",
         detail: batchId ? `批次 ${batchId} 已创建，正在进入候选人工作台。` : "正在进入候选人工作台。"
       });
-      navigate(
-        `/workbench?batch_id=${encodeURIComponent(batchId || "")}&jd_title=${encodeURIComponent(selectedJob)}`
-      );
+      navigate(`/workbench?batch_id=${encodeURIComponent(batchId || "")}&jd_title=${encodeURIComponent(selectedJob)}`);
     },
     onError: (error) => {
       setBanner({
         tone: "error",
         title: "批量初筛创建失败",
-        detail: error.message || "请先处理弱质量文件或调整当前批次配置。"
+        detail: error.message || "请先处理弱质量文件或调整本批次配置。"
       });
     }
   });
@@ -126,17 +132,25 @@ export default function BatchScreeningPage() {
       ...prev,
       enable_ai_reviewer: Boolean(defaults.enableAiReviewer),
       provider: defaults.provider || prev.provider || "openai",
-      model:
-        defaults.model ||
-        MODEL_PRESETS[defaults.provider || prev.provider || "openai"]?.[0] ||
-        prev.model,
+      model: defaults.model || MODEL_PRESETS[defaults.provider || prev.provider || "openai"]?.[0] || prev.model,
       api_base: defaults.apiBase || defaultApiBase(defaults.provider || prev.provider || "openai")
     }));
   }, [detailQuery.data?.title]);
 
-  const currentJob = useMemo(() => {
-    return jobsQuery.data?.find((item) => item.title === selectedJob) || null;
-  }, [jobsQuery.data, selectedJob]);
+  useEffect(() => {
+    if (!connectionMutation.isPending) {
+      setConnectionStage("idle");
+      return undefined;
+    }
+    setConnectionStage("validating");
+    const timer = setTimeout(() => setConnectionStage("network"), 700);
+    return () => clearTimeout(timer);
+  }, [connectionMutation.isPending]);
+
+  const currentJob = useMemo(
+    () => jobsQuery.data?.find((item) => item.title === selectedJob) || null,
+    [jobsQuery.data, selectedJob]
+  );
 
   const modelPresets = MODEL_PRESETS[runtime.provider] || [];
   const precheckItems = precheckMutation.data || [];
@@ -154,12 +168,20 @@ export default function BatchScreeningPage() {
     setRuntime((prev) => ({ ...prev, model: value }));
   }
 
+  const connectionTone = connectionMutation.isPending
+    ? "warning"
+    : connectionResult?.success
+      ? "success"
+      : connectionResult
+        ? "error"
+        : "neutral";
+
   return (
     <AppShell
       user={session.data}
       eyebrow="Batch Screening"
       title="批量初筛"
-      subtitle="从岗位默认配置出发，完成本批次 AI reviewer 设置、文件预检和批次创建。"
+      subtitle="在进入候选人工作台前，先完成岗位确认、AI reviewer 运行配置、文件预检和批次创建。"
     >
       <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <section className="space-y-6 rounded-[24px] bg-surface-container-lowest p-8 shadow-ambient">
@@ -167,17 +189,13 @@ export default function BatchScreeningPage() {
 
           <SectionHeader
             eyebrow="Batch Setup"
-            title="本批次配置"
-            description="运行期开关在批量初筛页完成设置，创建批次后会写入批次 metadata，并在候选人工作台继承。"
+            title="本批次运行配置"
+            description="JD 页面只保留默认配置；这里才是本批次真正生效的 AI reviewer 设置。创建批次后，工作台会继承这一组运行参数。"
           />
 
           <div className="grid gap-5 md:grid-cols-2">
             <Field label="目标岗位">
-              <select
-                value={selectedJob}
-                onChange={(event) => setSelectedJob(event.target.value)}
-                className="input-shell"
-              >
+              <select value={selectedJob} onChange={(event) => setSelectedJob(event.target.value)} className="input-shell">
                 <option value="">请选择岗位</option>
                 {(jobsQuery.data || []).map((job) => (
                   <option key={job.title} value={job.title}>
@@ -211,11 +229,7 @@ export default function BatchScreeningPage() {
             </Field>
 
             <Field label="模型预设">
-              <select
-                value=""
-                onChange={(event) => applyModelPreset(event.target.value)}
-                className="input-shell"
-              >
+              <select value="" onChange={(event) => applyModelPreset(event.target.value)} className="input-shell">
                 <option value="">选择预设模型</option>
                 {modelPresets.map((item) => (
                   <option key={item} value={item}>
@@ -230,7 +244,7 @@ export default function BatchScreeningPage() {
                 value={runtime.model}
                 onChange={(event) => updateRuntime("model", event.target.value)}
                 className="input-shell"
-                placeholder="支持自定义模型名"
+                placeholder="支持自定义模型名称"
               />
             </Field>
 
@@ -262,7 +276,7 @@ export default function BatchScreeningPage() {
                 value={runtime.api_key_value}
                 onChange={(event) => updateRuntime("api_key_value", event.target.value)}
                 className="input-shell"
-                placeholder="仅用于当前批次联调，不会写回明文"
+                placeholder="只用于当前批次联调，不会写回明文"
               />
             </Field>
           ) : (
@@ -279,13 +293,13 @@ export default function BatchScreeningPage() {
           <div className="grid gap-3 md:grid-cols-2">
             <ToggleCard
               label="启用 AI reviewer"
-              description="保持建议层，不会自动替代人工最终结论。"
+              description="AI reviewer 仍然只给建议，不会直接替代人工最终结论。"
               checked={runtime.enable_ai_reviewer}
               onChange={(checked) => updateRuntime("enable_ai_reviewer", checked)}
             />
             <ToggleCard
               label="新批次自动生成 AI 建议"
-              description="创建批次后即尝试生成建议，失败会安全退化。"
+              description="创建批次后立即尝试生成建议；失败会安全退化，不阻塞主流程。"
               checked={runtime.auto_generate_for_new_batch}
               onChange={(checked) => updateRuntime("auto_generate_for_new_batch", checked)}
             />
@@ -324,7 +338,11 @@ export default function BatchScreeningPage() {
                 disabled={connectionMutation.isPending}
                 className="rounded-2xl bg-surface-container-high px-4 py-3 text-sm font-semibold text-primary disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {connectionMutation.isPending ? "正在测试..." : "测试 AI 连接"}
+                {connectionMutation.isPending
+                  ? connectionStage === "network"
+                    ? "正在连接上游..."
+                    : "正在校验配置..."
+                  : "测试 AI 连接"}
               </button>
               <button
                 onClick={() => createMutation.mutate()}
@@ -356,7 +374,10 @@ export default function BatchScreeningPage() {
 
           <Panel title="预检结果">
             {!precheckItems.length ? (
-              <EmptyState title="还没有预检结果" description="上传简历后点击“运行提取预检”，先确认哪些文件可以稳定进入批量初筛。" />
+              <EmptyState
+                title="还没有预检结果"
+                description="上传简历后点击“运行提取预检”，先确认哪些文件可以稳定进入批量初筛。"
+              />
             ) : (
               <div className="space-y-3">
                 {precheckItems.map((item) => (
@@ -380,16 +401,41 @@ export default function BatchScreeningPage() {
           </Panel>
 
           <Panel title="AI 连接测试">
-            {!connectionResult ? (
-              <EmptyState title="还没有连接测试结果" description="点击“测试 AI 连接”后，这里会显示 provider、model、api_base 和失败原因。" />
+            {connectionMutation.isPending ? (
+              <ConnectionProbeState stage={connectionStage} />
+            ) : !connectionResult ? (
+              <EmptyState
+                title="还没有连接测试结果"
+                description="点击“测试 AI 连接”后，这里会展示本地校验结果、远程探测耗时以及失败原因。"
+              />
             ) : (
-              <div className="space-y-3 text-sm text-on-surface-variant">
-                <InfoRow label="provider" value={connectionResult.provider || runtime.provider} />
-                <InfoRow label="model" value={connectionResult.model || runtime.model} />
-                <InfoRow label="api_base" value={connectionResult.api_base || runtime.api_base || "-"} />
-                <InfoRow label="source" value={connectionResult.source || "-"} />
-                <InfoRow label="结果" value={connectionResult.ok || connectionResult.success ? "成功" : "失败"} />
-                <InfoRow label="原因" value={connectionResult.reason || connectionResult.message || "-"} />
+              <div className="space-y-4">
+                <StatusPill tone={connectionTone}>
+                  {connectionResult.success ? "连接成功" : connectionCategoryLabel(connectionResult.category)}
+                </StatusPill>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <InfoRow label="provider" value={connectionResult.provider || runtime.provider} />
+                  <InfoRow label="model" value={connectionResult.model || runtime.model} />
+                  <InfoRow label="api_base" value={connectionResult.api_base || runtime.api_base || "-"} />
+                  <InfoRow label="阶段" value={connectionPhaseLabel(connectionResult.phase)} />
+                  <InfoRow label="来源" value={connectionResult.source || "-"} />
+                  <InfoRow
+                    label="key 状态"
+                    value={connectionResult.api_key_present ? "已检测到" : "未检测到"}
+                  />
+                  <InfoRow label="本地校验耗时" value={formatMs(connectionResult.validation_ms)} />
+                  <InfoRow label="远程探测耗时" value={formatMs(connectionResult.network_ms)} />
+                  <InfoRow label="总耗时" value={formatMs(connectionResult.latency_ms)} />
+                  <InfoRow label="模式" value={connectionResult.api_key_mode_label || connectionResult.api_key_mode || "-"} />
+                </div>
+
+                <div className="rounded-[18px] bg-surface-container-low p-4 text-sm text-on-surface-variant">
+                  <div className="font-semibold text-on-surface">结果说明</div>
+                  <div className="mt-2 leading-7">
+                    {connectionResult.reason || connectionResult.message || "未返回额外说明"}
+                  </div>
+                </div>
               </div>
             )}
           </Panel>
@@ -402,7 +448,10 @@ export default function BatchScreeningPage() {
                 <InfoRow label="batch_id" value={currentBatchHint.batchId} />
                 <InfoRow label="created_at" value={currentBatchHint.createdAt || "-"} />
                 <InfoRow label="总文件数" value={currentBatchHint.totalResumes} />
-                <InfoRow label="通过 / 待复核 / 淘汰" value={`${currentBatchHint.passCount} / ${currentBatchHint.reviewCount} / ${currentBatchHint.rejectCount}`} />
+                <InfoRow
+                  label="通过 / 待复核 / 淘汰"
+                  value={`${currentBatchHint.passCount} / ${currentBatchHint.reviewCount} / ${currentBatchHint.rejectCount}`}
+                />
               </div>
             )}
           </Panel>
@@ -417,6 +466,33 @@ function defaultApiBase(provider) {
     return "https://api.deepseek.com/v1";
   }
   return "";
+}
+
+function formatMs(value) {
+  const num = Number(value || 0);
+  return num > 0 ? `${num} ms` : "-";
+}
+
+function connectionPhaseLabel(phase) {
+  if (phase === "network_probe") {
+    return "远程探测";
+  }
+  return "本地校验";
+}
+
+function connectionCategoryLabel(category) {
+  const labels = {
+    success: "连接成功",
+    config_error: "配置错误",
+    network_timeout: "网络超时",
+    network_error: "网络异常",
+    upstream_rejected: "上游拒绝",
+    auth_error: "鉴权失败",
+    unsupported_provider: "Provider 未实现",
+    mock: "Mock 模式",
+    unknown: "连接失败"
+  };
+  return labels[category] || category || "连接失败";
 }
 
 function Banner({ tone, title, detail }) {
@@ -501,6 +577,27 @@ function InfoRow({ label, value }) {
 
 function StatusPill({ tone, children }) {
   const toneClass =
-    tone === "success" ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700";
+    tone === "success"
+      ? "bg-emerald-50 text-emerald-700"
+      : tone === "error"
+        ? "bg-rose-50 text-rose-700"
+        : tone === "warning"
+          ? "bg-amber-50 text-amber-700"
+          : "bg-surface-container-low text-on-surface";
   return <span className={`rounded-full px-3 py-1 text-xs font-semibold ${toneClass}`}>{children}</span>;
+}
+
+function ConnectionProbeState({ stage }) {
+  return (
+    <div className="rounded-[20px] bg-surface-container-low p-5 text-sm text-on-surface-variant">
+      <div className="font-semibold text-on-surface">
+        {stage === "network" ? "正在连接上游服务" : "正在校验本地配置"}
+      </div>
+      <div className="mt-2 leading-7">
+        {stage === "network"
+          ? "本地校验已通过，正在发起轻量远程探测。若此阶段较慢，通常是 api_base、网络、DNS、TLS 或上游响应引起。"
+          : "系统会先检查 provider、api_base 与 API key 是否可用；如果本地配置有问题，会在这一阶段直接快速返回。"}
+      </div>
+    </div>
+  );
 }

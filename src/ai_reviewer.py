@@ -27,6 +27,7 @@ OPENAI_JSON_OBJECT_PROVIDERS = {"deepseek"}
 API_BASE_REQUIRED_PROVIDERS = {"openai_compatible"}
 MOCK_PROVIDERS = {"mock"}
 AI_API_KEY_MODES = {"direct_input", "env_name"}
+AI_CONNECTION_TEST_TIMEOUT_SECONDS = 8
 ENV_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _LATEST_AI_CALL_STATUS: dict[str, Any] = {}
 AI_PROVIDER_DEFAULTS = {
@@ -272,6 +273,27 @@ def _friendly_connection_error(exc: Exception, runtime_cfg: dict[str, Any], key_
     if any(token in lower for token in ["model_not_found", "unknown model", "does not exist"]):
         return "model 不存在或当前账号无权访问，请检查 model 名称。"
     return message or "请求失败，请检查 provider、api_base 和 API key 配置。"
+
+
+def _categorize_connection_reason(reason: str) -> str:
+    clean = str(reason or "").strip().lower()
+    if not clean:
+        return "unknown"
+    if "mock provider" in clean:
+        return "mock"
+    if "not implemented" in clean:
+        return "unsupported_provider"
+    if "api key 缺失" in reason or "环境变量" in reason or "api_base" in clean:
+        return "config_error"
+    if "超时" in reason or "timeout" in clean:
+        return "network_timeout"
+    if "无效" in reason or "未授权" in reason or "权限" in reason:
+        return "auth_error"
+    if "拒绝" in reason or "上游" in reason or clean.startswith("http 4") or clean.startswith("http 5"):
+        return "upstream_rejected"
+    if "无法连接" in reason or "网络" in reason or "tls" in clean or "ssl" in clean:
+        return "network_error"
+    return "unknown"
 
 
 def resolve_ai_runtime_config(ai_cfg: dict[str, Any] | None) -> dict[str, Any]:
@@ -948,6 +970,8 @@ def _call_openai_compatible_json_api(
     schema_name: str,
     json_schema: dict[str, Any] | None = None,
     prefer_structured_output: bool = False,
+    timeout_seconds: int = 25,
+    max_output_tokens: int | None = None,
 ) -> tuple[dict[str, Any], str]:
     runtime_cfg = resolve_ai_runtime_config(ai_cfg)
     provider = str(runtime_cfg.get("provider") or "openai")
@@ -968,6 +992,8 @@ def _call_openai_compatible_json_api(
         ],
         "temperature": 0,
     }
+    if max_output_tokens:
+        body["max_tokens"] = max(1, int(max_output_tokens))
     if json_schema and prefer_structured_output and _provider_supports_json_schema(provider):
         body["response_format"] = _json_schema_response_format(schema_name, json_schema)
     elif json_schema and _provider_supports_json_object(provider):
@@ -985,7 +1011,7 @@ def _call_openai_compatible_json_api(
     )
 
     try:
-        with urlrequest.urlopen(req, timeout=25) as response:
+        with urlrequest.urlopen(req, timeout=max(3, int(timeout_seconds or 25))) as response:
             raw_response = response.read().decode("utf-8")
     except urlerror.HTTPError as exc:
         payload = exc.read().decode("utf-8", errors="ignore")
@@ -1610,6 +1636,7 @@ def test_ai_connection(ai_cfg: dict[str, Any], *, purpose: str = "generic") -> d
     provider = str(runtime_cfg.get("provider") or "openai")
     key_details = _resolve_api_key_details(runtime_cfg)
     api_key_env_name = str(key_details.get("env_name") or "")
+    started_at = perf_counter()
     result = {
         "provider": provider,
         "model": str(runtime_cfg.get("model") or ""),
@@ -1621,37 +1648,87 @@ def test_ai_connection(ai_cfg: dict[str, Any], *, purpose: str = "generic") -> d
         "api_key_env_detected": bool(key_details.get("env_value_present")),
         "success": False,
         "reason": "",
+        "message": "",
         "request_id": "",
         "purpose": purpose,
+        "phase": "local_validation",
+        "category": "unknown",
+        "source": "validation",
+        "validation_ms": 0,
+        "network_ms": 0,
         "latency_ms": 0,
     }
 
     if provider in MOCK_PROVIDERS:
         result["success"] = True
         result["reason"] = "mock provider, skipped real network call"
+        result["message"] = result["reason"]
+        result["category"] = "mock"
+        result["source"] = "mock"
+        result["validation_ms"] = int(round((perf_counter() - started_at) * 1000))
+        result["latency_ms"] = result["validation_ms"]
+        _record_latest_ai_call_status(
+            purpose=purpose,
+            runtime_cfg=runtime_cfg,
+            source="mock",
+            success=True,
+            reason=result["reason"],
+        )
         return result
 
     if provider not in OPENAI_COMPATIBLE_PROVIDERS:
         result["reason"] = f"provider {provider} not implemented"
+        result["message"] = result["reason"]
+        result["category"] = "unsupported_provider"
+        result["validation_ms"] = int(round((perf_counter() - started_at) * 1000))
+        result["latency_ms"] = result["validation_ms"]
+        _record_latest_ai_call_status(
+            purpose=purpose,
+            runtime_cfg=runtime_cfg,
+            source="validation",
+            success=False,
+            reason=result["reason"],
+        )
         return result
 
     if provider_requires_explicit_api_base(provider) and not str(runtime_cfg.get("api_base") or "").strip():
         result["reason"] = _friendly_connection_error(RuntimeError(f"missing api_base for provider {provider}"), runtime_cfg, key_details)
+        result["message"] = result["reason"]
+        result["category"] = "config_error"
+        result["validation_ms"] = int(round((perf_counter() - started_at) * 1000))
+        result["latency_ms"] = result["validation_ms"]
+        _record_latest_ai_call_status(
+            purpose=purpose,
+            runtime_cfg=runtime_cfg,
+            source="validation",
+            success=False,
+            reason=result["reason"],
+        )
         return result
 
     if not key_details.get("key_value_present"):
         result["reason"] = _missing_api_key_reason(runtime_cfg, key_details)
+        result["message"] = result["reason"]
+        result["category"] = "config_error"
+        result["validation_ms"] = int(round((perf_counter() - started_at) * 1000))
+        result["latency_ms"] = result["validation_ms"]
+        _record_latest_ai_call_status(
+            purpose=purpose,
+            runtime_cfg=runtime_cfg,
+            source="validation",
+            success=False,
+            reason=result["reason"],
+        )
         return result
 
-    started_at = perf_counter()
+    result["validation_ms"] = int(round((perf_counter() - started_at) * 1000))
+    result["phase"] = "network_probe"
+    network_started_at = perf_counter()
     try:
         output, request_id = _call_openai_compatible_json_api(
             runtime_cfg,
-            system_prompt="Return only JSON.",
-            user_prompt=(
-                "Return a JSON object with exactly these fields: "
-                '{"status":"ok","message":"connection ok","provider_echo":"<provider>"}'
-            ),
+            system_prompt="Return only compact JSON for a connectivity probe.",
+            user_prompt='Return {"status":"ok","message":"connection ok","provider_echo":"current provider"}',
             schema_name="hiremate_ai_connection_test",
             json_schema={
                 "type": "object",
@@ -1664,14 +1741,31 @@ def test_ai_connection(ai_cfg: dict[str, Any], *, purpose: str = "generic") -> d
                 },
             },
             prefer_structured_output=_provider_supports_json_schema(provider),
+            timeout_seconds=AI_CONNECTION_TEST_TIMEOUT_SECONDS,
+            max_output_tokens=24,
         )
         result["success"] = True
         result["reason"] = str(output.get("message") or "connection ok")
+        result["message"] = result["reason"]
+        result["category"] = "success"
+        result["source"] = "api"
         result["request_id"] = request_id
     except Exception as exc:  # noqa: BLE001
         result["reason"] = _friendly_connection_error(exc, runtime_cfg, key_details)
+        result["message"] = result["reason"]
+        result["category"] = _categorize_connection_reason(result["reason"])
+        result["source"] = "api"
 
+    result["network_ms"] = int(round((perf_counter() - network_started_at) * 1000))
     result["latency_ms"] = int(round((perf_counter() - started_at) * 1000))
+    _record_latest_ai_call_status(
+        purpose=purpose,
+        runtime_cfg=runtime_cfg,
+        source=result["source"],
+        success=bool(result["success"]),
+        reason=result["reason"],
+        request_id=result["request_id"],
+    )
     return result
 
 

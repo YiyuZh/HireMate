@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM python:3.11-slim
 
 ARG APT_MIRROR_HOST=mirrors.tuna.tsinghua.edu.cn
@@ -9,13 +11,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HIREMATE_DB_PATH=/app/data/hiremate.db \
     HIREMATE_LEGACY_DATA_DIR=/app/bootstrap_data \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
     PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 
 WORKDIR /app
 
-RUN set -eux; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i "s|http://deb.debian.org/debian|https://${APT_MIRROR_HOST}/debian|g; s|http://security.debian.org/debian-security|https://${APT_MIRROR_HOST}/debian-security|g" /etc/apt/sources.list.d/debian.sources; \
     fi; \
@@ -33,9 +39,11 @@ RUN set -eux; \
 
 COPY requirements.txt /app/requirements.txt
 COPY backend/requirements.txt /app/backend-requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /app/requirements.txt \
-    && pip install --no-cache-dir -r /app/backend-requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --upgrade pip \
+    && pip install -r /app/requirements.txt \
+    && pip install -r /app/backend-requirements.txt
 
 COPY src /app/src
 COPY backend /app/backend

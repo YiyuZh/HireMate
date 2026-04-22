@@ -178,6 +178,51 @@ class ApiContractTests(unittest.TestCase):
         self.assertIn("runtime_config", data)
         self.assert_no_cjk_keys(data)
 
+    @patch("backend.api.routes.screening.test_runtime_connection")
+    def test_connection_contract(self, mock_test_runtime_connection) -> None:
+        mock_test_runtime_connection.return_value = {
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "api_base": "https://api.deepseek.com/v1",
+            "api_key_env_name": "DEEPSEEK_API_KEY",
+            "api_key_mode": "direct_input",
+            "api_key_mode_label": "直接输入 API Key",
+            "api_key_present": True,
+            "api_key_env_detected": False,
+            "success": True,
+            "reason": "connection ok",
+            "message": "connection ok",
+            "request_id": "req_1",
+            "purpose": "batch_runtime",
+            "phase": "network_probe",
+            "category": "success",
+            "source": "api",
+            "validation_ms": 12,
+            "network_ms": 320,
+            "latency_ms": 332,
+        }
+        response = self.client.post(
+            "/api/screening/ai/test-connection",
+            json={
+                "runtime_config": {
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "api_base": "https://api.deepseek.com/v1",
+                    "api_key_mode": "direct_input",
+                    "api_key_value": "sk-demo",
+                },
+                "purpose": "batch_runtime",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("phase", data)
+        self.assertIn("category", data)
+        self.assertIn("latency_ms", data)
+        self.assertIn("validation_ms", data)
+        self.assertIn("network_ms", data)
+        self.assert_no_cjk_keys(data)
+
     @patch("backend.api.routes.workbench.workbench_service.get_workbench")
     def test_workbench_contract(self, mock_get_workbench) -> None:
         mock_get_workbench.return_value = {
