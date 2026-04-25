@@ -141,3 +141,8 @@ photo.zenithy.art {
         reverse_proxy ai-interview-admin:80
     }
 }
+schedule-sync.zenithy.art {
+    import common_site
+
+    reverse_proxy schedule-sync-api:8000
+}
