@@ -74,6 +74,11 @@
     }
 }
 
+www.zenithy.art {
+    import common_site
+    redir https://zenithy.art{uri} permanent
+}
+
 blog.zenithy.art {
     import common_site
     import admin_auth_access_log

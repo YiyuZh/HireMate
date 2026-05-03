@@ -18,4 +18,12 @@
   .input-shell {
     @apply w-full rounded-2xl border-0 bg-surface-container-high px-4 py-3 text-sm outline-none ring-0 transition focus:bg-white focus:ring-2 focus:ring-primary;
   }
+
+  .icp-footer {
+    @apply flex justify-center px-6 py-5 text-xs text-on-surface-variant;
+  }
+
+  .icp-footer a {
+    @apply font-medium text-on-surface-variant transition hover:text-primary;
+  }
 }

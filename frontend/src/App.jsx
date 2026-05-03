@@ -36,61 +36,74 @@ function PlaceholderArchive() {
   );
 }
 
+function IcpFooter() {
+  return (
+    <footer className="icp-footer" aria-label="ICP备案信息">
+      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer noopener">
+        粤ICP备2026047626号
+      </a>
+    </footer>
+  );
+}
+
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<RootRedirect />} />
-      <Route path="/login" element={<LoginPage />} />
-      <Route
-        path="/jobs"
-        element={
-          <RequireAuth>
-            <JobsPage />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/jobs/:jdTitle"
-        element={
-          <RequireAuth>
-            <JobDetailPage />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/batch-screening"
-        element={
-          <RequireAuth>
-            <BatchScreeningPage />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/workbench"
-        element={
-          <RequireAuth>
-            <WorkbenchPage />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/admin/system-health"
-        element={
-          <RequireAuth>
-            <RequireAdmin>
-              <AdminSystemHealthPage />
-            </RequireAdmin>
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/archive"
-        element={
-          <RequireAuth>
-            <PlaceholderArchive />
-          </RequireAuth>
-        }
-      />
-    </Routes>
+    <>
+      <Routes>
+        <Route path="/" element={<RootRedirect />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route
+          path="/jobs"
+          element={
+            <RequireAuth>
+              <JobsPage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/jobs/:jdTitle"
+          element={
+            <RequireAuth>
+              <JobDetailPage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/batch-screening"
+          element={
+            <RequireAuth>
+              <BatchScreeningPage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/workbench"
+          element={
+            <RequireAuth>
+              <WorkbenchPage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/admin/system-health"
+          element={
+            <RequireAuth>
+              <RequireAdmin>
+                <AdminSystemHealthPage />
+              </RequireAdmin>
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/archive"
+          element={
+            <RequireAuth>
+              <PlaceholderArchive />
+            </RequireAuth>
+          }
+        />
+      </Routes>
+      <IcpFooter />
+    </>
   );
 }
