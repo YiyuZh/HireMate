@@ -138,6 +138,25 @@ photo.zenithy.art {
     }
 }
 
+healthy.zenithy.art {
+    import common_site
+    import admin_auth_access_log
+
+    @healthy_api path /api/*
+    handle @healthy_api {
+        reverse_proxy healthy-backend:8000
+    }
+
+    @healthy_h5 path /h5/*
+    handle @healthy_h5 {
+        reverse_proxy healthy-enterprise-h5:80
+    }
+
+    handle {
+        reverse_proxy healthy-opc-console:80
+    }
+}
+
 {$ADMIN_DOMAIN} {
     import common_site
     import ai_backend_routes
