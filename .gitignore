@@ -10,3 +10,5 @@ data/hiremate.db
 data/hiremate.db-shm
 data/hiremate.db-wal
 logs/
+certs/*
+!certs/.gitkeep
