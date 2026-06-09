@@ -116,6 +116,34 @@ blog.zenithy.art {
     }
 }
 
+headhunt.zenithy.art {
+    import common_site
+    import admin_auth_access_log
+
+    @headhunt_public path /health /discord/interactions /feishu/events /feishu/card-actions
+    @headhunt_internal path /ready /version /discord/commands/register /tasks* /approvals* /threads* /runs* /council* /docs* /redoc* /openapi.json
+    @headhunt_missing_admin {
+        path /ready /version /discord/commands/register /tasks* /approvals* /threads* /runs* /council* /docs* /redoc* /openapi.json
+        not header X-Internal-Admin-Key *
+    }
+
+    handle @headhunt_missing_admin {
+        respond "internal admin key required" 403
+    }
+
+    handle @headhunt_public {
+        reverse_proxy lietou-api:8000
+    }
+
+    handle @headhunt_internal {
+        reverse_proxy lietou-api:8000
+    }
+
+    handle {
+        respond "not found" 404
+    }
+}
+
 {$INTERVIEW_DOMAIN} {
     import common_site
     import ai_backend_routes
