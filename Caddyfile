@@ -202,8 +202,6 @@ schedule-sync.zenithy.art {
 ttcintern.zenithy.art {
     import common_site
 
-    tls /etc/caddy/certs/ttcintern/ttcintern.zenithy.art.crt /etc/caddy/certs/ttcintern/ttcintern.zenithy.art.key
-
     @ttcintern_backend path /api/*
     handle @ttcintern_backend {
         reverse_proxy ttcintern-backend:3001
