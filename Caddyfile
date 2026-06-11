@@ -204,7 +204,12 @@ ttcintern.zenithy.art {
 
     tls /etc/caddy/certs/ttcintern/ttcintern.zenithy.art.crt /etc/caddy/certs/ttcintern/ttcintern.zenithy.art.key
 
+    @ttcintern_backend path /api/*
+    handle @ttcintern_backend {
+        reverse_proxy ttcintern-backend:3001
+    }
+
     handle {
-        reverse_proxy host.docker.internal:3000
+        reverse_proxy ttcintern-frontend:3000
     }
 }
