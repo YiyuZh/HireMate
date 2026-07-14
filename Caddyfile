@@ -51,9 +51,9 @@
 
 (portal_api_upstream) {
     reverse_proxy portal-messages-api:8000 {
-        # Caddy overwrites this header, so clients cannot forge a direct
-        # container request into a trusted gateway request.
-        header_up -X-Portal-Gateway-Token
+        # A set operation overwrites any client-supplied value. Do not also
+        # configure a delete operation for this field: Caddy applies deletes
+        # after sets, which would remove the trusted value before proxying.
         header_up X-Portal-Gateway-Token {$PORTAL_GATEWAY_TOKEN}
     }
 }

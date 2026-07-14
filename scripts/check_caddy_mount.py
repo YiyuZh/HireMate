@@ -17,6 +17,9 @@ REQUIRED_CADDY_ENV_KEYS = (
 
 SECRET_ENV_KEYS = {"PORTAL_GATEWAY_TOKEN"}
 
+PORTAL_GATEWAY_HEADER_SET = "header_up X-Portal-Gateway-Token {$PORTAL_GATEWAY_TOKEN}"
+PORTAL_GATEWAY_HEADER_DELETE = "header_up -X-Portal-Gateway-Token"
+
 
 def _parse_dotenv(env_path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -48,6 +51,17 @@ def _is_unsafe_gateway_token(value: str | None) -> bool:
         marker in lowered
         for marker in ("replace-with", "change-me", "changeme", "example", "your-token")
     )
+
+
+def _portal_gateway_header_error(caddyfile_text: str) -> str | None:
+    if PORTAL_GATEWAY_HEADER_DELETE in caddyfile_text:
+        return (
+            "Caddyfile deletes X-Portal-Gateway-Token after setting it upstream. "
+            "Remove the header_up delete line; the set operation already overwrites client input."
+        )
+    if PORTAL_GATEWAY_HEADER_SET not in caddyfile_text:
+        return "Caddyfile does not inject PORTAL_GATEWAY_TOKEN into the Portal upstream request."
+    return None
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -106,6 +120,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("OK: Caddyfile exists and is a regular file.")
+
+    caddyfile_text = caddyfile_path.read_text(encoding="utf-8")
+    gateway_header_error = _portal_gateway_header_error(caddyfile_text)
+    if gateway_header_error:
+        print(f"ERROR: {gateway_header_error}")
+        return 1
+    print("OK: Portal gateway header is overwritten with the trusted Caddy token and is not deleted.")
     print()
     print("Caddy runtime env check:")
 
