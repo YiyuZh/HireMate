@@ -102,12 +102,36 @@ services:
     container_name: hiremate-caddy
     restart: unless-stopped
     environment:
-      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?Set CADDY_ACME_EMAIL in .env}
-      PRIMARY_DOMAIN: ${PRIMARY_DOMAIN:?Set PRIMARY_DOMAIN in .env}
-      HIREMATE_DOMAIN: ${HIREMATE_DOMAIN:?Set HIREMATE_DOMAIN in .env}
-      INTERVIEW_DOMAIN: ${INTERVIEW_DOMAIN:?Set INTERVIEW_DOMAIN in .env}
-      ADMIN_DOMAIN: ${ADMIN_DOMAIN:?Set ADMIN_DOMAIN in .env}
-      PORTAL_GATEWAY_TOKEN: ${PORTAL_GATEWAY_TOKEN:?Set PORTAL_GATEWAY_TOKEN in .env}
+      # Keep Compose lifecycle commands such as `down` and `config` usable
+      # during a configuration migration. The command below still fails the
+      # Caddy container closed before it can serve traffic with a missing value.
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:-}
+      PRIMARY_DOMAIN: ${PRIMARY_DOMAIN:-}
+      HIREMATE_DOMAIN: ${HIREMATE_DOMAIN:-}
+      INTERVIEW_DOMAIN: ${INTERVIEW_DOMAIN:-}
+      ADMIN_DOMAIN: ${ADMIN_DOMAIN:-}
+      PORTAL_GATEWAY_TOKEN: ${PORTAL_GATEWAY_TOKEN:-}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        : "$${CADDY_ACME_EMAIL:?Set CADDY_ACME_EMAIL in .env}"
+        : "$${PRIMARY_DOMAIN:?Set PRIMARY_DOMAIN in .env}"
+        : "$${HIREMATE_DOMAIN:?Set HIREMATE_DOMAIN in .env}"
+        : "$${INTERVIEW_DOMAIN:?Set INTERVIEW_DOMAIN in .env}"
+        : "$${ADMIN_DOMAIN:?Set ADMIN_DOMAIN in .env}"
+        : "$${PORTAL_GATEWAY_TOKEN:?Set PORTAL_GATEWAY_TOKEN in .env and use the same value in Portal .env}"
+        if [ "$${#PORTAL_GATEWAY_TOKEN}" -lt 32 ]; then
+          echo "PORTAL_GATEWAY_TOKEN must contain at least 32 characters" >&2
+          exit 1
+        fi
+        case "$${PORTAL_GATEWAY_TOKEN}" in
+          replace-with-*|change-me*|changeme*|*example*|*'<'*|*'>'*)
+            echo "PORTAL_GATEWAY_TOKEN is still a placeholder" >&2
+            exit 1
+            ;;
+        esac
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

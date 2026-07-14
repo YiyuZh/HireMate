@@ -61,7 +61,7 @@
 (portal_messages_api_routes) {
     @portal_messages_admin path /api/admin/messages* /api/admin/assistant* /api/admin/knowledge*
     handle @portal_messages_admin {
-        basicauth {
+        basic_auth {
             autsky6666@gmail.com $2b$12$bM/k/LvfDRXIKywrhrLmh.wEa8v8N15cluiTcQStDUjMtBNReZbYm
         }
         import portal_api_upstream
@@ -97,7 +97,7 @@ blog.zenithy.art {
     redir @legacy_blog_post / permanent
 
     @blog_admin path /admin /admin/* 
-    basicauth @blog_admin {
+    basic_auth @blog_admin {
         autsky6666@gmail.com $2b$12$bM/k/LvfDRXIKywrhrLmh.wEa8v8N15cluiTcQStDUjMtBNReZbYm
     }
     @blog_assets path /assets/* /favicon* /manifest.json
