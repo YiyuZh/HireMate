@@ -107,6 +107,7 @@ services:
       HIREMATE_DOMAIN: ${HIREMATE_DOMAIN:?Set HIREMATE_DOMAIN in .env}
       INTERVIEW_DOMAIN: ${INTERVIEW_DOMAIN:?Set INTERVIEW_DOMAIN in .env}
       ADMIN_DOMAIN: ${ADMIN_DOMAIN:?Set ADMIN_DOMAIN in .env}
+      PORTAL_GATEWAY_TOKEN: ${PORTAL_GATEWAY_TOKEN:?Set PORTAL_GATEWAY_TOKEN in .env}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

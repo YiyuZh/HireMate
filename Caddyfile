@@ -49,18 +49,27 @@
     }
 }
 
+(portal_api_upstream) {
+    reverse_proxy portal-messages-api:8000 {
+        # Caddy overwrites this header, so clients cannot forge a direct
+        # container request into a trusted gateway request.
+        header_up -X-Portal-Gateway-Token
+        header_up X-Portal-Gateway-Token {$PORTAL_GATEWAY_TOKEN}
+    }
+}
+
 (portal_messages_api_routes) {
-    @portal_messages_admin path /api/admin/messages*
+    @portal_messages_admin path /api/admin/messages* /api/admin/assistant* /api/admin/knowledge*
     handle @portal_messages_admin {
         basicauth {
             autsky6666@gmail.com $2b$12$bM/k/LvfDRXIKywrhrLmh.wEa8v8N15cluiTcQStDUjMtBNReZbYm
         }
-        reverse_proxy portal-messages-api:8000
+        import portal_api_upstream
     }
 
-    @portal_messages_public path /api/messages* /api/health
+    @portal_messages_public path /api/messages* /api/assistant* /api/health
     handle @portal_messages_public {
-        reverse_proxy portal-messages-api:8000
+        import portal_api_upstream
     }
 }
 
@@ -83,6 +92,9 @@ blog.zenithy.art {
     import common_site
     import admin_auth_access_log
     import portal_messages_api_routes
+
+    @legacy_blog_post path /post.html
+    redir @legacy_blog_post / permanent
 
     @blog_admin path /admin /admin/* 
     basicauth @blog_admin {
